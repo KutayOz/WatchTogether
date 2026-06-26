@@ -1,0 +1,30 @@
+# Environment files with secrets
+.env
+.env.local
+.env.production
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Node modules (frontend has its own gitignore)
+node_modules/
+
+# .NET build outputs
+bin/
+obj/
+*.user
+*.suo
+
+# Docker volumes
+mongodb_data/

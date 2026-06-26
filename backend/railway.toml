@@ -1,0 +1,25 @@
+# Railway service definition for WatchTogether backend (ASP.NET 8 + SignalR)
+#
+# IMPORTANT: This app keeps session state in-process (ConcurrentDictionary in
+# SessionService). It MUST stay at numReplicas = 1 until a Redis backplane is
+# added — multiple replicas will silently route peers to different machines and
+# fail to find each other's session.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Pinned to 1 — see header comment. SessionService keeps state in-process.
+numReplicas = 1
+
+# HTTP healthcheck (healthcheckPath = "/api/health") was tried but the new
+# container's /api/health was unreachable from Railway's pre-swap probe even
+# though Kestrel was bound on :8080 — a Railway-internal routing quirk during
+# blue-green swaps. Falling back to TCP-only check (the default when
+# healthcheckPath is unset). The endpoint is verified externally post-deploy.
+
+# ON_FAILURE (not ALWAYS) so a real crash-loop surfaces in the dashboard
+# instead of restarting forever. 10 retries before Railway gives up.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,44 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: watchtogether-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
+      - MongoDB__ConnectionString=${MONGODB_CONNECTION_STRING:?MONGODB_CONNECTION_STRING is required}
+      - MongoDB__DatabaseName=watchtogether
+      - Jwt__Secret=${JWT_SECRET:?JWT_SECRET is required}
+      - Jwt__Issuer=WatchTogether
+      - Jwt__Audience=WatchTogether
+      - Jwt__ExpirationHours=24
+      - Cors__AllowedOrigins__0=https://${FRONTEND_DOMAIN:?FRONTEND_DOMAIN is required, e.g. watchtogether.lol}
+      - Cors__AllowedOrigins__1=https://www.${FRONTEND_DOMAIN}
+      - WebRTC__CloudflareTurnKeyId=${CLOUDFLARE_TURN_KEY_ID:-}
+      - WebRTC__CloudflareTurnApiToken=${CLOUDFLARE_TURN_API_TOKEN:-}
+      - WebRTC__CloudflareTurnTtlSeconds=${CLOUDFLARE_TURN_TTL_SECONDS:-}
+      - WebRTC__TurnUrl=${TURN_URL:-}
+      - WebRTC__TurnUsername=${TURN_USERNAME:-}
+      - WebRTC__TurnCredential=${TURN_CREDENTIAL:-}
+      - WebRTC__TurnTlsPort=${TURN_TLS_PORT:-}
+      - App__FrontendUrl=https://${FRONTEND_DOMAIN}
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=https://${API_DOMAIN:?API_DOMAIN is required, e.g. api.watchtogether.lol}
+        - VITE_SIGNALR_URL=https://${API_DOMAIN}/hubs/watchtogether
+    container_name: watchtogether-frontend
+    restart: unless-stopped
+    environment:
+      - BACKEND_HOST=${API_DOMAIN}
+    ports:
+      - "80:8080"
+    depends_on:
+      - backend
