@@ -202,9 +202,29 @@ describe("AuthChallenge durable object", () => {
     expect(results.filter((r) => r.ok)).toHaveLength(1);
   });
 
-  it("refuses an expired challenge", async () => {
+  /**
+   * Both refusal codes are correct here, and which one arrives is a race this
+   * test does not control.
+   *
+   * /put arms the cleanup alarm at expiresAt (AuthChallenge.ts:55). Storing an
+   * already-expired challenge therefore sets an alarm in the past, which the
+   * runtime fires immediately. If the alarm lands first the record is gone and
+   * /consume answers "not_found"; if /consume lands first it finds the record
+   * and rejects it as "expired".
+   *
+   * This passed 174/174 locally and on three CI runs before failing on a
+   * slower runner, where the alarm won. Pinning one code was the bug — the
+   * contract is that an expired challenge is never usable, not which way it is
+   * refused.
+   */
+  it("refuses an expired challenge, whichever way the cleanup race lands", async () => {
     await put("challenge-d", { expiresAt: Date.now() - 1 });
-    expect(await consume("challenge-d")).toMatchObject({ ok: false, error: "expired" });
+    const result = await consume("challenge-d");
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/^(expired|not_found)$/);
+    // The security property, independent of the race: nothing usable comes back.
+    expect(result.challenge).toBeUndefined();
   });
 
   it("reports an unknown challenge as missing", async () => {
