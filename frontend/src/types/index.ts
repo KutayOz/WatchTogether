@@ -238,9 +238,16 @@ export interface QualityFeedback {
   fps: number;
 }
 
-export interface SpeedTestResult {
-  uploadSpeedMbps: number;
+/**
+ * What the bandwidth estimator thinks this connection's uplink can carry, and
+ * which screen-share presets therefore fit. Derived from the peer connection's
+ * own `availableOutgoingBitrate` — see hooks/useUplinkEstimate.ts.
+ *
+ * Null everywhere it appears means "no opinion", not "slow": a browser that
+ * does not publish the statistic must leave the user's choice alone.
+ */
+export interface UplinkEstimate {
+  uplinkMbps: number;
   recommendedQuality: ScreenShareQuality;
-  supportedQualities: Record<string, boolean>;
-  timestamp: number;
+  supportedQualities: Record<ScreenShareQuality, boolean>;
 }
