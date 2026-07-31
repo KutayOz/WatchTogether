@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "./middleware/auth";
 import { optionalAuth } from "./middleware/auth";
 import { rateLimit } from "./middleware/rateLimit";
+import { withSecurityHeaders } from "./middleware/securityHeaders";
 import { authRoutes } from "./routes/auth";
 import { passkeyRoutes } from "./routes/passkey";
 import { sessionRoutes } from "./routes/session";
@@ -49,7 +50,14 @@ app.route("/api/terms", termsRoutes);
 app.route("/api/admin", adminRoutes);
 
 export default {
-  fetch: app.fetch,
+  /**
+   * Wrapped rather than installed as Hono middleware so that the headers are
+   * applied to everything this Worker emits — including responses Hono did not
+   * build, such as the onError 500 and whatever a Durable Object hands back.
+   */
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return withSecurityHeaders(await app.fetch(request, env, ctx));
+  },
 
   /**
    * Nightly housekeeping.

@@ -20,9 +20,14 @@ export default defineConfig({
      * nothing dials out. jsdom is the wrong DOM here specifically because it
      * refuses to perform navigation, which would hide the 401 login redirect
      * api.test.ts asserts on.
+     *
+     * tests/ holds the checks that read shipped files off disk rather than
+     * exercise app code — the CSP in public/_headers, which no other test can
+     * reach because `vite dev` ignores it and production is the only place it
+     * applies.
      */
     environment: 'happy-dom',
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
   },
   resolve: {
     alias: {

@@ -1,0 +1,27 @@
+# Security headers for everything the static-asset layer serves — which, given
+# `run_worker_first = ["/api/*"]` in wrangler.toml, means the SPA and its
+# bundles. /api/* responses never pass through here; those headers are set in
+# worker/src/middleware/securityHeaders.ts.
+#
+# Vite copies public/ verbatim into dist/, and Cloudflare reads dist/_headers
+# while refusing to serve the file itself. `vite dev` ignores it entirely, so
+# local development is not governed by this policy — production is the only
+# place it takes effect, which is exactly why frontend/tests/csp.test.ts asserts
+# its contents rather than trusting a browser check nobody will re-run.
+#
+# This replaces frontend/nginx.conf.template. Everything Google-sign-in has
+# been dropped along with the feature.
+
+/*
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=(), payment=(), usb=()
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://www.youtube.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss://app.watchtogether.workers.dev https://cdn.jsdelivr.net https://storage.googleapis.com; frame-src https://www.youtube.com https://www.youtube-nocookie.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+
+# Content-addressed filenames — a deploy changes the hash, so the old URL is
+# never stale and the browser never needs to revalidate.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
