@@ -75,14 +75,51 @@ jobs:
       # a deploy failure.
       - run: npm run build
 
+  # Playwright, against `vite dev` with the API stubbed at the network boundary.
+  #
+  # Its own job rather than a step in `frontend` because it needs a browser
+  # download the other steps do not, and because a failure here means something
+  # different: the unit suites say the pieces work, this says the screens do.
+  #
+  # Added in the same change that deleted the .NET backend, for a specific
+  # reason. Nothing ran these specs, so they went on asserting against the
+  # email-and-password sign-in form for two phases after passkeys replaced it —
+  # half the suite was red and the repository could not tell anyone. A test
+  # nobody runs is not a slow test, it is a false claim.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # Chromium only — playwright.config.ts defines the one project, and
+      # pulling all three browsers would triple the download for nothing.
+      - run: npx playwright install --with-deps chromium
+
+      # playwright.config.ts starts `npm run dev` itself and waits for the port,
+      # so there is no server to launch here. /api/* is never reached: every
+      # spec stubs it with page.route().
+      - run: npm run e2e
+
   # Lint is deliberately absent for now.
   #
-  # `npm run lint` currently reports 12 pre-existing errors — setState-in-effect
-  # in ScreenShareView, unused vars in the Playwright specs, useless try/catch in
+  # `npm run lint` currently reports 10 pre-existing errors — setState-in-effect
+  # in ScreenShareView and a few other components, useless try/catch in
   # webrtcService. A gate that is red on the day you add it is a gate everyone
   # learns to skip, and then it protects nothing.
   #
-  # Fix those 12, then add here:
+  # Fix those 10, then add here:
   #
   #   lint:
   #     runs-on: ubuntu-latest

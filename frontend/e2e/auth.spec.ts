@@ -2,101 +2,81 @@ import { test, expect } from '@playwright/test';
 import {
   mockLoggedOut,
   mockLoggedInUser,
-  mockLoginSuccess,
-  mockLoginFailure,
+  mockPasskeySignIn,
+  mockSetupStatus,
   expectPathname,
   disableAnimations,
 } from './helpers';
 
-test.describe('Login screen', () => {
+test.describe('Sign-in screen', () => {
   test.beforeEach(async ({ page }) => {
     // StickerButton with breathe=true wiggles forever; disable so click()
-    // doesn't time out on actionability check.
+    // doesn't time out on the actionability check.
     await disableAnimations(page);
-    // Default state: nobody is logged in. Without this stub the AuthContext
-    // initial /me call hangs against the unmocked dev server and the
-    // PublicRoute logic delays the form render.
+    // Default state: nobody is signed in. Without this stub the AuthContext
+    // initial /me call hangs against the unmocked dev server and PublicRoute
+    // delays the render.
     await mockLoggedOut(page);
+    // And the instance already has a root account, so the bootstrap panel
+    // stays hidden unless a test asks for it.
+    await mockSetupStatus(page, true);
   });
 
-  // Helper — the page has *two* buttons whose accessible name starts with
-  // "Sign in" (the password submit "SIGN IN" and an aria-labelled passkey
-  // button). Anchor the regex so only the submit matches; the passkey
-  // button's full label is "Sign in with a passkey".
-  const signInSubmit = (page: import('@playwright/test').Page) =>
-    page.getByRole('button', { name: /^sign in/i, exact: false }).first()
-      // Belt-and-braces: also require type=submit so a future refactor that
-      // reorders buttons doesn't silently target the passkey one.
-      .and(page.locator('button[type="submit"]'));
-
-  test('renders the WatchTogether branded sign-in form', async ({ page }) => {
+  test('renders the passkey sign-in screen', async ({ page }) => {
     await page.goto('/login');
 
-    // Heading + the BETA tag are the load-bearing chrome of this page.
+    // Heading + tagline are the load-bearing chrome of this page.
     await expect(page.getByRole('heading', { name: /watchtogether/i })).toBeVisible();
     await expect(page.getByText(/two friends\. one screen/i)).toBeVisible();
 
-    // The form itself — email + password fields + sign-in button.
-    await expect(page.getByPlaceholder('you@watchtogether.app')).toBeVisible();
-    await expect(page.getByPlaceholder('shhh — keep it secret')).toBeVisible();
-    await expect(signInSubmit(page)).toBeVisible();
+    await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeEnabled();
+    // Accounts exist only by invitation, so there is no sign-up affordance —
+    // just the explanation of why.
+    await expect(page.getByText(/invite-only/i)).toBeVisible();
   });
 
-  test('sign-in button stays disabled until both email and password have content', async ({ page }) => {
+  /**
+   * A regression guard rather than a feature test. Passwords were removed
+   * because BCrypt at work factor 12 costs ~400 ms and a Worker gets 10 ms of
+   * CPU, so a password field reappearing here would not be a design regression
+   * — it would be a thing that cannot run on this infrastructure at all.
+   */
+  test('offers nothing to type — no password field, no email field', async ({ page }) => {
     await page.goto('/login');
+    await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
 
-    const signIn = signInSubmit(page);
-    await expect(signIn).toBeDisabled();
-
-    await page.getByPlaceholder('you@watchtogether.app').fill('alice@example.test');
-    // Only email filled — still disabled.
-    await expect(signIn).toBeDisabled();
-
-    await page.getByPlaceholder('shhh — keep it secret').fill('correct-horse-battery-staple');
-    // Both filled — enabled.
-    await expect(signIn).toBeEnabled();
+    expect(await page.locator('input[type="password"]').count()).toBe(0);
+    expect(await page.locator('input[type="email"]').count()).toBe(0);
   });
 
-  test('successful login redirects to the lobby', async ({ page }) => {
-    // Important: DO NOT call mockLoggedInUser here. That helper seeds
-    // localStorage with cached-user state, which would make useAuth's
-    // optimistic-render path treat us as already logged in — PublicRoute
-    // would then redirect from /login *before* we got a chance to fill
-    // the form. We want the realistic flow: arrive logged-out, submit
-    // the form, login() resolves with the user, state flips, redirect.
-    //
-    // The login endpoint is the only network mock we need: api.login()
-    // returns the response body, useAuth.login() calls setUser(...) with
-    // it, and PublicRoute then navigates to "/".
-    await mockLoginSuccess(page);
+  test('signs in with a passkey and lands in the lobby', async ({ page }) => {
+    // Deliberately NOT mockLoggedInUser: that seeds cached-user state, and
+    // PublicRoute would redirect away from /login before the button was ever
+    // clicked. We want the real shape — arrive signed out, run the ceremony,
+    // state flips, redirect.
+    await mockPasskeySignIn(page, 'success');
 
     await page.goto('/login');
-    await page.getByPlaceholder('you@watchtogether.app').fill('alice@example.test');
-    await page.getByPlaceholder('shhh — keep it secret').fill('correct-horse-battery-staple');
-    await signInSubmit(page).click();
+    await page.getByRole('button', { name: /sign in with a passkey/i }).click();
 
-    // PublicRoute → Navigate to "/" on user becoming non-null.
     await expectPathname(page, '/');
   });
 
-  test('shows OOPS error after a failed login', async ({ page }) => {
-    await mockLoginFailure(page);
+  test('shows the OOPS burst when the ceremony is cancelled', async ({ page }) => {
+    await mockPasskeySignIn(page, 'cancelled');
     await page.goto('/login');
 
-    await page.getByPlaceholder('you@watchtogether.app').fill('alice@example.test');
-    await page.getByPlaceholder('shhh — keep it secret').fill('definitely-wrong');
-    await signInSubmit(page).click();
+    await page.getByRole('button', { name: /sign in with a passkey/i }).click();
 
-    // The error block has role="alert" and contains an OOPS! burst.
     await expect(page.getByRole('alert')).toBeVisible();
     await expect(page.getByText(/oops/i)).toBeVisible();
-    // Still on /login — no redirect.
+    // Still on /login — a dismissed system sheet is not a failed login.
     expect(new URL(page.url()).pathname).toBe('/login');
   });
 
-  test('logged-in user visiting /login gets bounced to the lobby', async ({ page }) => {
-    // PublicRoute redirects authenticated users away from /login so they
-    // don't see a "log back in" form for a session they're already in.
+  test('signed-in user visiting /login gets bounced to the lobby', async ({ page }) => {
+    // PublicRoute redirects authenticated users away from /login so they don't
+    // see a "sign back in" screen for a session they are already in.
     await mockLoggedInUser(page);
 
     await page.goto('/login');
@@ -105,10 +85,58 @@ test.describe('Login screen', () => {
   });
 });
 
-test.describe('Logged-out routing', () => {
+/**
+ * The first account cannot be invited by anybody, so with no email and no
+ * password an empty database plus a deployment secret is the only way in. The
+ * panel that does it must be invisible from the moment root exists — it is the
+ * one place on a public page that accepts a secret.
+ */
+test.describe('First-run bootstrap', () => {
   test.beforeEach(async ({ page }) => {
     await disableAnimations(page);
     await mockLoggedOut(page);
+  });
+
+  test('is offered while the instance has no root account', async ({ page }) => {
+    await mockSetupStatus(page, false);
+
+    await page.goto('/login');
+
+    await expect(page.getByText(/first run — claim this instance/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: /create root account/i })).toBeVisible();
+  });
+
+  test('is gone once root exists', async ({ page }) => {
+    await mockSetupStatus(page, true);
+
+    await page.goto('/login');
+    // Wait for something on the page first, so this is an assertion about a
+    // rendered screen rather than about a screen that has not painted yet.
+    await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
+
+    await expect(page.getByText(/first run — claim this instance/i)).toHaveCount(0);
+  });
+
+  /**
+   * The status call failing must hide the panel, not show it. Showing a
+   * secret-accepting form because a health check blipped is the worse of the
+   * two failure modes.
+   */
+  test('stays hidden when the status call fails', async ({ page }) => {
+    await page.route('**/api/auth/setup/status', (route) => route.abort('failed'));
+
+    await page.goto('/login');
+    await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
+
+    await expect(page.getByText(/first run — claim this instance/i)).toHaveCount(0);
+  });
+});
+
+test.describe('Signed-out routing', () => {
+  test.beforeEach(async ({ page }) => {
+    await disableAnimations(page);
+    await mockLoggedOut(page);
+    await mockSetupStatus(page, true);
   });
 
   test('anonymous visit to / is redirected to /login', async ({ page }) => {

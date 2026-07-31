@@ -1,11 +1,12 @@
 import { test, expect } from '@playwright/test';
-import { mockLoggedOut, mockLoggedInUser, trackChunkRequests } from './helpers';
+import { mockLoggedOut, mockLoggedInUser } from './helpers';
 
 /**
  * Code-split smoke. These tests verify the bundle-size optimization is
  * actually doing its job at runtime — landing on /login must NOT pull
- * down session-only chunks (signalr, webrtc-adapter), and navigating
- * to other routes must trigger the expected per-route chunk fetch.
+ * down session-only chunks (the signalling transport, webrtc-adapter),
+ * and navigating to other routes must trigger the expected per-route
+ * chunk fetch.
  *
  * Sensitive to:
  *   - The dev build, which doesn't chunk like the prod build. We run
@@ -45,7 +46,8 @@ test.describe('Code splitting at runtime', () => {
   test('landing on /login does NOT load session-only modules', async ({ page }) => {
     // This is the load-bearing assertion of the route-split work:
     // a visitor that just opens the login page should not be paying
-    // for SignalR, webrtc-adapter, or any /Session/ source code.
+    // for the signalling transport, webrtc-adapter, or any /Session/
+    // source code.
     await mockLoggedOut(page);
     const tracker = trackAllJsRequests(page);
 
@@ -54,7 +56,11 @@ test.describe('Code splitting at runtime', () => {
 
     // No session-only deps should be in the network log.
     expect(
-      tracker.includesAny(['@microsoft/signalr', 'webrtc-adapter', '/components/Session/']),
+      tracker.includesAny([
+        '/services/transportService',
+        'webrtc-adapter',
+        '/components/Session/',
+      ]),
       `unexpected session-only module loaded on /login. seen: ${tracker.dump().slice(0, 30).join(', ')}`,
     ).toBeFalsy();
   });

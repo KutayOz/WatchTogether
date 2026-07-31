@@ -6,16 +6,18 @@ import { defineConfig, devices } from '@playwright/test';
  * What we're testing here:
  *   - Frontend behavior in real Chromium with the real bundle.
  *   - API calls are mocked at the network boundary (page.route()) so the
- *     suite doesn't need MongoDB + the backend to be running.
+ *     suite needs no Worker, no database and no secrets — which is what lets
+ *     it run as its own CI job in about a minute.
  *   - Lazy chunks (from the route-splitting refactor) are verified by
  *     observing network requests.
  *
  * What we're explicitly NOT testing here:
- *   - WebRTC / SignalR — running a real call needs two peers + a TURN
- *     server, both of which are out of scope for unit-level smoke. Those
- *     belong in a separate live-call test job that spins up the backend.
- *   - Real authentication round-trips — covered by the backend xUnit suite
- *     (AuthServiceTests).
+ *   - WebRTC and the signalling socket — a real call needs two peers and a
+ *     TURN server. The Durable Object's side of the protocol is covered in
+ *     worker/src/do/SessionRoom.test.ts, against the real runtime.
+ *   - Real authentication round-trips. The passkey ceremony is stubbed at
+ *     navigator.credentials here; it runs against real crypto in
+ *     worker/src/routes/passkey.test.ts.
  *
  * Run:
  *   npm run e2e           # headless, reuses dev server if already up

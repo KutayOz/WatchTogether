@@ -6,9 +6,10 @@ import { api } from './api';
 // Every api.* method used to call `await response.json()` on a failed response
 // (or, in about half the cases, discard the body entirely). The API always
 // returns `{ message }` for /api/* failures it generates itself — but a large
-// class of failures never reaches it: nginx's own 502/504 pages, the platform
-// edge timing out an upstream, a proxy rejecting an oversized body, a
-// plain-text "not found". Those bodies are HTML or text, and `response.json()`
+// class of failures never reaches it: Cloudflare's own error pages, the edge
+// rejecting a request before the Worker runs, the asset layer answering an
+// unmatched path with index.html, a plain-text "not found". Those bodies are
+// HTML or text, and `response.json()`
 // on them throws `SyntaxError: Unexpected token '<'`.
 //
 // The SyntaxError then propagated *in place of* the real failure: the HTTP

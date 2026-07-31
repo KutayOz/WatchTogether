@@ -9,8 +9,9 @@
 # place it takes effect, which is exactly why frontend/tests/csp.test.ts asserts
 # its contents rather than trusting a browser check nobody will re-run.
 #
-# This replaces frontend/nginx.conf.template. Everything Google-sign-in has
-# been dropped along with the feature.
+# This replaces the nginx.conf.template the old Fly.io frontend shipped with
+# (git show archive/dotnet:frontend/nginx.conf.template). Everything
+# Google-sign-in has been dropped along with the feature.
 
 /*
   Strict-Transport-Security: max-age=31536000; includeSubDomains

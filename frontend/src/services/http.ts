@@ -4,8 +4,8 @@
 // success side. The API returns JSON for everything it generates itself, but
 // plenty of responses never come from the API at all:
 //
-//   - nginx's own 502/504 pages and a proxy's 413 rejection are HTML
-//   - the platform edge timing out an upstream returns HTML
+//   - Cloudflare's own error pages — a 1101 worker exception, a 522 — are HTML
+//   - the edge rejecting a request before the Worker ever runs returns HTML
 //   - an SPA/proxy misroute serves index.html — with a 200 — for an /api/* path
 //   - a 204 or a truncated response has no body to parse
 //

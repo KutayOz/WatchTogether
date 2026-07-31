@@ -6,7 +6,13 @@
  * on one side failed silently at runtime on the other. Here, drift is a
  * compile error.
  *
- * Ported from backend/API/Hubs/WatchTogetherHub.cs. Two structural changes:
+ * Ported from backend/API/Hubs/WatchTogetherHub.cs. That file — and every other
+ * line-numbered C# citation in this repository — was deleted with the .NET
+ * backend and lives at the `archive/dotnet` tag:
+ *
+ *     git show archive/dotnet:backend/API/Hubs/WatchTogetherHub.cs
+ *
+ * Two structural changes from it:
  *
  *   1. No sessionId on any message. The socket is bound to a session by the
  *      Durable Object that owns it, so a client cannot address someone else's

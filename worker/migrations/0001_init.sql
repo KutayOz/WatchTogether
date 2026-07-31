@@ -1,7 +1,8 @@
 -- WatchTogether initial schema.
 --
--- Ported from the MongoDB collections in backend/Data/Entities, with three
--- deliberate departures:
+-- Ported from the MongoDB collections in backend/Data/Entities — deleted now,
+-- readable at `git show archive/dotnet:backend/Data/Entities/User.cs` — with
+-- three deliberate departures:
 --
 --   1. Identity is `username#discriminator`, not email. Email is gone entirely
 --      along with all verification machinery.

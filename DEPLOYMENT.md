@@ -1,120 +1,214 @@
-# WatchTogether Deployment Notes
+# Deployment
 
-Production runbook + post-deploy state. Last updated 2026-04-26.
+Runbook for the Cloudflare deployment. Last updated 2026-07-31.
 
-## Live URLs
+## What exists
 
-| What | URL |
-|------|-----|
-| Frontend | https://watchtogether.lol |
-| Backend API | https://api.watchtogether.lol |
-| Health check | https://api.watchtogether.lol/api/health |
-| Fly default (frontend) | https://watchtogether-web.fly.dev |
-| Fly default (backend) | https://watchtogether-api.fly.dev |
+| What | Value |
+|---|---|
+| Live | https://app.watchtogether.workers.dev |
+| Health | https://app.watchtogether.workers.dev/api/health |
+| Worker | `app`, on the account subdomain `watchtogether` |
+| D1 | `watchtogether` — `0372f4d6-afce-48f2-921c-f9fc6d3a164f`, region EEUR |
+| Durable Objects | `SessionRoom`, `AuthChallenge` — both SQLite-backed |
+| Cron | `17 4 * * *` — nightly housekeeping |
+| TURN | Cloudflare Realtime, app `watchtogether-workers` |
+| CI/CD | GitHub Actions — see [.github/workflows/README.md](.github/workflows/README.md) |
 
-## Hosting
+Cost: **$0.00**. Two accounts, Cloudflare and GitHub, both on free plans. There
+is no third-party database, mail provider or host.
 
-- **Provider:** Fly.io, region `ams` (Amsterdam)
-- **Backend app:** `watchtogether-api` — always-on (`auto_stop_machines = "off"`) so SignalR sessions don't drop
-- **Frontend app:** `watchtogether-web` — auto-stops when idle (cold start ~1s)
-- **Database:** MongoDB Atlas free tier (`<your-cluster>.mongodb.net`), user `<your-db-user>`
-- **Email:** Resend with `noreply@watchtogether.lol` (domain verified, SPF + DKIM + MX in DNS)
-- **TURN/STUN:** Cloudflare Realtime TURN — short-lived ICE credentials minted per request via the Cloudflare API (`WebRTC__CloudflareTurnKeyId` + `WebRTC__CloudflareTurnApiToken`); falls back to static coturn creds if those are unset
-- **Domain registrar:** Spaceship (`watchtogether.lol`)
-- **TLS:** Let's Encrypt via Fly, auto-renewed by Fly
+The hostname is `<worker>.<account-subdomain>.workers.dev`, not
+`<worker>.workers.dev` — both labels belong to us, and they were picked to read
+together.
 
-## Fly secrets (backend)
+## Deploying
 
-| Name | Purpose |
-|------|---------|
-| `Jwt__Secret` | JWT signing key (≥32 bytes, openssl rand -base64 48) |
-| `MongoDB__ConnectionString` | Atlas SRV URI with rotated password |
-| `Email__ResendApiKey` | Resend API key (named `fly-watchtogether-api`) |
-| `Email__FromEmail` | `noreply@watchtogether.lol` |
-| `WebRTC__CloudflareTurnKeyId` | Cloudflare Realtime TURN key id |
-| `WebRTC__CloudflareTurnApiToken` | Cloudflare Realtime TURN API token — mints short-lived ICE creds |
+Push to `main`. `deploy.yml` runs every check, builds the SPA, applies D1
+migrations, then deploys.
 
-Non-secret config lives in `backend/fly.toml` `[env]` block (Issuer, Audience, AllowedHosts, CORS origins, etc.).
+By hand, if Actions is unavailable:
 
-## Common operations
-
-### Deploy after code change
 ```bash
-cd backend && fly deploy --app watchtogether-api
-cd ../frontend && fly deploy --app watchtogether-web
+cd frontend && npm ci && npm run build
+cd ../worker && npm ci && npm run db:migrate:remote && npm run deploy
 ```
-Frontend `VITE_*` env vars are baked at build time — change requires redeploy.
+
+**Build the SPA first.** `wrangler.toml` points `[assets]` at
+`../frontend/dist`, so deploying the Worker against a stale `dist/` ships
+yesterday's frontend with today's backend, and nothing warns you.
+
+## Secrets
+
+Four, all on the Worker. Set them yourself — `wrangler secret put` prompts, so
+the value never lands in shell history:
+
+```bash
+cd worker
+npx wrangler secret put JWT_SECRET
+```
+
+| Name | What it is |
+|---|---|
+| `JWT_SECRET` | HS256 signing key. `openssl rand -base64 48`. Rotating it signs everyone out, which is the intended blast radius. |
+| `SETUP_SECRET` | Gates the first-run root bootstrap. Only usable while the users table is empty. |
+| `CLOUDFLARE_TURN_KEY_ID` | Realtime TURN key id. |
+| `CLOUDFLARE_TURN_API_TOKEN` | Mints short-lived ICE credentials per request. |
+
+`npx wrangler secret list` prints the names, never the values.
+
+Both TURN secrets are optional: unset, the app serves STUN only, which works for
+most peers and fails behind symmetric NAT. Cloudflare shows a TURN token exactly
+once — lose it and the only path forward is deleting the TURN app and making a
+new one.
+
+Non-secret config lives in `[vars]` in `wrangler.toml`, and `worker/.dev.vars`
+(gitignored) overrides it locally.
+
+GitHub Actions needs two repository secrets of its own,
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` — see the workflows README.
+
+## Operating it
 
 ### Logs
+
 ```bash
-fly logs --app watchtogether-api
-fly logs --app watchtogether-api --no-tail | tail -50   # historical, one-shot
+cd worker && npx wrangler tail
 ```
 
-### Rotate a secret
-```bash
-fly secrets set --app watchtogether-api Jwt__Secret='<new value>'
-```
-Triggers rolling restart automatically. Set multiple secrets in one command to restart only once.
+Live only; Workers do not retain logs on the free plan. `npx wrangler tail --status error` filters to failures.
 
-### Connect to Atlas
+### Rolling back
+
 ```bash
-mongosh "mongodb+srv://<your-db-user>:<password>@<your-cluster>.mongodb.net/watchtogether"
+npx wrangler deployments list
+npx wrangler rollback <version-id>
 ```
 
-### Promote a user to root
+Every version is retained and the id is printed in the Actions run summary.
+
+Rollback returns the **code**, not the schema. Migrations are forward-only, so a
+change that dropped a column is not coming back — do destructive schema changes
+as expand then contract (add the new shape, ship code that uses it, remove the
+old shape in a later deploy) rather than as one cutover.
+
+### Querying the database
+
 ```bash
-mongosh "<atlas uri>" --quiet --eval 'db.users.updateOne({email: "user@example.com"}, {$set: {isRootUser: true}})'
+cd worker
+npx wrangler d1 execute watchtogether --remote --command "SELECT username, discriminator, is_root FROM users"
 ```
 
-### Generate an invitation link via API
+Drop `--remote` for the local development copy. Note the app never deletes a
+user row — `is_deleted` is a flag, and soft-deletion also removes their passkey
+credentials so the same authenticator can register again.
+
+### Running the cron by hand
+
 ```bash
-TOKEN=$(curl -sS -X POST https://api.watchtogether.lol/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"oahmetkutay@gmail.com","password":"<pw>"}' \
-  | sed -E 's/.*"token":"([^"]+)".*/\1/')
-curl -sS -X POST https://api.watchtogether.lol/api/invitation/generate-link \
-  -H "Authorization: Bearer $TOKEN"
+npx wrangler d1 execute watchtogether --remote --command \
+  "SELECT COUNT(*) FROM revoked_tokens WHERE expires_at < unixepoch()"
 ```
 
-## Local development
+There is no way to trigger a scheduled event against production, and
+`wrangler dev --test-scheduled` **does not work here** — see the trap below. To
+verify the logic, run `npm test` in `worker/`: `src/index.test.ts` calls the
+handler directly against real D1.
 
-`docker-compose up` is the canonical dev path (uses local MongoDB container, picks up `.env` for secrets).
+### Claiming root on a fresh instance
 
-For raw `dotnet run`: `appsettings.Development.json` carries a clearly-marked `DEV_ONLY_NOT_FOR_PROD_*` JWT secret so local boot works without env-var setup. Production overrides are enforced by `appsettings.Production.json` having empty values + Program.cs strict validation.
+Load `/login` while the users table is empty. The bootstrap panel appears; give
+it a username and the `SETUP_SECRET`. It disappears permanently once root
+exists, and the endpoint behind it refuses to run a second time.
 
-## Outstanding follow-ups
+## The free-tier budget
 
-These didn't block deploy but should be addressed:
+| Resource | Free daily allowance | What uses it |
+|---|---|---|
+| Worker requests | 100,000 | `/api/*` only — static assets never invoke the Worker |
+| Durable Object requests | 100,000 | Every inbound WebSocket message counts |
+| Durable Object duration | 13,000 GB-s (~28 h of active time) | Sockets, while awake |
+| D1 reads | 5,000,000 | |
+| D1 writes | 100,000 | |
+| D1 storage | 5 GB | |
+| TURN | 1,000 GB/month | Relayed media, when P2P fails |
 
-| Priority | Item | Where |
-|----------|------|-------|
-| P2 | Bump shareable invite link expiry from 15 min to 7 days | `backend/Business/Services/InvitationLinkService.cs:14` `LINK_EXPIRY_MINUTES` |
-| P2 | Add "Revoke active invite link" UI in the Lobby | `frontend/src/components/Lobby/Lobby.tsx` — without it users get stuck once `isInvitationTicketUsed = true`. `revoke-link` API endpoint already exists. |
-| P2 | Replace `Console.WriteLine` in EmailService with `ILogger.LogInformation` | `backend/Business/Services/EmailService.cs` (T2.4 missed this file) |
-| P3 | Implement password reset flow (`/api/auth/password-reset/{request,confirm}`) | New endpoints; mirror email-verification flow |
-| P3 | Replace JWT-in-storage with HttpOnly cookie + CSRF token | Real fix for XSS-readable JWT (T2.3 only changed the default) |
-| P3 | Per-email rate-limit partition for login | `backend/API/Program.cs` rate limiter — defends credential stuffing across rotated IPs |
-| P3 | Structured logging + log shipping (Serilog → Better Stack / Axiom) | Replace stdout logging |
-| P4 | npm audit fix (8 build-tool advisories) | `frontend/` |
+Two design choices keep a session inside this:
 
-## Things to remember when something goes wrong
+**High-frequency presence runs peer-to-peer.** Cursors, typing, reactions and
+video sync go over the WebRTC DataChannel, not the socket. At 10 Hz, cursor
+updates alone would have cost ~36,000 Durable Object requests for one
+half-hour two-person session — a third of the daily budget on mouse positions.
+They now cost nothing, and a session lands under 100 requests.
 
-- **Health check shows critical but app responds 200?** Fly's check-status display gets stuck after failed deploys; the actual machine is fine. Trust `curl` over `fly checks list`.
-- **Deploy times out at "waiting for health checks"?** The CLI is timing out on its own API call, not the actual check. Verify with `fly machine status` and `curl /api/health`.
-- **`Email__ResendApiKey` missing → emails silently no-op.** EmailService returns `true` even when key is empty (see line 36 of EmailService.cs). Symptoms: registration "succeeds" but no email arrives. Always confirm secret is set after deploy.
-- **`AllowedHosts` too tight → "400 Invalid Hostname".** Any new subdomain or platform hostname must be added to the semicolon-separated `AllowedHosts` env var in `backend/fly.toml`.
+**Sockets hibernate.** Accepted with `state.acceptWebSocket()`, so an idle
+session holds no memory and burns no GB-s. Keepalives are answered by the
+runtime via `setWebSocketAutoResponse` without waking the object.
 
-## Verification (run after major changes)
+Watch it on the Cloudflare dashboard under Workers & Pages → `app` → Metrics,
+and Durable Objects separately. **Not yet measured against a real session** —
+that needs two humans on real devices, and the numbers above are the design
+targets, not observations.
 
-1. `curl https://api.watchtogether.lol/api/health` → 200 with status:healthy
-2. `curl -I https://watchtogether.lol/` → headers include CSP, HSTS, X-Frame-Options:DENY
-3. Login with the root account, create a session, generate an invite, join from incognito
-4. Two-peer WebRTC: cameras visible both ways, screen share works
-5. SignalR negotiate request has `Authorization: Bearer ...` header — NO `?access_token=` in URL (T2.1)
-6. Hammer 6 wrong logins in 1 minute → 6th returns 429 (T1.5)
-7. From User B's devtools: `fetch('/api/session/<A-session-id>/invite', {method:'POST', headers:{Authorization:'Bearer '+sessionStorage.getItem('token')}})` → 403 (T1.4)
+## Things that will waste your afternoon
 
-## Related artifacts
+**`wrangler dev --test-scheduled` returns 200 and does nothing.** `/__scheduled`
+does not match `run_worker_first = ["/api/*"]`, so the static-asset layer
+answers it with `index.html` — a 200 that looks exactly like a successful cron
+run, while no cron code executes at all. `src/index.test.ts` covers the handler
+instead.
 
-- Hardening commit: `90d986a Harden security and migrate deployment from Railway to Fly.io`
+**A missing asset returns 200, not 404.** `not_found_handling =
+"single-page-application"` serves `index.html` for anything unmatched, which is
+what makes deep links work. Probing `/assets/some-old-hash.js` therefore returns
+the SPA shell with the SPA's cache headers, and looks like a broken
+`Cache-Control` rule. Check the filename against the live `index.html` first.
+
+**`new_sqlite_classes`, not `new_classes`.** KV-backed Durable Objects are
+paid-only. Getting this wrong is the most common silent free-plan deploy
+failure.
+
+**Two independent header mechanisms.** `/api/*` headers are set in
+`worker/src/middleware/securityHeaders.ts`; everything else is
+`frontend/public/_headers`, because static assets never reach the Worker.
+Changing one does not change the other. `frontend/tests/csp.test.ts` asserts
+the shipped file, since `vite dev` ignores it entirely and production is the
+only place it applies.
+
+**Changing `RP_ID` invalidates every passkey.** It is currently the full host
+`app.watchtogether.workers.dev`, deliberately, so credentials are not shared
+with any other Worker on this account subdomain. Moving to a custom domain means
+every user re-registers.
+
+**`request.cf` is undefined under `wrangler dev`.** Rate limiting reads
+`CF-Connecting-IP`; the guard for its absence exists, but code added near it
+needs the same care.
+
+## Verification after a deploy
+
+```bash
+curl -sS https://app.watchtogether.workers.dev/api/health
+curl -sSI https://app.watchtogether.workers.dev/login | grep -iE 'content-security-policy|strict-transport'
+curl -sSI https://app.watchtogether.workers.dev/api/health | grep -iE 'cache-control|content-security-policy'
+```
+
+Expect: health 200; the SPA carrying the full CSP and HSTS; `/api/*` carrying
+`no-store` and `default-src 'none'`.
+
+Then, in a browser: sign in with a passkey, create a session, generate an
+invite, join it from another profile, and confirm video both ways, chat
+(including your own messages appearing), screen share and background blur.
+
+## Known gaps
+
+- **No real-session budget numbers.** Needs two people on real devices.
+- **Background blur is verified only as far as the CSP.** WebAssembly compiles
+  under the live policy and both MediaPipe origins load; that it segments a
+  real camera feed correctly in production is untested.
+- **The speed test is dead weight.** `speedTestService.ts` POSTs to
+  `/api/speedtest/upload`, which this Worker does not implement — a 404 every
+  five minutes per user. Worse, on Workers it would measure client-to-edge
+  latency, so it would report absurd speeds and clamp screen-share quality to
+  maximum for everyone. It should be deleted and quality driven from
+  `RTCPeerConnection.getStats()`, which `useQualityMonitor.ts` already reads.
+- **CI is advisory until a ruleset requires it.** See the workflows README.

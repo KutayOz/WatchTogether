@@ -1,4 +1,7 @@
-# Environment files with secrets
+# Secrets. Nothing at the repo root reads a .env any more — the Worker's local
+# config lives in worker/.dev.vars (ignored there) and the frontend has no
+# build-time variables at all — but the patterns stay so a stray one written by
+# habit cannot be committed.
 .env
 .env.local
 .env.production
@@ -17,14 +20,5 @@ Thumbs.db
 *.log
 logs/
 
-# Node modules (frontend has its own gitignore)
+# Node modules (frontend and worker each have their own gitignore too)
 node_modules/
-
-# .NET build outputs
-bin/
-obj/
-*.user
-*.suo
-
-# Docker volumes
-mongodb_data/
