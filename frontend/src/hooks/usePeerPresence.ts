@@ -14,28 +14,30 @@ export interface FloatingReaction { id: number; emoji: string; from: string }
  * cursor halo, the "X is typing…" indicator, and floating emoji reactions.
  * Each owns its state, its throttled outgoing sender, and its auto-clear timer.
  *
- * The RECEIVE side stays in SessionRoom's central SignalR handler, which drives
+ * The RECEIVE side stays in SessionRoom's central transport handler, which drives
  * the returned setters (setPeerCursor / setPeerTyping* / setReactions). Sends
- * route through signalRRef so this hook can be called before useSignalR wires up.
+ * route through transportRef so this hook can be called before useTransport wires up.
  */
 export function usePeerPresence(
   sessionIdRef: RefObject<string | null>,
-  signalRRef: RefObject<PresenceSender | null>,
+  transportRef: RefObject<PresenceSender | null>,
   displayName: string | undefined,
 ) {
   /* ── cursor halo ── */
   const [peerCursor, setPeerCursor] = useState<PeerCursor | null>(null);
   const lastCursorSentAtRef = useRef(0);
 
-  // Outgoing-cursor throttle. ~10Hz over the wire — frequent enough to feel
-  // real-time, infrequent enough not to flood SignalR.
+  // Outgoing-cursor throttle. ~10Hz — past that a cursor stops looking any
+  // smoother. These frames ride the WebRTC DataChannel now, so each one costs a
+  // peer-to-peer packet rather than a billable Durable Object request; the
+  // throttle is about how it looks, not what it costs.
   const handleLocalCursor = useCallback((x: number, y: number) => {
     if (!sessionIdRef.current) return;
     const now = Date.now();
     if (now - lastCursorSentAtRef.current < 100) return;
     lastCursorSentAtRef.current = now;
-    signalRRef.current?.notifyCursor(sessionIdRef.current, x, y);
-  }, [sessionIdRef, signalRRef]);
+    transportRef.current?.notifyCursor(sessionIdRef.current, x, y);
+  }, [sessionIdRef, transportRef]);
 
   // Auto-clear stale cursor — if no fresh PeerCursor in ~1.5s, hide the halo.
   useEffect(() => {
@@ -62,8 +64,8 @@ export function usePeerPresence(
     const now = Date.now();
     if (now - lastTypingSentAtRef.current < 2000) return;
     lastTypingSentAtRef.current = now;
-    signalRRef.current?.notifyTyping(sessionIdRef.current);
-  }, [sessionIdRef, signalRRef]);
+    transportRef.current?.notifyTyping(sessionIdRef.current);
+  }, [sessionIdRef, transportRef]);
 
   // Auto-clear the "X is typing" indicator 2.5s after the last keystroke. A
   // timeout (vs. pure render-time math) ensures the UI re-renders when it clears.
@@ -97,10 +99,10 @@ export function usePeerPresence(
       }, 2400);
 
       if (sessionIdRef.current) {
-        signalRRef.current?.notifyReaction(sessionIdRef.current, emoji);
+        transportRef.current?.notifyReaction(sessionIdRef.current, emoji);
       }
     },
-    [sessionIdRef, signalRRef, displayName],
+    [sessionIdRef, transportRef, displayName],
   );
 
   return {

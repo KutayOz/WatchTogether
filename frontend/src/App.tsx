@@ -18,10 +18,9 @@ import { ScreentoneDefs } from './components/manga';
  * main chunk that every visitor downloaded before even seeing /login. Each
  * route here lives behind a dynamic import so Vite emits a per-route chunk;
  * pair with the manualChunks config in vite.config.ts (which groups vendor
- * deps like react / signalr / webrtc-adapter separately) and a typical first
- * load is now <App + react-vendor + auth> — the session-only deps (SignalR,
- * webrtc-adapter, useWebRTC, useSignalR) don't ship until the user actually
- * enters a call.
+ * deps like react / webrtc-adapter separately) and a typical first load is now
+ * <App + react-vendor + auth> — the session-only deps (webrtc-adapter,
+ * useWebRTC, useTransport) don't ship until the user actually enters a call.
  *
  * Grouping policy: we don't use one `lazy()` per file — Auth screens travel
  * together because users that hit /login often follow up with /register, and

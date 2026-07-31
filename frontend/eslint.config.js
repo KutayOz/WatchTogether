@@ -19,5 +19,16 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // A leading underscore already means "deliberately unused" throughout
+      // this codebase. transportService is the case that forced the setting:
+      // every send takes a sessionId it no longer needs, because the socket is
+      // bound to a session server-side — and keeping the parameter is what lets
+      // callers stay unchanged.
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+    },
   },
 ])

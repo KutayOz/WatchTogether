@@ -8,13 +8,13 @@ type VideoSyncSender = { notifyVideoSync: (sessionId: string, action: string, pa
  * "Watch Together" co-watch state + the local→peer sync senders. The frontend
  * owns the YouTube player (through watchPlayerRef); these handlers relay
  * load/close/play/pause/seek transitions. The RECEIVE side stays in
- * SessionRoom's central SignalR handler — it writes setWatchVideoId and drives
- * watchPlayerRef, so this hook is called before useSignalR and sends through
- * signalRRef (populated once the connection is wired).
+ * SessionRoom's central transport handler — it writes setWatchVideoId and drives
+ * watchPlayerRef, so this hook is called before useTransport and sends through
+ * transportRef (populated once the connection is wired).
  */
 export function useWatchTogether(
   sessionIdRef: RefObject<string | null>,
-  signalRRef: RefObject<VideoSyncSender | null>,
+  transportRef: RefObject<VideoSyncSender | null>,
   showToast: ShowToast,
 ) {
   const [watchVideoId, setWatchVideoId] = useState<string | null>(null);
@@ -31,24 +31,24 @@ export function useWatchTogether(
     setShowWatchPrompt(false);
     if (sessionIdRef.current) {
       // Send the bare ID — accepted by extractYouTubeVideoId on the peer side too.
-      signalRRef.current?.notifyVideoSync(sessionIdRef.current, 'load', id);
+      transportRef.current?.notifyVideoSync(sessionIdRef.current, 'load', id);
     }
-  }, [sessionIdRef, signalRRef, showToast]);
+  }, [sessionIdRef, transportRef, showToast]);
 
   const handleCloseWatch = useCallback(() => {
     setWatchVideoId(null);
     if (sessionIdRef.current) {
-      signalRRef.current?.notifyVideoSync(sessionIdRef.current, 'close', '');
+      transportRef.current?.notifyVideoSync(sessionIdRef.current, 'close', '');
     }
-  }, [sessionIdRef, signalRRef]);
+  }, [sessionIdRef, transportRef]);
 
   const handleLocalVideoAction = useCallback(
     (action: 'play' | 'pause' | 'seek', payloadSeconds: number) => {
       if (sessionIdRef.current) {
-        signalRRef.current?.notifyVideoSync(sessionIdRef.current, action, String(payloadSeconds));
+        transportRef.current?.notifyVideoSync(sessionIdRef.current, action, String(payloadSeconds));
       }
     },
-    [sessionIdRef, signalRRef],
+    [sessionIdRef, transportRef],
   );
 
   return {
