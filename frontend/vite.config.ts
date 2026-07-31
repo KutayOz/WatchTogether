@@ -1,9 +1,30 @@
-import { defineConfig } from 'vite'
+// defineConfig comes from 'vitest/config' rather than 'vite' so the `test`
+// block below is typed. It's a superset of vite's — every non-test option
+// behaves identically, and vitest is a devDependency that `npm ci` installs,
+// so the Docker build stage still resolves it.
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  test: {
+    /*
+     * Unit tests. Separate from e2e/ — those are Playwright specs against a
+     * running app (`npm run e2e`) and must NOT be picked up here, hence the
+     * explicit include rather than vitest's default glob.
+     *
+     * environment: 'node' — not jsdom. The only thing under test today is
+     * services/api.ts, a fetch wrapper with no DOM dependency; the handful of
+     * browser globals it touches on the 401 path (window.location, localStorage,
+     * sessionStorage) are stubbed per-test with vi.stubGlobal. That's both
+     * lighter than pulling in jsdom and *more* precise here: jsdom refuses to
+     * perform navigation, so it can't observe the login redirect we assert on.
+     * Adding component tests later means installing jsdom and switching this.
+     */
+    environment: 'node',
+    include: ['src/**/*.test.ts'],
+  },
   build: {
     /*
      * Bundle splitting strategy
