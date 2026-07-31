@@ -1,4 +1,5 @@
 import { logger } from './logger';
+import { dataChannelService } from './dataChannelService';
 import type { IceServerConfig, ScreenShareQuality, QualityPreset } from '../types';
 import { QUALITY_PRESETS as QualityPresets } from '../types';
 
@@ -43,6 +44,12 @@ class WebRTCService {
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];
     this.setupPeerConnectionHandlers();
+
+    // Before any offer is created, so both channels land in the initial SDP and
+    // never cost a renegotiation of their own. Both ends create their own side
+    // (the channels are negotiated with fixed ids), so this runs identically
+    // for offerer and answerer.
+    dataChannelService.attach(this.peerConnection);
   }
 
   private setupPeerConnectionHandlers(): void {
@@ -688,6 +695,9 @@ class WebRTCService {
       clearTimeout(this.disconnectTimer);
       this.disconnectTimer = null;
     }
+    // Before the peer connection goes, so the channels close cleanly rather
+    // than being torn out from under their handlers.
+    dataChannelService.detach();
     this.localStream?.getTracks().forEach(track => track.stop());
     this.screenStream?.getTracks().forEach(track => track.stop());
     this.peerConnection?.close();

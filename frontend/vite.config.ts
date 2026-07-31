@@ -1,9 +1,47 @@
+/// <reference types="vitest/config" />
+import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  test: {
+    // wsService reads window.location to build its URL and compares against
+    // WebSocket's static readyState constants, so it needs a DOM. The socket
+    // itself is replaced by a fake in the tests — nothing dials out.
+    environment: 'happy-dom',
+    include: ['src/**/*.test.ts'],
+  },
+  resolve: {
+    alias: {
+      /*
+       * The wire protocol is one contract, and it used to be two hand-mirrored
+       * copies in two languages — a change on one side failed at runtime on the
+       * other, silently. Importing the Worker's own module means drift is a
+       * compile error instead.
+       */
+      '@shared': fileURLToPath(new URL('../worker/src/lib', import.meta.url)),
+    },
+  },
+  server: {
+    // The alias resolves outside the Vite root, so the dev server has to be
+    // allowed to serve from the repo root.
+    fs: { allow: ['..'] },
+    /*
+     * Single-origin in production: the Worker serves both the SPA and /api/*.
+     * `vite dev` runs on its own port, so proxy the API — including the
+     * WebSocket upgrade — at `wrangler dev`. Without ws:true the upgrade would
+     * 404 and the session would never join.
+     */
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8787',
+        changeOrigin: true,
+        ws: true,
+      },
+    },
+  },
   build: {
     /*
      * Bundle splitting strategy
@@ -12,11 +50,11 @@ export default defineConfig({
      * every visitor downloaded before /login could render. We split along
      * two axes:
      *
-     *   1) Vendor chunks (long-lived, deploy-cached) — React, SignalR,
-     *      and webrtc-adapter rarely change between releases, so isolating
+     *   1) Vendor chunks (long-lived, deploy-cached) — React and
+     *      webrtc-adapter rarely change between releases, so isolating
      *      them means the user's browser keeps the cached file across
-     *      most of our deploys. signalr + webrtc-adapter are also gated
-     *      to the session route — auth/lobby visitors don't pay for them.
+     *      most of our deploys. webrtc-adapter is also gated to the
+     *      session route — auth/lobby visitors don't pay for it.
      *
      *   2) Route group chunks — each top-level area (auth, lobby, session,
      *      admin, settings) compiles into its own chunk. Lazy() in App.tsx
@@ -66,9 +104,6 @@ export default defineConfig({
               id.includes('node_modules/scheduler/') // peer dep of react
             ) {
               return 'react-vendor';
-            }
-            if (id.includes('node_modules/@microsoft/signalr')) {
-              return 'signalr';
             }
             if (id.includes('node_modules/webrtc-adapter')) {
               return 'webrtc-adapter';

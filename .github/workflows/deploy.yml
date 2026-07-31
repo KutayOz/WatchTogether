@@ -1,0 +1,109 @@
+# Ships main to production.
+#
+# This is the workflow that stops a laptop from being infrastructure. Until it
+# exists, the only machine on earth that can deploy WatchTogether is whichever
+# one happens to hold a `wrangler login` session.
+#
+# It re-runs the full check suite first rather than trusting that main is green.
+# Branch protection should make that redundant, but "should" is doing a lot of
+# work in a repo where anyone with push access can bypass a pull request. The
+# checks cost about a minute; shipping a broken worker costs more.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  # Manual re-run, for when a deploy needs repeating without a code change.
+  workflow_dispatch:
+
+# Never two deploys at once. cancel-in-progress is false on purpose: killing a
+# deploy halfway through leaves you guessing which half landed.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  deploy:
+    name: deploy to Cloudflare
+    needs: checks
+    runs-on: ubuntu-latest
+    # Attach required reviewers or a wait timer to this environment in repo
+    # settings if you ever want a human in the loop before production.
+    environment: production
+    env:
+      # Repo secrets, set under Settings → Secrets and variables → Actions.
+      # A scoped API token, not your account password and not an OAuth session.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            worker/package-lock.json
+
+      # Order is load-bearing. wrangler.toml points [assets] at
+      # ../frontend/dist, so the SPA has to be built before the Worker is
+      # uploaded — get this backwards and you ship yesterday's frontend with
+      # today's backend.
+      - name: Build the SPA
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install worker dependencies
+        working-directory: worker
+        run: npm ci
+
+      # Before the deploy, so the schema is never behind the code that queries
+      # it. Worth knowing: D1 migrations are forward-only. `wrangler rollback`
+      # returns the code to a previous version, but a migration that dropped a
+      # column is not coming back — so destructive migrations need the
+      # expand/contract treatment (add the new shape, ship code using it, remove
+      # the old shape in a later deploy) rather than a single cutover.
+      - name: Apply D1 migrations
+        working-directory: worker
+        run: npm run db:migrate:remote
+
+      # npx rather than cloudflare/wrangler-action, so the deploy uses exactly
+      # the wrangler version in package-lock.json — the same one that ran
+      # locally. One fewer third-party action in the path to production.
+      - name: Deploy
+        working-directory: worker
+        run: npx wrangler deploy
+
+      # Every deploy is a retained version and the id is the rollback handle:
+      #   npx wrangler rollback <version-id>
+      # Recording it here means recovery does not depend on finding the right
+      # run and scrolling its log.
+      - name: Record the deployed version
+        working-directory: worker
+        run: |
+          # Newest deployment is LAST in the array, and the version id is nested
+          # under versions[] — both verified against a real deployment rather
+          # than guessed. Falls back to "unknown" instead of failing the run:
+          # the deploy already succeeded by this point, and a summary line is
+          # not worth marking it red over.
+          VERSION=$(npx wrangler deployments list --json 2>/dev/null \
+            | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{
+                try { const d=JSON.parse(s); console.log(d.at(-1)?.versions?.[0]?.version_id ?? "unknown") }
+                catch { console.log("unknown") } })')
+          {
+            echo "### Deployed \`$VERSION\`"
+            echo ""
+            echo "Roll back with:"
+            echo '```bash'
+            echo "npx wrangler rollback $VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

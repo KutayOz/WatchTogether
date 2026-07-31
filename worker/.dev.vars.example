@@ -1,0 +1,16 @@
+# Local-development overrides for [vars] in wrangler.toml.
+# Not secrets — just the localhost relying-party config so `wrangler dev` can
+# run a real passkey ceremony. Real secrets go in `wrangler secret put`.
+RP_ID = "localhost"
+RP_ORIGIN = "http://localhost:8787"
+
+# Dev-only. Production values are set with `wrangler secret put`.
+JWT_SECRET = "DEV_ONLY_do_not_use_in_production_at_least_32_bytes_long"
+SETUP_SECRET = "DEV_ONLY_setup_secret"
+
+# Cloudflare Realtime TURN. Optional — when unset the app serves STUN only,
+# which works for most peers but fails behind symmetric NAT.
+# Production values go in `wrangler secret put`.
+CLOUDFLARE_TURN_KEY_ID = ""
+CLOUDFLARE_TURN_API_TOKEN = ""
+CLOUDFLARE_TURN_TTL_SECONDS = ""

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { useAuthContext } from '../../context/AuthContext';
 import { useSessionContext } from '../../context/SessionContext';
-import { useSignalR } from '../../hooks/useSignalR';
+import { useTransport } from '../../hooks/useTransport';
 import { useWebRTC } from '../../hooks/useWebRTC';
 import { useMediaDevices } from '../../hooks/useMediaDevices';
 import { useSpeedTest } from '../../hooks/useSpeedTest';
@@ -34,12 +34,16 @@ import {
   BackButton,
   Doodle,
 } from '../manga';
-import type { ScreenShareQuality, QualityFeedback } from '../../types';
+import type { MediaState, ScreenShareQuality, QualityFeedback } from '../../types';
 import { QUALITY_PRESETS } from '../../types';
 
 export function SessionRoom() {
   const { id: urlSessionId } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // Display only — it picks the wording of the lobby's context hint. The
+  // negotiation role used to be read from here too, which is exactly why a
+  // refresh broke calls; that now comes from the server's Joined frame, and
+  // this being wrong after a refresh costs nothing but a slightly off label.
   const location = useLocation();
   const isCreator = (location.state as { isCreator?: boolean })?.isCreator ?? false;
   const { user } = useAuthContext();
@@ -109,7 +113,7 @@ export function SessionRoom() {
   // who collapsed the sidebar still notice fresh chat.
   const [unreadMessages, setUnreadMessages] = useState(0);
 
-  // Mirror isSidebarOpen into a ref so the SignalR handler — which keeps
+  // Mirror isSidebarOpen into a ref so the transport handler — which keeps
   // its first-mount closure — sees the current value when deciding to
   // bump the unread counter.
   const isSidebarOpenRef = useRef(isSidebarOpen);
@@ -131,13 +135,16 @@ export function SessionRoom() {
 
   const pendingScreenShareRef = useRef<{ stream: MediaStream; streamId: string } | null>(null);
 
+  // Who creates the offer. Both of these now come from the server's Joined
+  // frame rather than from React Router's location.state, which is the fix for
+  // a real bug: refreshing mid-call lost the router state, so both peers came
+  // back as answerers and sat waiting for an offer neither would send.
   const isInitiatorRef = useRef(false);
-  // Perfect-negotiation role: the joiner (non-creator) is "polite" and yields on
-  // offer glare; the creator is "impolite" and ignores the colliding offer. Set
-  // alongside isInitiatorRef at join time.
+  // Perfect-negotiation role: the answerer is "polite" and yields on offer
+  // glare; the offerer is "impolite" and ignores the colliding offer.
   const politeRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
-  const signalRRef = useRef<ReturnType<typeof useSignalR> | null>(null);
+  const transportRef = useRef<ReturnType<typeof useTransport> | null>(null);
   const peerNameRef = useRef<string | null>(null);
   const screenShareQualityRef = useRef<ScreenShareQuality>(screenShareQuality);
   const localScreenStreamIdRef = useRef<string | null>(null);
@@ -157,17 +164,17 @@ export function SessionRoom() {
 
   const handleIceCandidate = useCallback(async (candidate: string) => {
     const currentSessionId = sessionIdRef.current;
-    const currentSignalR = signalRRef.current;
-    if (currentSessionId && currentSignalR) {
+    const currentTransport = transportRef.current;
+    if (currentSessionId && currentTransport) {
       try {
-        await currentSignalR.sendIceCandidate(currentSessionId, candidate);
+        await currentTransport.sendIceCandidate(currentSessionId, candidate);
       } catch (err) {
         logger.error('[WebRTC] Failed to send ICE candidate:', err);
       }
     } else {
-      logger.warn('[WebRTC] Cannot send ICE - no session or signalR', {
+      logger.warn('[WebRTC] Cannot send ICE - no session or transport', {
         hasSession: !!currentSessionId,
-        hasSignalR: !!currentSignalR,
+        hasTransport: !!currentTransport,
       });
     }
   }, []);
@@ -176,12 +183,12 @@ export function SessionRoom() {
 
   const handleIceRestart = useCallback(async () => {
     const currentSessionId = sessionIdRef.current;
-    const currentSignalR = signalRRef.current;
+    const currentTransport = transportRef.current;
     const currentWebrtc = webrtcRef.current;
-    if (currentSessionId && currentSignalR && currentWebrtc) {
+    if (currentSessionId && currentTransport && currentWebrtc) {
       try {
         const offer = await currentWebrtc.createIceRestartOffer();
-        await currentSignalR.sendRenegotiationOffer(currentSessionId, offer);
+        await currentTransport.sendRenegotiationOffer(currentSessionId, offer);
       } catch (err) {
         logger.error('[Session] ICE restart failed:', err);
       }
@@ -195,6 +202,38 @@ export function SessionRoom() {
 
   useEffect(() => {
     webrtcRef.current = webrtc;
+  }, [webrtc]);
+
+  /**
+   * Send the offer, plus the state the peer needs to render us correctly.
+   *
+   * One path for all four ways a peer can appear: they join, we join and find
+   * them already there, they refresh, we refresh. Only the offerer acts, so
+   * this is safe to call unconditionally.
+   *
+   * Media state is passed in rather than read from isMuted/isCameraOn because
+   * the join-time caller has just toggled them and would still be looking at
+   * the pre-toggle render's values.
+   */
+  const offerToPeer = useCallback(async (mediaState: MediaState) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!isInitiatorRef.current || !currentSessionId) return;
+
+    try {
+      const offer = await webrtc.createOffer();
+      await transportRef.current?.sendOffer(currentSessionId, offer);
+
+      if (localScreenStreamIdRef.current) {
+        await transportRef.current?.notifyScreenShareStarted(
+          currentSessionId,
+          localScreenStreamIdRef.current,
+        );
+      }
+
+      await transportRef.current?.notifyMediaStateChange(currentSessionId, mediaState);
+    } catch (err) {
+      logger.error('[transport] Failed to create/send offer:', err);
+    }
   }, [webrtc]);
 
   // Background blur pipeline lives here (after webrtc so cameraTrack is in
@@ -264,62 +303,73 @@ export function SessionRoom() {
   });
 
   // Invite link state + generate/copy/expiry-countdown. Placed after
-  // sessionIdRef (read inside) and before useSignalR (onPeerLeft clears it).
+  // sessionIdRef (read inside) and before useTransport (onPeerLeft clears it).
   const {
     inviteUrl, isGeneratingInvite, inviteCopied,
     setInviteUrl, setInviteExpiry, handleGenerateInvite, handleCopyInvite, getInviteTimeRemaining,
   } = useInviteLink(sessionIdRef, setToast);
 
   // Watch Together co-watch state + local→peer sync senders. Receive side lives
-  // in the central SignalR handler below (writes setWatchVideoId / watchPlayerRef).
+  // in the central transport handler below (writes setWatchVideoId / watchPlayerRef).
   const {
     watchVideoId, setWatchVideoId, showWatchPrompt, setShowWatchPrompt,
     watchPlayerRef, handleStartWatch, handleCloseWatch, handleLocalVideoAction,
-  } = useWatchTogether(sessionIdRef, signalRRef, setToast);
+  } = useWatchTogether(sessionIdRef, transportRef, setToast);
 
   // Ephemeral peer presence: cursor halo, typing indicator, floating reactions.
-  // Receive side lives in the central SignalR handler (drives the setters).
+  // Receive side lives in the central transport handler (drives the setters).
   const {
     peerCursor, setPeerCursor, handleLocalCursor,
     peerTypingName, isPeerTyping, setPeerTypingAt, setPeerTypingName, handleLocalTyping,
     reactions, setReactions, handleSendReaction,
-  } = usePeerPresence(sessionIdRef, signalRRef, user?.displayName);
+  } = usePeerPresence(sessionIdRef, transportRef, user?.displayName);
 
   // Post-C4: auth is via cookie. We just gate connection on whether the user
   // is logged in at all — the cookie travels with the WebSocket handshake.
-  const signalR = useSignalR(!!user, {
+  const transport = useTransport(!!user, {
     onPeerJoined: async (displayName) => {
       setPeerHasLeft(false);
       setPeerName(displayName);
       peerNameRef.current = displayName;
       setToast({ message: `${displayName} joined the session`, type: 'info' });
 
-      if (isInitiatorRef.current && sessionIdRef.current) {
-        try {
-          const offer = await webrtc.createOffer();
-          await signalRRef.current?.sendOffer(sessionIdRef.current, offer);
-
-          if (localScreenStreamIdRef.current) {
-            await signalRRef.current?.notifyScreenShareStarted(
-              sessionIdRef.current,
-              localScreenStreamIdRef.current
-            );
-          }
-
-          await signalRRef.current?.notifyMediaStateChange(sessionIdRef.current, {
-            isMuted,
-            isCameraOn,
-            isScreenSharing: !!localScreenStreamIdRef.current,
-          });
-        } catch (err) {
-          logger.error('[SignalR] Failed to create/send offer:', err);
-        }
-      }
+      await offerToPeer({
+        isMuted,
+        isCameraOn,
+        isScreenSharing: !!localScreenStreamIdRef.current,
+      });
     },
     onExistingPeer: (displayName) => {
       setPeerHasLeft(false);
       setPeerName(displayName);
       peerNameRef.current = displayName;
+    },
+    // The peer replaced their socket — refresh, tab restore, network flap. The
+    // server tells us rather than leaving us to infer it from a PeerLeft that
+    // never arrives, and a fresh offer rebuilds the peer connection their
+    // reload destroyed. This is the half of reconnect SignalR never had:
+    // withAutomaticReconnect restored the transport and nothing rejoined the
+    // room or renegotiated the media.
+    onPeerReconnected: async (displayName) => {
+      setPeerHasLeft(false);
+      setPeerName(displayName);
+      peerNameRef.current = displayName;
+
+      await offerToPeer({
+        isMuted,
+        isCameraOn,
+        isScreenSharing: !!localScreenStreamIdRef.current,
+      });
+    },
+    onReconnecting: () => {
+      setToast({ message: 'reconnecting…', type: 'warning' });
+    },
+    onReconnected: () => {
+      setToast({ message: 'back online', type: 'info' });
+    },
+    onFatal: (reason) => {
+      setError(reason);
+      setToast({ message: reason, type: 'error' });
     },
     onPeerLeft: (displayName) => {
       setPeerHasLeft(true);
@@ -341,24 +391,24 @@ export function SessionRoom() {
         await webrtc.setRemoteDescription(sdpOffer);
         const answer = await webrtc.createAnswer();
         if (sessionIdRef.current) {
-          await signalRRef.current?.sendAnswer(sessionIdRef.current, answer);
+          await transportRef.current?.sendAnswer(sessionIdRef.current, answer);
         }
       } catch (err) {
-        logger.error('[SignalR] Failed to handle offer:', err);
+        logger.error('[transport] Failed to handle offer:', err);
       }
     },
     onReceiveAnswer: async (sdpAnswer) => {
       try {
         await webrtc.setRemoteDescription(sdpAnswer);
       } catch (err) {
-        logger.error('[SignalR] Failed to set answer:', err);
+        logger.error('[transport] Failed to set answer:', err);
       }
     },
     onReceiveIceCandidate: async (candidate) => {
       try {
         await webrtc.addIceCandidate(candidate);
       } catch (err) {
-        logger.error('[SignalR] Failed to add ICE candidate:', err);
+        logger.error('[transport] Failed to add ICE candidate:', err);
       }
     },
     onReceiveChatMessage: (message) => {
@@ -425,12 +475,12 @@ export function SessionRoom() {
         await webrtc.addScreenShareTracks(stream, screenShareQualityRef.current);
         setCurrentScreenSharer(user?.displayName ?? 'You');
 
-        await signalRRef.current?.notifyScreenShareStarted(sessionIdRef.current, streamId);
+        await transportRef.current?.notifyScreenShareStarted(sessionIdRef.current, streamId);
 
         const offer = await webrtc.createOffer();
-        await signalRRef.current?.sendRenegotiationOffer(sessionIdRef.current, offer);
+        await transportRef.current?.sendRenegotiationOffer(sessionIdRef.current, offer);
 
-        await signalRRef.current?.notifyMediaStateChange(sessionIdRef.current, {
+        await transportRef.current?.notifyMediaStateChange(sessionIdRef.current, {
           isMuted,
           isCameraOn,
           isScreenSharing: true,
@@ -472,7 +522,7 @@ export function SessionRoom() {
         await webrtc.setRemoteDescription(sdpOffer);
         const answer = await webrtc.createAnswer();
         if (sessionIdRef.current) {
-          await signalRRef.current?.sendRenegotiationAnswer(sessionIdRef.current, answer);
+          await transportRef.current?.sendRenegotiationAnswer(sessionIdRef.current, answer);
         }
       } catch (err) {
         logger.error('[Renegotiation] failed to handle offer:', err);
@@ -523,13 +573,13 @@ export function SessionRoom() {
   });
 
   useEffect(() => {
-    signalRRef.current = signalR;
-  }, [signalR]);
+    transportRef.current = transport;
+  }, [transport]);
 
   const handleQualityFeedback = useCallback(async (feedback: QualityFeedback) => {
-    if (sessionIdRef.current && signalRRef.current) {
+    if (sessionIdRef.current && transportRef.current) {
       try {
-        await signalRRef.current.sendQualityFeedback(sessionIdRef.current, feedback);
+        await transportRef.current.sendQualityFeedback(sessionIdRef.current, feedback);
       } catch (err) {
         logger.error('[Quality] Failed to send feedback:', err);
       }
@@ -594,8 +644,6 @@ export function SessionRoom() {
         throw new Error('Session is full or does not exist');
       }
 
-      isInitiatorRef.current = isCreator;
-      politeRef.current = !isCreator;
       sessionIdRef.current = targetSessionId;
 
       await webrtc.initialize();
@@ -612,7 +660,7 @@ export function SessionRoom() {
         // the in-call pipeline (Stretch 16) physically stops the track and
         // replaceTrack(null)s the sender — so the camera LED honestly goes
         // dark the moment the user lands in the room. We do this BEFORE
-        // signalR.joinSession so the first offer reflects the chosen state.
+        // transport.joinSession so the first offer reflects the chosen state.
         if (initial?.micOff) {
           toggleMute(webrtc.toggleAudio);
         }
@@ -634,13 +682,33 @@ export function SessionRoom() {
         }
       }
 
-      const joined = await signalR.joinSession(targetSessionId);
-      if (!joined) {
-        throw new Error('Failed to join session - room might be full');
-      }
+      // Resolves on the server's Joined frame — the readiness barrier that
+      // JoinSession's boolean return used to be. A room that is full or gone
+      // rejects with a message worth showing rather than a bare false.
+      const joined = await transport.joinSession(targetSessionId);
+
+      // Assigned with no await in between, deliberately: the promise settles
+      // inside the socket's message handler, so this runs as a microtask before
+      // any further frame can be delivered. An await here would open a gap in
+      // which a PeerJoined could arrive and find isInitiatorRef still false —
+      // and then nobody would ever offer.
+      isInitiatorRef.current = joined.isOfferer;
+      politeRef.current = !joined.isOfferer;
 
       setSessionId(targetSessionId);
       setStage('live');
+
+      // We arrived second. Nobody will announce the peer to us — they were
+      // already here — so if we are the offerer, this is our cue.
+      if (joined.existingPeers.length > 0) {
+        await offerToPeer({
+          // The lobby's toggles were applied moments ago and this render still
+          // sees the pre-toggle values, so read them from what the lobby said.
+          isMuted: initial?.micOff ?? false,
+          isCameraOn: !(initial?.camOff ?? false),
+          isScreenSharing: false,
+        });
+      }
     } catch (err) {
       logger.error('[Session] Failed to join session:', err);
       const errorMessage = err instanceof Error ? err.message : 'Failed to join session';
@@ -653,7 +721,7 @@ export function SessionRoom() {
     } finally {
       setIsJoining(false);
     }
-  }, [user, isJoining, isCreator, webrtc, signalR, setSessionId, toggleMute, toggleCamera]);
+  }, [user, isJoining, webrtc, transport, offerToPeer, setSessionId, toggleMute, toggleCamera]);
 
   const handlePreflightReady = useCallback((stream: MediaStream, initial: PreflightInitialState) => {
     if (!urlSessionId) {
@@ -671,7 +739,7 @@ export function SessionRoom() {
 
   const handleLeave = async () => {
     if (sessionIdRef.current) {
-      await signalR.leaveSession(sessionIdRef.current);
+      await transport.leaveSession(sessionIdRef.current);
     }
     webrtc.close();
     setSessionId(null);
@@ -737,10 +805,10 @@ export function SessionRoom() {
         setCurrentScreenSharer(user?.displayName ?? 'You');
 
         if (sessionIdRef.current) {
-          await signalR.notifyScreenShareStarted(sessionIdRef.current, streamId);
+          await transport.notifyScreenShareStarted(sessionIdRef.current, streamId);
           const offer = await webrtc.createOffer();
-          await signalR.sendRenegotiationOffer(sessionIdRef.current, offer);
-          await signalR.notifyMediaStateChange(sessionIdRef.current, {
+          await transport.sendRenegotiationOffer(sessionIdRef.current, offer);
+          await transport.notifyMediaStateChange(sessionIdRef.current, {
             isMuted,
             isCameraOn,
             isScreenSharing: true,
@@ -751,7 +819,7 @@ export function SessionRoom() {
 
       pendingScreenShareRef.current = { stream, streamId };
       setIsWaitingForApproval(true);
-      await signalR.requestScreenShare(sessionIdRef.current);
+      await transport.requestScreenShare(sessionIdRef.current);
     } catch (err) {
       logger.error('[Session] Screen share error:', err);
       setIsWaitingForApproval(false);
@@ -764,14 +832,14 @@ export function SessionRoom() {
 
   const handleApproveScreenShare = async () => {
     if (!sessionIdRef.current || !screenShareRequest) return;
-    await signalR.respondScreenShare(sessionIdRef.current, true);
+    await transport.respondScreenShare(sessionIdRef.current, true);
     setCurrentScreenSharer(screenShareRequest.from);
     setScreenShareRequest(null);
   };
 
   const handleDenyScreenShare = async () => {
     if (!sessionIdRef.current) return;
-    await signalR.respondScreenShare(sessionIdRef.current, false);
+    await transport.respondScreenShare(sessionIdRef.current, false);
     setScreenShareRequest(null);
   };
 
@@ -782,14 +850,14 @@ export function SessionRoom() {
       localScreenStreamIdRef.current = null;
 
       if (sessionIdRef.current) {
-        await signalR.stopScreenShare(sessionIdRef.current);
+        await transport.stopScreenShare(sessionIdRef.current);
 
         if (needsRenegotiation) {
           const offer = await webrtc.createOffer();
-          await signalR.sendRenegotiationOffer(sessionIdRef.current, offer);
+          await transport.sendRenegotiationOffer(sessionIdRef.current, offer);
         }
 
-        await signalR.notifyMediaStateChange(sessionIdRef.current, {
+        await transport.notifyMediaStateChange(sessionIdRef.current, {
           isMuted,
           isCameraOn,
           isScreenSharing: false,
@@ -803,7 +871,7 @@ export function SessionRoom() {
 
   const handleSendMessage = async (message: string) => {
     if (sessionIdRef.current) {
-      await signalR.sendChatMessage(sessionIdRef.current, message);
+      await transport.sendChatMessage(sessionIdRef.current, message);
     }
   };
 
@@ -1218,7 +1286,7 @@ export function SessionRoom() {
                         // Useful when the user notices a stale 'lost' state.
                         webrtc.createIceRestartOffer().then((offer) => {
                           if (sessionIdRef.current) {
-                            signalR.sendRenegotiationOffer(sessionIdRef.current, offer);
+                            transport.sendRenegotiationOffer(sessionIdRef.current, offer);
                           }
                         });
                       }
