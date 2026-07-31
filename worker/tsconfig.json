@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // Runtime types come from the generated worker-configuration.d.ts, which
+    // `wrangler types` derives from wrangler.toml. Rerun it after changing
+    // bindings. @cloudflare/workers-types is deliberately absent — it is
+    // superseded and would conflict.
+    "types": ["@cloudflare/vitest-pool-workers/types", "node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "worker-configuration.d.ts", "vitest.config.ts"]
+}

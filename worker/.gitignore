@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+dist/
+
+# Local var overrides. Committed variants would shadow production config, and
+# this is where real secrets would land during debugging.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example

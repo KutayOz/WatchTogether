@@ -1,0 +1,80 @@
+name = "app"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# The SPA build output. Requests that resolve to a static asset never invoke the
+# Worker, so they cost nothing against the 100k/day free request budget. Only
+# /api/* runs the Worker — which is exactly why the WebSocket route lives at
+# /api/session/ws/:sessionId rather than somewhere prettier.
+[assets]
+directory = "../frontend/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "watchtogether"
+database_id = "0372f4d6-afce-48f2-921c-f9fc6d3a164f"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionRoom"
+
+[[durable_objects.bindings]]
+name = "CHALLENGE"
+class_name = "AuthChallenge"
+
+# new_sqlite_classes, NOT new_classes. KV-backed Durable Objects are a paid-plan
+# feature; SQLite-backed ones are available on the Workers Free plan. Getting
+# this wrong is the most common silent free-plan deploy failure.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionRoom", "AuthChallenge"]
+
+# Rate limiting. Free, and crucially costs no Durable Object requests — the
+# scarce resource on this plan. `period` accepts only 10 or 60.
+[[unsafe.bindings]]
+name = "RL_GLOBAL"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 200, period = 60 }
+
+[[unsafe.bindings]]
+name = "RL_AUTH"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 20, period = 60 }
+
+[[unsafe.bindings]]
+name = "RL_LOOKUP"
+type = "ratelimit"
+namespace_id = "1003"
+simple = { limit = 60, period = 60 }
+
+# Nightly housekeeping: sweep expired deny-list entries and return invite
+# slots held by unused links. Replaces Mongo's TTL indexes, which D1 lacks.
+[triggers]
+crons = ["17 4 * * *"]
+
+[vars]
+# WebAuthn relying-party config — PRODUCTION values. Local dev overrides these
+# via .dev.vars (localhost / http://localhost:8787).
+#
+# The URL is <worker-name>.<account-subdomain>.workers.dev — both labels are
+# ours, so the worker is named "app" under the account subdomain
+# "watchtogether" to read as app.watchtogether.workers.dev.
+#
+# RP_ID is the full host rather than the registrable domain
+# (watchtogether.workers.dev). Both are legal — workers.dev is on the Public
+# Suffix List, so watchtogether.workers.dev is the eTLD+1 — but scoping to the
+# full host stops passkeys being shared with any other Worker deployed on this
+# same account subdomain.
+#
+# CHANGING THIS INVALIDATES EVERY REGISTERED PASSKEY. Decide the final domain
+# before real users register.
+RP_ID = "app.watchtogether.workers.dev"
+RP_ORIGIN = "https://app.watchtogether.workers.dev"
