@@ -3,6 +3,23 @@ import { dataChannelService } from './dataChannelService';
 import type { IceServerConfig, ScreenShareQuality, QualityPreset } from '../types';
 import { QUALITY_PRESETS as QualityPresets } from '../types';
 
+/**
+ * Encoder ceilings for the camera, in bps.
+ *
+ * The camera had no ceiling at all, so Chrome's default applied — and on a
+ * measured session that default let a 640x480 webcam settle at 1700 kbps while
+ * the screen share it was competing with got 600 kbps and was encoded down to
+ * 318x178. Both senders reported qualityLimitationReason 'bandwidth' for
+ * essentially the whole connection, so this was a split of a fixed budget, not
+ * a shortage the camera was innocent of.
+ *
+ * 640x480 at 30fps is a talking head in a corner; VP8 has no use for more than
+ * IDLE here. WHILE_SHARING is the one that matters: the shared screen is the
+ * thing both people are actually watching, so the thumbnail yields to it.
+ */
+const CAMERA_MAX_BITRATE_IDLE = 800_000;
+const CAMERA_MAX_BITRATE_WHILE_SHARING = 250_000;
+
 export type WebRTCEventHandlers = {
   onTrack?: (event: RTCTrackEvent) => void;
   onIceCandidate?: (candidate: RTCIceCandidate) => void;
@@ -194,6 +211,10 @@ class WebRTCService {
         logger.warn('[WebRTC] addTrack failed for', track.kind, err);
       }
     });
+
+    // Cap the camera the moment it has a sender. Fire-and-forget: this method
+    // is sync for its callers and a failed cap is never worth blocking a join.
+    void this.applyCameraEncoding(!!this.screenStream);
   }
 
   // Capture screen WITHOUT adding to peer connection (for permission flow)
@@ -264,6 +285,92 @@ class WebRTCService {
   }
 
   /**
+   * The sender carrying the camera.
+   *
+   * Identified by track id against localStream rather than by "first video
+   * sender": once a screen share is up there are two video senders, and their
+   * order is an accident of when addTrack ran. Background blur swaps the camera
+   * track through localStream too, so localStream stays the authority on which
+   * track is the camera.
+   */
+  private getCameraVideoSender(): RTCRtpSender | null {
+    if (!this.peerConnection || !this.localStream) return null;
+    const cameraTrackIds = new Set(this.localStream.getVideoTracks().map((t) => t.id));
+    return (
+      this.peerConnection
+        .getSenders()
+        .find((s) => s.track?.kind === 'video' && cameraTrackIds.has(s.track.id)) ?? null
+    );
+  }
+
+  /**
+   * setParameters, with the bitrate cap protected from the priority hint.
+   *
+   * networkPriority is the less portable of the two knobs, and a browser that
+   * rejects it would otherwise take the maxBitrate ceiling down with it — the
+   * whole call throws, and we'd silently keep the uncapped encoder that caused
+   * the problem. So: try both, and on failure retry with the ceiling alone.
+   */
+  private async setParametersSafely(
+    sender: RTCRtpSender,
+    params: RTCRtpSendParameters,
+    label: string,
+  ): Promise<boolean> {
+    try {
+      await sender.setParameters(params);
+      return true;
+    } catch (err) {
+      logger.debug(`[WebRTC] setParameters(${label}) rejected, retrying without priority:`, err);
+    }
+
+    const enc = params.encodings?.[0] as
+      | (RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType })
+      | undefined;
+    if (enc) delete enc.networkPriority;
+
+    try {
+      await sender.setParameters(params);
+      return true;
+    } catch (err) {
+      logger.warn(`[WebRTC] setParameters(${label}) failed — encoder left as-is:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Hold the camera to its share of the uplink.
+   *
+   * Two mechanisms, because they fail differently: maxBitrate is a hard ceiling
+   * the allocator cannot exceed, and networkPriority biases which stream sheds
+   * first when the estimate drops. The cap alone would still let Chrome split a
+   * *shrinking* budget evenly between camera and screen; the priority makes the
+   * camera the one that gives ground.
+   *
+   * Assigned unconditionally rather than behind `'networkPriority' in enc` —
+   * that guard reads as defensive but is a no-op switch: browsers are not
+   * obliged to pre-populate the key in getParameters(), and where they don't,
+   * the guard silently skips the setting it exists to protect.
+   */
+  private async applyCameraEncoding(isSharing: boolean): Promise<void> {
+    const sender = this.getCameraVideoSender();
+    if (!sender) return;
+
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    const enc = params.encodings[0] as RTCRtpEncodingParameters & {
+      networkPriority?: RTCPriorityType;
+    };
+    enc.maxBitrate = isSharing ? CAMERA_MAX_BITRATE_WHILE_SHARING : CAMERA_MAX_BITRATE_IDLE;
+    enc.networkPriority = isSharing ? 'low' : 'medium';
+
+    if (await this.setParametersSafely(sender, params, 'camera')) {
+      logger.debug(`[WebRTC] Camera capped at ${enc.maxBitrate} bps (sharing: ${isSharing})`);
+    }
+  }
+
+  /**
    * Motion-optimized video encoding parameters for a quality preset.
    * Mutates `params` in place. Shared by addScreenShareTracks (initial add)
    * and updateScreenShareQuality (live switch) so the two paths can never
@@ -295,9 +402,12 @@ class WebRTCService {
     enc.maxFramerate = preset.video.frameRate;
     // Allow the encoder to drop resolution to protect the frame rate.
     delete enc.scaleResolutionDownBy;
-    if ('networkPriority' in enc) {
-      (enc as RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType }).networkPriority = 'high';
-    }
+    // Unconditional: the old `'networkPriority' in enc` guard meant this only
+    // applied on browsers that happened to echo the key back from
+    // getParameters(), so the priority boost the screen share is supposed to
+    // have could silently never be set. setParametersSafely covers the risk.
+    (enc as RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType }).networkPriority =
+      'high';
 
     // Whole-sender preference (not per-encoding): smoothness over sharpness.
     params.degradationPreference = 'maintain-framerate';
@@ -338,11 +448,8 @@ class WebRTCService {
                 }
               }
 
-              try {
-                await sender.setParameters(params);
+              if (await this.setParametersSafely(sender, params, `screen ${track.kind}`)) {
                 logger.debug(`[WebRTC] Set ${track.kind} encoding (${quality}):`, params.encodings[0]);
-              } catch (err) {
-                logger.debug(`[WebRTC] Could not set ${track.kind} encoding params:`, err);
               }
             }
           } catch {
@@ -350,6 +457,10 @@ class WebRTCService {
           }
         }
       }
+
+      // The screen is now the thing worth spending uplink on — stand the camera
+      // down before the encoder has a chance to settle at its old ceiling.
+      await this.applyCameraEncoding(true);
 
       const videoTrack = this.screenStream.getVideoTracks()[0];
       if (videoTrack) {
@@ -406,15 +517,12 @@ class WebRTCService {
     // a live switch and a fresh share end up byte-for-byte identical.
     const params = videoSender.getParameters();
     this.applyVideoEncoding(params, preset);
-    try {
-      await videoSender.setParameters(params);
+    // CRITICAL: a bitrate tweak failing must NOT cascade into
+    // stop+getDisplayMedia+renegotiate — that re-prompts for screen permission
+    // and freezes the viewer. setParametersSafely swallows the failure; the
+    // stream keeps running, we just didn't move the cap.
+    if (await this.setParametersSafely(videoSender, params, 'screen video')) {
       logger.debug(`[WebRTC] updateScreenShareQuality video → ${quality}`, params.encodings[0]);
-    } catch (err) {
-      // CRITICAL: a bitrate tweak failing must NOT cascade into
-      // stop+getDisplayMedia+renegotiate — that re-prompts for screen permission
-      // and freezes the viewer. Treat it as a best-effort no-op; the stream keeps
-      // running, we just didn't move the cap.
-      logger.warn('[WebRTC] setParameters(video) failed — keeping stream as-is (non-fatal):', err);
     }
 
     // Best-effort framerate cap on the capture side. Partial browser support; a
@@ -480,6 +588,9 @@ class WebRTCService {
         this.screenStreamId = null;
         this.screenVideoSender = null;
         this.screenAudioSender = null;
+
+        // Nothing left to yield to — give the camera its full ceiling back.
+        await this.applyCameraEncoding(false);
         return true; // needs renegotiation
       }
       return false;

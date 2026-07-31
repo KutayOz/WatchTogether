@@ -118,9 +118,100 @@ export class FakeDataChannel {
   }
 }
 
-/** Just enough RTCPeerConnection to hand out data channels. */
+let trackSeq = 0;
+
+/** A track that can be told apart by id and kind — enough for sender routing. */
+export class FakeMediaStreamTrack {
+  readonly kind: 'video' | 'audio';
+  readonly id: string;
+  readyState: MediaStreamTrackState = 'live';
+  contentHint = '';
+  enabled = true;
+  onended: (() => void) | null = null;
+
+  constructor(kind: 'video' | 'audio', id?: string) {
+    this.kind = kind;
+    this.id = id ?? `${kind}-${++trackSeq}`;
+  }
+
+  stop(): void {
+    this.readyState = 'ended';
+  }
+
+  async applyConstraints(): Promise<void> {}
+  addEventListener(): void {}
+}
+
+export class FakeMediaStream {
+  readonly id: string;
+  private tracks: FakeMediaStreamTrack[];
+
+  constructor(tracks: FakeMediaStreamTrack[], id = `stream-${++trackSeq}`) {
+    this.tracks = [...tracks];
+    this.id = id;
+  }
+
+  getTracks(): FakeMediaStreamTrack[] {
+    return [...this.tracks];
+  }
+  getVideoTracks(): FakeMediaStreamTrack[] {
+    return this.tracks.filter((t) => t.kind === 'video');
+  }
+  getAudioTracks(): FakeMediaStreamTrack[] {
+    return this.tracks.filter((t) => t.kind === 'audio');
+  }
+  addTrack(track: FakeMediaStreamTrack): void {
+    if (!this.tracks.includes(track)) this.tracks.push(track);
+  }
+  removeTrack(track: FakeMediaStreamTrack): void {
+    this.tracks = this.tracks.filter((t) => t !== track);
+  }
+}
+
+/**
+ * Records what the code under test asked the encoder for.
+ *
+ * getParameters() hands back a *copy*, exactly like the real API — code that
+ * mutates the returned object and never calls setParameters must not appear to
+ * have configured anything, or the test would pass on a no-op.
+ */
+export class FakeRtpSender {
+  track: FakeMediaStreamTrack | null;
+  /** Every setParameters() call, newest last. */
+  readonly applied: RTCRtpSendParameters[] = [];
+  private params: RTCRtpSendParameters = { encodings: [{}] } as RTCRtpSendParameters;
+
+  constructor(track: FakeMediaStreamTrack) {
+    this.track = track;
+  }
+
+  getParameters(): RTCRtpSendParameters {
+    return structuredClone(this.params);
+  }
+
+  async setParameters(params: RTCRtpSendParameters): Promise<void> {
+    this.params = structuredClone(params);
+    this.applied.push(structuredClone(params));
+  }
+
+  async replaceTrack(track: FakeMediaStreamTrack | null): Promise<void> {
+    this.track = track;
+  }
+
+  /** Current encoder ceiling in bps, or undefined if never set. */
+  get maxBitrate(): number | undefined {
+    return this.params.encodings?.[0]?.maxBitrate;
+  }
+
+  get networkPriority(): string | undefined {
+    return (this.params.encodings?.[0] as { networkPriority?: string })?.networkPriority;
+  }
+}
+
+/** Just enough RTCPeerConnection to hand out data channels and senders. */
 export class FakePeerConnection {
   readonly channels: FakeDataChannel[] = [];
+  readonly senders: FakeRtpSender[] = [];
 
   createDataChannel(label: string, options: RTCDataChannelInit): FakeDataChannel {
     const channel = new FakeDataChannel(label, options);
@@ -133,4 +224,21 @@ export class FakePeerConnection {
     if (!found) throw new Error(`no channel labelled ${label}`);
     return found;
   }
+
+  addTrack(track: FakeMediaStreamTrack): FakeRtpSender {
+    const sender = new FakeRtpSender(track);
+    this.senders.push(sender);
+    return sender;
+  }
+
+  /** Real removeTrack leaves the sender in place with a null track. */
+  removeTrack(sender: FakeRtpSender): void {
+    sender.track = null;
+  }
+
+  getSenders(): FakeRtpSender[] {
+    return [...this.senders];
+  }
+
+  close(): void {}
 }
