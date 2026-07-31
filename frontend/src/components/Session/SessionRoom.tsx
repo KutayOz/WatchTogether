@@ -153,6 +153,10 @@ export function SessionRoom() {
   const userOverrodeQualityRef = useRef(false);
   // Throttle timestamp for the reactive (viewer-feedback-driven) auto-downgrade.
   const lastAutoDowngradeRef = useRef(0);
+  // Whether the previous viewer report was already 'critical'. The downgrade
+  // needs two in a row so a single bad 3-second window can't ratchet quality
+  // down permanently — nothing ever raises it back.
+  const lastFeedbackWasCriticalRef = useRef(false);
   // One step down the quality ladder, used by the reactive downgrade. Floor at 'low'.
   const QUALITY_DOWNGRADE: Record<ScreenShareQuality, ScreenShareQuality> = {
     extreme: 'ultra', ultra: 'high', high: 'medium', medium: 'low', low: 'low', auto: 'low',
@@ -574,11 +578,23 @@ export function SessionRoom() {
           type: 'warning',
         });
       }
-      // Close the adaptation loop: on CRITICAL viewer feedback while sharing, step
-      // the encoder down one preset (throttled to once / 8s). Reactive safety net
-      // on top of the proactive speed-test clamp. 'poor' only warns — only
-      // 'critical' acts, so we don't thrash the quality up and down.
-      if (feedback.level === 'critical' && webrtc.isScreenSharing) {
+      // Close the adaptation loop: on sustained CRITICAL viewer feedback while
+      // sharing, step the encoder down one preset (throttled to once / 8s).
+      // Reactive safety net on top of the proactive uplink clamp. 'poor' only
+      // warns — only 'critical' acts, so we don't thrash the quality up and down.
+      //
+      // Two readings, not one. The score used to be incapable of reaching
+      // 'critical' on a frame-rate collapse, so this branch effectively never
+      // ran; now that it reports honestly, a single bad 3-second window — a
+      // passing wifi hiccup, someone else on the link starting a download —
+      // would be enough to permanently step quality down, and nothing here ever
+      // steps it back up. Requiring the next window to agree costs 3 seconds of
+      // reaction time and buys us not reacting to noise.
+      const criticalNow = feedback.level === 'critical';
+      const criticalTwice = criticalNow && lastFeedbackWasCriticalRef.current;
+      lastFeedbackWasCriticalRef.current = criticalNow;
+
+      if (criticalTwice && webrtc.isScreenSharing) {
         const now = Date.now();
         if (now - lastAutoDowngradeRef.current > 8000) {
           const current = screenShareQualityRef.current;

@@ -18,7 +18,17 @@ import { QUALITY_PRESETS as QualityPresets } from '../types';
  * thing both people are actually watching, so the thumbnail yields to it.
  */
 const CAMERA_MAX_BITRATE_IDLE = 800_000;
-const CAMERA_MAX_BITRATE_WHILE_SHARING = 250_000;
+const CAMERA_MAX_BITRATE_WHILE_SHARING = 150_000;
+
+/**
+ * How far the camera is scaled down while a screen share is running.
+ *
+ * 2 takes 640x480 to 320x240, which is more than the corner thumbnail is ever
+ * displayed at. Without this the encoder keeps trying to hold 640x480 inside a
+ * 150 kbps ceiling and spends the budget on macroblock noise; told to shrink,
+ * it spends the same bits on a clean small picture.
+ */
+const CAMERA_SCALE_DOWN_WHILE_SHARING = 2;
 
 export type WebRTCEventHandlers = {
   onTrack?: (event: RTCTrackEvent) => void;
@@ -364,9 +374,64 @@ class WebRTCService {
     };
     enc.maxBitrate = isSharing ? CAMERA_MAX_BITRATE_WHILE_SHARING : CAMERA_MAX_BITRATE_IDLE;
     enc.networkPriority = isSharing ? 'low' : 'medium';
+    if (isSharing) {
+      enc.scaleResolutionDownBy = CAMERA_SCALE_DOWN_WHILE_SHARING;
+    } else {
+      delete enc.scaleResolutionDownBy;
+    }
 
     if (await this.setParametersSafely(sender, params, 'camera')) {
       logger.debug(`[WebRTC] Camera capped at ${enc.maxBitrate} bps (sharing: ${isSharing})`);
+    }
+  }
+
+  /**
+   * Ask for VP9 on the screen share.
+   *
+   * The measured session encoded with `libvpx` — VP8 — and the picture was the
+   * complaint. VP9 carries roughly the same quality in 30-50% fewer bits, and
+   * on a link that is bandwidth-limited every hour of the day, fewer bits per
+   * frame converts directly into resolution: the encoder stops having to choose
+   * 318x178 to stay inside its ceiling. This is the only lever here that
+   * improves the picture without taking bandwidth from something else.
+   *
+   * Promote-only, rather than sorting the whole list: RTX, RED and FEC entries
+   * keep their original relative order, and a browser without VP9 is left
+   * exactly as it was. setCodecPreferences also only reorders *our* offer — the
+   * answerer still picks from the intersection — so a peer that cannot do VP9
+   * negotiates VP8 as before rather than failing.
+   *
+   * The trade is CPU: VP9 encode costs more than VP8. The measured session had
+   * `qualityLimitationDurations.cpu` at 0, so there was headroom, but that was
+   * headroom at 318x178. If this flips the limitation from 'bandwidth' to
+   * 'cpu', this is the change to revert.
+   */
+  private preferVp9(sender: RTCRtpSender): void {
+    if (!this.peerConnection) return;
+
+    const transceiver = this.peerConnection
+      .getTransceivers()
+      .find((t) => t.sender === sender);
+    if (!transceiver?.setCodecPreferences) return;
+
+    // typeof, not a bare reference: this runs inside addScreenShareTracks'
+    // per-track try block, and a ReferenceError here would be swallowed by it
+    // *after* skipping the setParameters call that applies the bitrate ceiling.
+    if (typeof RTCRtpSender === 'undefined') return;
+    const codecs = RTCRtpSender.getCapabilities?.('video')?.codecs;
+    if (!codecs?.length) return;
+
+    const isVp9 = (mime: string) => /\/vp9$/i.test(mime);
+    const vp9 = codecs.filter((c) => isVp9(c.mimeType));
+    if (vp9.length === 0) return; // nothing to promote — leave the order alone
+
+    try {
+      transceiver.setCodecPreferences([...vp9, ...codecs.filter((c) => !isVp9(c.mimeType))]);
+      logger.debug('[WebRTC] Screen share will offer VP9 first');
+    } catch (err) {
+      // Not fatal in any way: we simply negotiate whatever the browser would
+      // have negotiated on its own.
+      logger.debug('[WebRTC] setCodecPreferences(VP9) rejected:', err);
     }
   }
 
@@ -441,6 +506,9 @@ class WebRTCService {
                 // Motion-optimized: maintain-framerate + maxFramerate, and
                 // crucially NO scaleResolutionDownBy pin (see applyVideoEncoding).
                 this.applyVideoEncoding(params, preset);
+                // Before the renegotiation this addTrack triggers, so the codec
+                // order lands in the offer rather than needing a second one.
+                this.preferVp9(sender);
               } else if (track.kind === 'audio') {
                 // Use audio bitrate from quality preset
                 if (preset.audio.bitrate > 0) {

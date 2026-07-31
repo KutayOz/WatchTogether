@@ -206,12 +206,32 @@ export class FakeRtpSender {
   get networkPriority(): string | undefined {
     return (this.params.encodings?.[0] as { networkPriority?: string })?.networkPriority;
   }
+
+  get scaleResolutionDownBy(): number | undefined {
+    return this.params.encodings?.[0]?.scaleResolutionDownBy;
+  }
+}
+
+/** Records the codec order the code under test asked to offer. */
+export class FakeRtpTransceiver {
+  readonly sender: FakeRtpSender;
+  /** Codec order from the last setCodecPreferences call, or null if never set. */
+  codecPreferences: RTCRtpCodec[] | null = null;
+
+  constructor(sender: FakeRtpSender) {
+    this.sender = sender;
+  }
+
+  setCodecPreferences(codecs: RTCRtpCodec[]): void {
+    this.codecPreferences = [...codecs];
+  }
 }
 
 /** Just enough RTCPeerConnection to hand out data channels and senders. */
 export class FakePeerConnection {
   readonly channels: FakeDataChannel[] = [];
   readonly senders: FakeRtpSender[] = [];
+  readonly transceivers: FakeRtpTransceiver[] = [];
 
   createDataChannel(label: string, options: RTCDataChannelInit): FakeDataChannel {
     const channel = new FakeDataChannel(label, options);
@@ -228,7 +248,21 @@ export class FakePeerConnection {
   addTrack(track: FakeMediaStreamTrack): FakeRtpSender {
     const sender = new FakeRtpSender(track);
     this.senders.push(sender);
+    // Real addTrack creates (or reuses) a transceiver for the sender. Codec
+    // preferences live there, not on the sender.
+    this.transceivers.push(new FakeRtpTransceiver(sender));
     return sender;
+  }
+
+  getTransceivers(): FakeRtpTransceiver[] {
+    return [...this.transceivers];
+  }
+
+  /** The transceiver whose sender carries a given track id. */
+  transceiverFor(trackId: string): FakeRtpTransceiver {
+    const found = this.transceivers.find((t) => t.sender.track?.id === trackId);
+    if (!found) throw new Error(`no transceiver for track ${trackId}`);
+    return found;
   }
 
   /** Real removeTrack leaves the sender in place with a null track. */
