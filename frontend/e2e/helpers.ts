@@ -3,8 +3,8 @@ import { Page, expect } from '@playwright/test';
 /**
  * Test-side helpers for stubbing the API boundary.
  *
- * The frontend talks to the backend through fetch() against the same origin
- * (Vite dev server proxies /api → backend in real life, but in E2E we
+ * The frontend talks to the Worker through fetch() against the same origin
+ * (`vite dev` proxies /api → `wrangler dev` in real life, but in E2E we
  * intercept the request before it even leaves the page). All routes here are
  * relative to baseURL.
  *
@@ -16,46 +16,50 @@ import { Page, expect } from '@playwright/test';
  *  loose-typed copy so we don't pull frontend type imports into the test
  *  config (Vite + Playwright TS roots are separate). */
 interface MeShape {
-  email: string;
-  displayName: string;
+  username: string;
+  discriminator: string;
+  /** `username#1234` — the server precomputes it so the two cannot drift. */
+  tag: string;
   isRootUser?: boolean;
   hasAcceptedTerms?: boolean;
-  isInvitationTicketUsed?: boolean;
 }
 
 /**
  * Stand the user up as authenticated for the lifetime of the test.
  *
  * useAuth() does NOT call /me unless there's a cached user in storage
- * (optimistic-render pattern — see useAuth.ts line ~37). So an /api/auth/me
+ * (optimistic-render pattern — see useAuth.ts line ~47). So an /api/auth/me
  * mock by itself isn't enough: we also have to pre-seed localStorage with
  * the same keys getCachedUser() looks for. addInitScript runs in the page
  * context *before* any application script, so the React init() sees the
- * cache as if the user had already logged in on a prior visit.
+ * cache as if the user had already signed in on a prior visit.
  *
  * The /me mock is still useful — useAuth's background-verify path fires
  * after the initial render and overwrites state from this response. Without
  * the mock, /me would hit the dev server (or fail), potentially clearing
  * the optimistic state via the 401 redirect path.
+ *
+ * There is no token to fake. The JWT lives in an HttpOnly cookie that JS
+ * cannot write, which is the point — everything seeded here is public UI
+ * state that grants nothing on its own.
  */
 export async function mockLoggedInUser(page: Page, overrides: Partial<MeShape> = {}) {
   const user: MeShape = {
-    email: 'alice@example.test',
-    displayName: 'Alice',
+    username: 'alice',
+    discriminator: '0042',
+    tag: 'alice#0042',
     isRootUser: false,
     hasAcceptedTerms: true,
-    isInvitationTicketUsed: false,
     ...overrides,
   };
-  // 1) Seed storage so the optimistic-render path turns the user on.
+  // 1) Seed storage so the optimistic-render path turns the user on. These are
+  //    exactly the AUTH_KEYS in authStorage.ts; 'username' is the sentinel
+  //    getCachedUser() requires before it will return a user at all.
   await page.addInitScript((u) => {
-    // Match the exact keys useAuth + getCachedUser read in authStorage.ts.
-    // 'displayName' is the sentinel — its presence flips "logged in".
-    localStorage.setItem('rememberMe', 'true');
-    localStorage.setItem('displayName', u.displayName);
-    localStorage.setItem('email', u.email);
+    localStorage.setItem('username', u.username);
+    localStorage.setItem('discriminator', u.discriminator);
+    localStorage.setItem('tag', u.tag);
     localStorage.setItem('isRootUser', String(u.isRootUser ?? false));
-    localStorage.setItem('isInvitationTicketUsed', String(u.isInvitationTicketUsed ?? false));
     localStorage.setItem('hasAcceptedTerms', String(u.hasAcceptedTerms ?? true));
   }, user);
   // 2) Mock /me so the background-verify confirms (instead of clearing state).
@@ -76,38 +80,112 @@ export async function mockLoggedOut(page: Page) {
   });
 }
 
-/** Successful login. Body matches ExtendedLoginResponse on the backend. */
-export async function mockLoginSuccess(page: Page) {
-  await page.route('**/api/auth/login', async (route) => {
+/**
+ * Whether the instance already has a root account.
+ *
+ * /login calls this on mount and shows the first-run bootstrap form only when
+ * it answers false, so every test touching that screen has to pin it — an
+ * unmocked call reaches the dev server and the panel's visibility becomes a
+ * property of whatever is in the local database.
+ */
+export async function mockSetupStatus(page: Page, isSetupComplete: boolean) {
+  await page.route('**/api/auth/setup/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ isSetupComplete }),
+    });
+  });
+}
+
+/**
+ * Drive a passkey sign-in to a chosen outcome.
+ *
+ * Two halves, because a passkey ceremony has two:
+ *
+ *   - The *authenticator* half is stubbed by replacing navigator.credentials.
+ *     Chromium does expose a virtual authenticator over CDP, but it only
+ *     answers a challenge for a credential it holds, and minting one means
+ *     hand-rolling a PKCS#8 key whose signature the mocked server half would
+ *     then ignore anyway. The stub is the honest version of the same fiction.
+ *   - The *server* half is stubbed with page.route().
+ *
+ * So this covers the screen's wiring — button → ceremony → state → redirect,
+ * and the failure path back to the OOPS burst. It deliberately proves nothing
+ * about WebAuthn verification itself; that lives in the Worker's own suite
+ * (worker/src/routes/passkey.test.ts), where it runs against real crypto.
+ */
+export async function mockPasskeySignIn(
+  page: Page,
+  outcome: 'success' | 'cancelled',
+  user: Partial<MeShape> = {},
+) {
+  await page.addInitScript((shouldSucceed) => {
+    Object.defineProperty(navigator, 'credentials', {
+      configurable: true,
+      value: {
+        get: async () => {
+          if (!shouldSucceed) {
+            // What a real authenticator throws when the user dismisses the
+            // system sheet. useAuth maps it to the message the burst shows.
+            throw new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError');
+          }
+          // @simplewebauthn/browser reads these fields off the credential and
+          // re-encodes them; the shapes matter, the bytes do not, because the
+          // /finish mock below never looks at them.
+          const empty = new ArrayBuffer(0);
+          return {
+            id: 'dGVzdC1jcmVkZW50aWFs',
+            rawId: empty,
+            type: 'public-key',
+            authenticatorAttachment: 'platform',
+            response: {
+              clientDataJSON: empty,
+              authenticatorData: empty,
+              signature: empty,
+              userHandle: empty,
+            },
+            getClientExtensionResults: () => ({}),
+          };
+        },
+      },
+    });
+  }, outcome === 'success');
+
+  await page.route('**/api/auth/passkey/auth/begin', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
-        token: 'fake-jwt-token',
-        email: 'alice@example.test',
-        displayName: 'Alice',
+        challenge: 'Y2hhbGxlbmdl',
+        rpId: 'localhost',
+        timeout: 60000,
+        userVerification: 'preferred',
+        // Usernameless: the authenticator picks from its discoverable
+        // credentials rather than being handed a list.
+        allowCredentials: [],
+      }),
+    });
+  });
+
+  await page.route('**/api/auth/passkey/auth/finish', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        username: 'alice',
+        discriminator: '0042',
+        tag: 'alice#0042',
         isRootUser: false,
-        isInvitationTicketUsed: false,
         hasAcceptedTerms: true,
+        ...user,
       }),
     });
   });
 }
 
-/** Generic login failure — the real backend returns 401 with a single
- *  generic message (constant-time defense against email enumeration). */
-export async function mockLoginFailure(page: Page, status = 401) {
-  await page.route('**/api/auth/login', async (route) => {
-    await route.fulfill({
-      status,
-      contentType: 'application/json',
-      body: JSON.stringify({ message: 'Invalid email or password' }),
-    });
-  });
-}
-
 /** Track every JS chunk the page downloads. Useful for the code-split
- *  assertions — "did landing on /login pull in signalr-*.js?" */
+ *  assertions — "did landing on /login pull in the session chunk?" */
 export function trackChunkRequests(page: Page) {
   const downloaded: string[] = [];
   page.on('request', (req) => {

@@ -379,6 +379,36 @@ describe("session invites", () => {
     expect(response.status).toBe(403);
   });
 
+  /**
+   * A deliberate divergence from GenerateInvite in the .NET SessionService,
+   * which handed back the still-valid invite rather than minting a second one.
+   * Overwriting is the more useful behaviour — it makes "generate link" double
+   * as "revoke the one I pasted in the wrong window" — but it is a behaviour
+   * change, so it is pinned here rather than left to be rediscovered.
+   */
+  it("replaces the previous invite when the creator mints again", async () => {
+    const { stub } = await createSession("creator");
+    const mint = () =>
+      stub
+        .fetch("https://do/invite", { method: "POST", body: JSON.stringify({ userId: "creator" }) })
+        .then((r) => r.json<{ secret: string }>());
+
+    const first = await mint();
+    const second = await mint();
+
+    const redeem = (secret: string) =>
+      stub
+        .fetch("https://do/invite/redeem", {
+          method: "POST",
+          body: JSON.stringify({ secret, userId: "guest" }),
+        })
+        .then((r) => r.json<{ ok: boolean; error?: string }>());
+
+    expect(second.secret).not.toBe(first.secret);
+    expect(await redeem(first.secret)).toMatchObject({ ok: false, error: "invalid" });
+    expect(await redeem(second.secret)).toMatchObject({ ok: true });
+  });
+
   it("rejects a wrong secret", async () => {
     const { stub } = await createSession("creator");
     await stub.fetch("https://do/invite", {

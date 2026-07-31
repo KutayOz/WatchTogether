@@ -4,7 +4,7 @@ Three files, two of which are entry points:
 
 | | Trigger | Does |
 |---|---|---|
-| `checks.yml` | called by the other two | typecheck + tests + build, worker and frontend in parallel |
+| `checks.yml` | called by the other two | typecheck + tests + build, worker / frontend / e2e in parallel |
 | `ci.yml` | every pull request | runs `checks.yml` |
 | `deploy.yml` | push to `main`, or manual | runs `checks.yml`, then migrates D1 and deploys |
 
@@ -38,7 +38,7 @@ A green tick nobody is required to look at protects nothing. Under
 **Settings → Rules → Rulesets**, add a ruleset targeting `main` that requires:
 
 - a pull request before merging
-- the `worker` and `frontend` status checks to pass
+- the `worker`, `frontend` and `e2e` status checks to pass
 - branches to be up to date before merging — this is the one that would have
   caught the first two pull requests on this repo, which were branched off a
   `main` that predated the Cloudflare rewrite
@@ -66,10 +66,16 @@ in the run summary. A migration that dropped a column is not coming back, so
 destructive schema changes need expand/contract (add the new shape, ship code
 using it, remove the old shape in a later deploy) rather than a single cutover.
 
-**Lint is not a gate yet.** `npm run lint` reports 12 pre-existing errors in
-`ScreenShareView.tsx`, the Playwright specs and `webrtcService.ts`. A gate that
-is red the day you add it is a gate people learn to skip. Fix those first;
-`checks.yml` has the job commented out and ready.
+**Lint is not a gate yet.** `npm run lint` reports 10 pre-existing errors in
+`ScreenShareView.tsx`, `webrtcService.ts` and a handful of other components. A
+gate that is red the day you add it is a gate people learn to skip. Fix those
+first; `checks.yml` has the job commented out and ready.
+
+**The e2e job is new, and it is here because of what it caught.** Nothing ran
+those specs, so they went on testing the email-and-password sign-in form for
+two phases after passkeys replaced it — six of twelve red, and no signal
+anywhere. The specs stub `/api/*` at the network boundary, so the job needs no
+Worker, no database and no secrets; it takes about a minute.
 
 **The worker suite needs `.dev.vars`.** It is gitignored, because that is where
 real secrets land during local debugging, so `checks.yml` copies
