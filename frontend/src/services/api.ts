@@ -1,5 +1,6 @@
 import { API_URL } from '../utils/constants';
 import { clearAuthData } from '../utils/authStorage';
+import { apiError, readJson } from './http';
 import type {
   LoginResponse,
   PasskeyListItem,
@@ -38,6 +39,11 @@ import type {
 const baseHeaders: HeadersInit = {
   'Content-Type': 'application/json',
 };
+
+// Neither the failure nor the success side of a response is guaranteed to be
+// JSON — see ./http for why, and for what apiError/readJson do about it. Every
+// method below pairs the two with the same fallback wording, so a call fails
+// with one recognisable message whichever side went wrong.
 
 // Handle 401 responses by clearing cached UI state and redirecting to login.
 // Note: this CAN'T clear the auth cookie (HttpOnly) — only the server can,
@@ -80,8 +86,8 @@ export const api = {
   // Auth
   async getMe(): Promise<MeResponse> {
     const response = await authFetch(`${API_URL}/api/auth/me`);
-    if (!response.ok) throw new Error('Failed to fetch current user');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to fetch current user');
+    return readJson(response, 'Failed to fetch current user');
   },
 
   async login(email: string, password: string, rememberMe: boolean = false): Promise<LoginResponse> {
@@ -89,19 +95,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email, password, rememberMe }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Login failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Login failed');
+    return readJson(response, 'Login failed');
   },
 
   // ────────────────── Passkeys (WebAuthn) ──────────────────
 
   async passkeyBeginRegistration(): Promise<unknown> {
     const response = await authFetch(`${API_URL}/api/auth/passkey/register/begin`, { method: 'POST' });
-    if (!response.ok) throw new Error('Failed to start passkey registration');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to start passkey registration');
+    return readJson(response, 'Failed to start passkey registration');
   },
 
   async passkeyFinishRegistration(attestation: unknown, label: string): Promise<{ label: string }> {
@@ -109,11 +112,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ response: attestation, label }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.message || 'Passkey registration failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Passkey registration failed');
+    return readJson(response, 'Passkey registration failed');
   },
 
   async passkeyBeginAuth(email?: string): Promise<unknown> {
@@ -121,8 +121,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email: email ?? null }),
     });
-    if (!response.ok) throw new Error('Failed to start passkey authentication');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to start passkey authentication');
+    return readJson(response, 'Failed to start passkey authentication');
   },
 
   async passkeyFinishAuth(assertion: unknown): Promise<LoginResponse> {
@@ -130,17 +130,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(assertion),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.message || 'Passkey authentication failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Passkey authentication failed');
+    return readJson(response, 'Passkey authentication failed');
   },
 
   async passkeyList(): Promise<{ items: PasskeyListItem[] }> {
     const response = await authFetch(`${API_URL}/api/auth/passkey`);
-    if (!response.ok) throw new Error('Failed to load passkeys');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to load passkeys');
+    return readJson(response, 'Failed to load passkeys');
   },
 
   async passkeyRemove(credentialIdBase64Url: string): Promise<void> {
@@ -148,7 +145,7 @@ export const api = {
       `${API_URL}/api/auth/passkey/${encodeURIComponent(credentialIdBase64Url)}`,
       { method: 'DELETE' },
     );
-    if (!response.ok) throw new Error('Failed to remove passkey');
+    if (!response.ok) throw await apiError(response, 'Failed to remove passkey');
   },
 
   async googleSignIn(idToken: string, invitationLinkToken?: string): Promise<LoginResponse> {
@@ -159,11 +156,8 @@ export const api = {
       // for existing users (matched by GoogleId or email).
       body: JSON.stringify({ idToken, ...(invitationLinkToken ? { invitationLinkToken } : {}) }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.message || 'Google sign-in failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Google sign-in failed');
+    return readJson(response, 'Google sign-in failed');
   },
 
   async logout(): Promise<void> {
@@ -179,8 +173,8 @@ export const api = {
 
   async validateInvitation(token: string): Promise<ValidateInvitationResponse> {
     const response = await publicFetch(`${API_URL}/api/auth/invitation/${token}`);
-    if (!response.ok) throw new Error('Failed to validate invitation');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to validate invitation');
+    return readJson(response, 'Failed to validate invitation');
   },
 
   async register(invitationToken: string, displayName: string, password: string): Promise<RegisterResponse> {
@@ -188,20 +182,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ invitationToken, displayName, password }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Registration failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Registration failed');
+    return readJson(response, 'Registration failed');
   },
 
   async verifyEmailByToken(token: string): Promise<VerifyEmailResponse> {
     const response = await publicFetch(`${API_URL}/api/auth/verify-email/${encodeURIComponent(token)}`);
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Verification failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Verification failed');
+    return readJson(response, 'Verification failed');
   },
 
   async resendVerification(email: string): Promise<{ message: string }> {
@@ -209,18 +197,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to resend verification');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to resend verification');
+    return readJson(response, 'Failed to resend verification');
   },
 
   // Invitations
   async getAvailableSlots(): Promise<InvitationSlots> {
     const response = await authFetch(`${API_URL}/api/invitation/available-slots`);
-    if (!response.ok) throw new Error('Failed to get invitation slots');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get invitation slots');
+    return readJson(response, 'Failed to get invitation slots');
   },
 
   async createInvitation(email: string): Promise<CreateInvitationResponse> {
@@ -228,28 +213,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to create invitation');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to create invitation');
+    return readJson(response, 'Failed to create invitation');
   },
 
   async getMyInvitations(): Promise<Invitation[]> {
     const response = await authFetch(`${API_URL}/api/invitation/my-invitations`);
-    if (!response.ok) throw new Error('Failed to get invitations');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get invitations');
+    return readJson(response, 'Failed to get invitations');
   },
 
   async revokeInvitation(id: string): Promise<{ message: string }> {
     const response = await authFetch(`${API_URL}/api/invitation/${id}/revoke`, {
       method: 'DELETE',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to revoke invitation');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to revoke invitation');
+    return readJson(response, 'Failed to revoke invitation');
   },
 
   // New link-based invitations
@@ -257,34 +236,28 @@ export const api = {
     const response = await authFetch(`${API_URL}/api/invitation/generate-link`, {
       method: 'POST',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to generate invite link');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to generate invite link');
+    return readJson(response, 'Failed to generate invite link');
   },
 
   async validateInviteLink(token: string): Promise<ValidateLinkResponse> {
     const response = await publicFetch(`${API_URL}/api/invitation/validate/${token}`);
-    if (!response.ok) throw new Error('Failed to validate invite link');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to validate invite link');
+    return readJson(response, 'Failed to validate invite link');
   },
 
   async getActiveInviteLink(): Promise<ActiveLinkResponse> {
     const response = await authFetch(`${API_URL}/api/invitation/active-link`);
-    if (!response.ok) throw new Error('Failed to get active link');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get active link');
+    return readJson(response, 'Failed to get active link');
   },
 
   async revokeInviteLink(): Promise<{ message: string }> {
     const response = await authFetch(`${API_URL}/api/invitation/revoke-link`, {
       method: 'DELETE',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to revoke invite link');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to revoke invite link');
+    return readJson(response, 'Failed to revoke invite link');
   },
 
   async registerWithLink(linkToken: string, email: string, displayName: string, password: string): Promise<RegisterResponse> {
@@ -292,11 +265,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ linkToken, email, displayName, password }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Registration failed');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Registration failed');
+    return readJson(response, 'Registration failed');
   },
 
   // Session
@@ -304,20 +274,20 @@ export const api = {
     const response = await authFetch(`${API_URL}/api/session/create`, {
       method: 'POST',
     });
-    if (!response.ok) throw new Error('Failed to create session');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to create session');
+    return readJson(response, 'Failed to create session');
   },
 
   async validateSession(sessionId: string): Promise<SessionValidation> {
     const response = await authFetch(`${API_URL}/api/session/${sessionId}/validate`);
-    if (!response.ok) throw new Error('Failed to validate session');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to validate session');
+    return readJson(response, 'Failed to validate session');
   },
 
   async getIceServers(): Promise<IceServerConfig> {
     const response = await authFetch(`${API_URL}/api/session/ice-servers`);
-    if (!response.ok) throw new Error('Failed to get ICE servers');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get ICE servers');
+    return readJson(response, 'Failed to get ICE servers');
   },
 
   // Session invites
@@ -325,62 +295,56 @@ export const api = {
     const response = await authFetch(`${API_URL}/api/session/${sessionId}/invite`, {
       method: 'POST',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to generate invite');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to generate invite');
+    return readJson(response, 'Failed to generate invite');
   },
 
   async validateSessionInvite(token: string): Promise<ValidateSessionInviteResponse> {
     const response = await authFetch(`${API_URL}/api/session/invite/${token}/validate`);
-    if (!response.ok) throw new Error('Failed to validate invite');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to validate invite');
+    return readJson(response, 'Failed to validate invite');
   },
 
   async joinWithSessionInvite(token: string): Promise<JoinWithInviteResponse> {
     const response = await authFetch(`${API_URL}/api/session/invite/${token}/join`, {
       method: 'POST',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to join session');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to join session');
+    return readJson(response, 'Failed to join session');
   },
 
   // Terms
   async getTerms(): Promise<{ version: string; lastUpdated: string; content: string }> {
     const response = await publicFetch(`${API_URL}/api/terms/current`);
-    if (!response.ok) throw new Error('Failed to get terms');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get terms');
+    return readJson(response, 'Failed to get terms');
   },
 
   async acceptTerms(): Promise<{ success: boolean; message: string }> {
     const response = await authFetch(`${API_URL}/api/terms/accept`, {
       method: 'POST',
     });
-    if (!response.ok) throw new Error('Failed to accept terms');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to accept terms');
+    return readJson(response, 'Failed to accept terms');
   },
 
   // Admin
   async getAdminUsers(): Promise<AdminUser[]> {
     const response = await authFetch(`${API_URL}/api/admin/users`);
-    if (!response.ok) throw new Error('Failed to get users');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get users');
+    return readJson(response, 'Failed to get users');
   },
 
   async getAdminUserTree(): Promise<UserTreeResponse> {
     const response = await authFetch(`${API_URL}/api/admin/user-tree`);
-    if (!response.ok) throw new Error('Failed to get user tree');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get user tree');
+    return readJson(response, 'Failed to get user tree');
   },
 
   async getAdminInvitations(): Promise<AdminInvitation[]> {
     const response = await authFetch(`${API_URL}/api/admin/invitations`);
-    if (!response.ok) throw new Error('Failed to get invitations');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get invitations');
+    return readJson(response, 'Failed to get invitations');
   },
 
   async updateAdminUser(id: string, data: { displayName?: string; email?: string; isEmailVerified?: boolean }): Promise<{ message: string }> {
@@ -388,33 +352,24 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(data),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to update user');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to update user');
+    return readJson(response, 'Failed to update user');
   },
 
   async deleteAdminUser(id: string): Promise<{ message: string }> {
     const response = await authFetch(`${API_URL}/api/admin/users/${id}`, {
       method: 'DELETE',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to delete user');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to delete user');
+    return readJson(response, 'Failed to delete user');
   },
 
   async deleteAdminInvitation(id: string): Promise<{ message: string }> {
     const response = await authFetch(`${API_URL}/api/admin/invitations/${id}`, {
       method: 'DELETE',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to delete invitation');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to delete invitation');
+    return readJson(response, 'Failed to delete invitation');
   },
 
   // Demo requests (public submit)
@@ -423,29 +378,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email, displayName, message: message?.trim() || null }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.message || 'Failed to submit demo request');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to submit demo request');
+    return readJson(response, 'Failed to submit demo request');
   },
 
   // Demo requests (admin)
   async getAdminDemoRequests(): Promise<AdminDemoRequest[]> {
     const response = await authFetch(`${API_URL}/api/admin/demo-requests`);
-    if (!response.ok) throw new Error('Failed to get demo requests');
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to get demo requests');
+    return readJson(response, 'Failed to get demo requests');
   },
 
   async approveAdminDemoRequest(id: string): Promise<ApproveDemoRequestResponse> {
     const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/approve`, {
       method: 'POST',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to approve demo request');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to approve demo request');
+    return readJson(response, 'Failed to approve demo request');
   },
 
   async rejectAdminDemoRequest(id: string, reason?: string): Promise<{ message: string }> {
@@ -453,21 +402,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ reason: reason?.trim() || null }),
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to reject demo request');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to reject demo request');
+    return readJson(response, 'Failed to reject demo request');
   },
 
   async resendAdminDemoRequest(id: string): Promise<ApproveDemoRequestResponse> {
     const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/resend`, {
       method: 'POST',
     });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to resend invitation');
-    }
-    return response.json();
+    if (!response.ok) throw await apiError(response, 'Failed to resend invitation');
+    return readJson(response, 'Failed to resend invitation');
   },
 };
