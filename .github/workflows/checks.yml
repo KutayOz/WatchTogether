@@ -1,0 +1,89 @@
+# The checks themselves, defined once.
+#
+# Callable rather than triggered: ci.yml runs it on pull requests, deploy.yml
+# runs it again on main immediately before shipping. Defining it in one place is
+# what stops "CI is green" and "the thing we deployed was tested" from drifting
+# apart — the usual way that happens is a second copy of the steps that quietly
+# falls behind.
+name: checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    name: worker (174 tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - run: npm ci
+
+      # The test suite reads JWT_SECRET through the Workers runtime, and
+      # .dev.vars is gitignored because that is where real secrets land during
+      # local debugging. Without this the suite fails on a genuinely confusing
+      # error — "Imported HMAC key length (0)" — rather than anything that
+      # points at a missing file. The example file holds clearly-labelled dev
+      # placeholders and no real credentials.
+      - name: Provide local dev vars
+        run: cp .dev.vars.example .dev.vars
+
+      - run: npm run typecheck
+
+      # Runs the real workerd runtime through @cloudflare/vitest-pool-workers:
+      # actual Durable Objects, actual D1, actual WebAuthn ceremonies against a
+      # software authenticator. Not mocks.
+      - run: npm test
+
+  frontend:
+    name: frontend (34 tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # Type-checks worker/src/lib too, via the @shared alias. That is the point
+      # of the alias: a change to the wire protocol on the server side fails
+      # here, at build time, instead of at runtime in a call.
+      - run: npx tsc -b
+
+      - run: npm test
+
+      # The Worker serves this directory as static assets, so a build failure is
+      # a deploy failure.
+      - run: npm run build
+
+  # Lint is deliberately absent for now.
+  #
+  # `npm run lint` currently reports 12 pre-existing errors — setState-in-effect
+  # in ScreenShareView, unused vars in the Playwright specs, useless try/catch in
+  # webrtcService. A gate that is red on the day you add it is a gate everyone
+  # learns to skip, and then it protects nothing.
+  #
+  # Fix those 12, then add here:
+  #
+  #   lint:
+  #     runs-on: ubuntu-latest
+  #     steps: [checkout, setup-node, npm ci, npm run lint]

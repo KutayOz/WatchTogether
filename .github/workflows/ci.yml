@@ -1,0 +1,27 @@
+# Runs the checks on every pull request.
+#
+# The value here is not the checks — you can run those locally. It is that they
+# run on a machine that is not yours: no .dev.vars, no stale node_modules, no
+# file you forgot to commit. Both of the first two pull requests on this repo
+# were branched off a stale main and would have failed here before a human read
+# the diff.
+#
+# Deliberately not triggered on pushes to main — deploy.yml runs the same checks
+# there before shipping, and running them twice would just burn minutes.
+name: CI
+
+on:
+  pull_request:
+
+# One run per pull request. A new push supersedes the run already in flight
+# rather than queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
