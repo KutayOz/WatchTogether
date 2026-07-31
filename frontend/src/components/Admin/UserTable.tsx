@@ -4,7 +4,6 @@ import {
   SectionTitle,
   StickerButton,
   BackButton,
-  InkInput,
   BurstSticker,
   TagSticker,
 } from '../manga';
@@ -16,35 +15,9 @@ interface UserTableProps {
 }
 
 export function UserTable({ users, onRefresh }: UserTableProps) {
-  const [editingUser, setEditingUser] = useState<AdminUser | null>(null);
-  const [editForm, setEditForm] = useState({ displayName: '', email: '' });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-
-  const handleEdit = (user: AdminUser) => {
-    setEditingUser(user);
-    setEditForm({ displayName: user.displayName, email: user.email });
-    setError(null);
-  };
-
-  const handleSave = async () => {
-    if (!editingUser) return;
-    setIsSubmitting(true);
-    setError(null);
-    try {
-      await api.updateAdminUser(editingUser.id, {
-        displayName: editForm.displayName,
-        email: editForm.email,
-      });
-      setEditingUser(null);
-      onRefresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update user');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
 
   const handleDelete = async (id: string) => {
     setIsSubmitting(true);
@@ -60,8 +33,8 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
     }
   };
 
-  const formatDate = (dateStr: string) =>
-    new Date(dateStr).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+  const formatDate = (millis: number) =>
+    new Date(millis).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 
   return (
     <div>
@@ -103,7 +76,7 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
           <thead>
             <tr style={{ borderBottom: '3px solid var(--ink)' }}>
               <Th>user</Th>
-              <Th>email</Th>
+              <Th>tag</Th>
               <Th>status</Th>
               <Th>joined</Th>
               <Th align="right">actions</Th>
@@ -128,41 +101,36 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
                         fontSize: 14,
                       }}
                     >
-                      {u.displayName.charAt(0).toUpperCase()}
+                      {u.username.charAt(0).toUpperCase()}
                     </div>
                     <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 15, letterSpacing: 0.5 }}>
-                      {u.displayName}
+                      {u.username}
                     </span>
                     {u.isRootUser && <TagSticker color="orange" rot={3}>ROOT</TagSticker>}
                   </div>
                 </Td>
                 <Td>
-                  <span style={{ fontSize: 13, fontFamily: 'monospace' }}>{u.email}</span>
+                  {/* The tag, not an email — it is what makes two people called
+                      "kutay" distinguishable, and the only handle admins can act on. */}
+                  <span style={{ fontSize: 13, fontFamily: 'monospace' }}>{u.tag}</span>
                 </Td>
                 <Td>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <Pill bg={u.isEmailVerified ? 'var(--pink)' : 'var(--orange)'}>
-                      {u.isEmailVerified ? 'VERIFIED' : 'UNVERIFIED'}
-                    </Pill>
-                    <Pill bg={u.hasAcceptedTerms ? 'var(--purple)' : 'rgba(26,20,23,0.15)'} fg={u.hasAcceptedTerms ? 'var(--cream)' : 'var(--ink)'}>
-                      {u.hasAcceptedTerms ? 'TERMS OK' : 'TERMS PENDING'}
-                    </Pill>
+                    {u.isDeleted && <Pill bg="var(--orange)">DELETED</Pill>}
+                    {u.isRootUser && <Pill bg="var(--purple)" fg="var(--cream)">ROOT</Pill>}
                   </div>
                 </Td>
                 <Td>
                   <span className="hand" style={{ fontSize: 16 }}>{formatDate(u.createdAt)}</span>
                 </Td>
                 <Td align="right">
-                  <div style={{ display: 'inline-flex', gap: 8 }}>
-                    <ActionBtn onClick={() => handleEdit(u)} color="purple">
-                      edit
+                  {/* Delete only. The Worker exposes no user-update endpoint,
+                      and root is undeletable server-side as well as here. */}
+                  {!u.isRootUser && !u.isDeleted && (
+                    <ActionBtn onClick={() => setDeleteConfirm(u.id)} color="orange">
+                      delete
                     </ActionBtn>
-                    {!u.isRootUser && (
-                      <ActionBtn onClick={() => setDeleteConfirm(u.id)} color="orange">
-                        delete
-                      </ActionBtn>
-                    )}
-                  </div>
+                  )}
                 </Td>
               </tr>
             ))}
@@ -170,35 +138,6 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
         </table>
       </div>
 
-      {/* Edit modal */}
-      {editingUser && (
-        <ModalShell title="EDIT USER" onClose={() => setEditingUser(null)}>
-          <div className="col" style={{ gap: 14 }}>
-            <InkInput
-              label="display name"
-              value={editForm.displayName}
-              onChange={(e) => setEditForm({ ...editForm, displayName: e.target.value })}
-            />
-            <InkInput
-              label="email"
-              type="email"
-              value={editForm.email}
-              onChange={(e) => setEditForm({ ...editForm, email: e.target.value })}
-            />
-            {error && (
-              <div className="hand" style={{ color: 'var(--orange-deep)', fontSize: 18 }}>
-                {error}
-              </div>
-            )}
-            <div className="row" style={{ gap: 12, marginTop: 8, flexWrap: 'wrap' }}>
-              <StickerButton color="pink" sfx="KLIK" onClick={handleSave} disabled={isSubmitting}>
-                {isSubmitting ? 'SAVING…' : 'SAVE'}
-              </StickerButton>
-              <BackButton onClick={() => setEditingUser(null)}>cancel</BackButton>
-            </div>
-          </div>
-        </ModalShell>
-      )}
 
       {/* Delete confirm */}
       {deleteConfirm && (

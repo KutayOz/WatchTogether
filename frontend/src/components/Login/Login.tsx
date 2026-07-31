@@ -1,75 +1,70 @@
-import { useState } from 'react';
-import { useNavigate, useLocation, Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAuthContext } from '../../context/AuthContext';
+import { api } from '../../services/api';
 import { TermsModal } from '../Auth/TermsModal';
-import { PasswordField } from '../Auth/PasswordField';
-import { GoogleSignInButton } from '../Auth/GoogleSignInButton';
+import { PasskeyIcon } from '../Auth/PasskeyIcon';
+import { UsernameField } from '../Auth/UsernameField';
 import {
   Sketchbook,
   SectionTitle,
   TagSticker,
-  NotebookField,
   StickerButton,
   Doodle,
   BurstSticker,
 } from '../manga';
 
 /**
- * Normalize backend auth errors before showing them. Goals:
+ * Sign-in, passkey-only.
  *
- *   - Don't echo backend-internal phrases the user can't act on.
- *   - Keep the message generic by default so we never leak whether an
- *     email is registered (the backend already runs constant-time so
- *     the answer is "you can't tell from any signal" — UI matches).
- *   - When the backend hints at lockout, surface a softer copy that
- *     points at password reset instead of just confusing the user.
+ * There is nothing to type. The authenticator holds a discoverable credential
+ * for this site and the server identifies you from it, so the screen is one
+ * button — no email, no password, no "forgot" flow, and no account-enumeration
+ * surface, because nothing is ever submitted to be looked up.
  *
- * The match is intentionally substring-based: it's fine to add more
- * mappings as backend error shapes evolve.
+ * The one exception is first run: with no email and no password, the very first
+ * account cannot be invited by anybody, so an empty database plus a deployment
+ * secret is the only way to mint root.
  */
-function normalizeLoginError(raw: string | null): string | null {
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  if (lower.includes('lock') || lower.includes('too many')) {
-    return 'Too many failed attempts. Try again in a few minutes or use password reset.';
-  }
-  if (lower.includes('verify') && lower.includes('email')) {
-    return 'Please verify your email before signing in — check your inbox.';
-  }
-  // Default: keep it generic. Both "user not found" and "wrong password"
-  // collapse into this single message — same as the backend, no leak.
-  return 'Email or password is incorrect.';
-}
-
 export function Login() {
   const navigate = useNavigate();
-  // Hand-off from /register/:token + /invite/:token success — those screens
-  // navigate here with { state: { email, justRegistered: true } } so we can
-  // prefill the address and pop a "kayıt başarılı" banner without forcing
-  // the user to retype anything they just typed two seconds ago.
-  const location = useLocation();
-  const navState = (location.state ?? {}) as { email?: string; justRegistered?: boolean };
+  const { loginWithPasskey, setupRootWithPasskey, isLoading, error, setError, updateTermsAccepted } =
+    useAuthContext();
 
-  const [email, setEmail] = useState(navState.email ?? '');
-  const [password, setPassword] = useState('');
-  const [rememberMe, setRememberMe] = useState(false);
   const [showTermsModal, setShowTermsModal] = useState(false);
-  const [showJustRegisteredBanner, setShowJustRegisteredBanner] = useState(!!navState.justRegistered);
-  const { login, loginWithGoogle, loginWithPasskey, isLoading, error, updateTermsAccepted } = useAuthContext();
+  // undefined while unknown — the setup panel must not flash on a normal load.
+  const [isSetupComplete, setIsSetupComplete] = useState<boolean | undefined>(undefined);
+  const [setupUsername, setSetupUsername] = useState('');
+  const [setupSecret, setSetupSecret] = useState('');
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!email.trim() || !password) return;
+  useEffect(() => {
+    api
+      .setupStatus()
+      .then((s) => setIsSetupComplete(s.isSetupComplete))
+      // Assume set up: showing the bootstrap form because a health check
+      // blipped would be worse than hiding it from the one person who needs it.
+      .catch(() => setIsSetupComplete(true));
+  }, []);
 
+  const land = (hasAcceptedTerms?: boolean) => {
+    if (hasAcceptedTerms) navigate('/');
+    else setShowTermsModal(true);
+  };
+
+  const handleSignIn = async () => {
     try {
-      const user = await login(email.trim(), password, rememberMe);
-      if (!user.hasAcceptedTerms) {
-        setShowTermsModal(true);
-      } else {
-        navigate('/');
-      }
+      land((await loginWithPasskey()).hasAcceptedTerms);
     } catch {
-      // Error is handled by context
+      // useAuth has already turned this into a readable message.
+    }
+  };
+
+  const handleSetup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      land((await setupRootWithPasskey(setupUsername.trim(), setupSecret)).hasAcceptedTerms);
+    } catch {
+      // Same.
     }
   };
 
@@ -79,40 +74,10 @@ export function Login() {
     navigate('/');
   };
 
-  const handlePasskeySignIn = async () => {
-    try {
-      // Usernameless flow — passing email through if filled lets the
-      // browser scope to that user's credentials; otherwise resident
-      // (discoverable) credentials pick themselves.
-      const user = await loginWithPasskey(email.trim() || undefined);
-      if (!user.hasAcceptedTerms) {
-        setShowTermsModal(true);
-      } else {
-        navigate('/');
-      }
-    } catch {
-      // useAuth surfaces the error into context.error.
-    }
-  };
-
-  const handleGoogleCredential = async (idToken: string) => {
-    try {
-      const user = await loginWithGoogle(idToken);
-      if (!user.hasAcceptedTerms) {
-        setShowTermsModal(true);
-      } else {
-        navigate('/');
-      }
-    } catch {
-      // useAuth surfaces the error into context.error — same banner renders.
-    }
-  };
-
   return (
     <div className="app">
       <div className="screen" style={{ display: 'grid', placeItems: 'center', padding: '20px 0' }}>
         <Sketchbook style={{ width: '100%', maxWidth: 720 }}>
-          {/* Title */}
           <div style={{ marginBottom: 24, position: 'relative' }}>
             <SectionTitle size={64} underline="pink">
               WatchTogether
@@ -122,206 +87,54 @@ export function Login() {
                 BETA
               </TagSticker>
             </div>
-            <div
-              className="hand"
-              style={{ fontSize: 24, color: 'rgba(26,20,23,0.7)', marginTop: 14 }}
-            >
+            <div className="hand" style={{ fontSize: 24, color: 'rgba(26,20,23,0.7)', marginTop: 14 }}>
               two friends. one screen. ♥
             </div>
           </div>
 
-          <form onSubmit={handleSubmit} style={{ marginTop: 16, maxWidth: 480, position: 'relative' }}>
-            <NotebookField
-              label="email:"
-              type="email"
-              value={email}
-              onChange={setEmail}
-              placeholder="you@watchtogether.app"
-              autoFocus
-              disabled={isLoading}
-            />
+          {error && (
+            <div className="shake" style={{ marginTop: 8, textAlign: 'left' }} role="alert">
+              <BurstSticker bg="var(--orange)" rot={-4} w={170} h={110}>
+                OOPS!
+              </BurstSticker>
+              <div className="hand" style={{ fontSize: 18, marginTop: 6, color: 'var(--ink)' }}>
+                {error}
+              </div>
+            </div>
+          )}
 
-            <PasswordField
-              label="password:"
-              value={password}
-              onChange={setPassword}
-              placeholder="shhh — keep it secret"
+          <div style={{ marginTop: 28, maxWidth: 520 }}>
+            <StickerButton
+              color="pink"
+              size="xl"
+              sfx="TAP!"
+              sparks
+              breathe
               disabled={isLoading}
-              showChecklist={false}
-              showStrengthMeter={false}
-            />
+              onClick={handleSignIn}
+            >
+              {isLoading ? 'CHECKING…' : 'SIGN IN WITH A PASSKEY'}
+            </StickerButton>
 
-            {/* Remember me — handwritten checkbox */}
-            <label
+            <div
               className="hand"
               style={{
-                display: 'inline-flex',
+                display: 'flex',
                 alignItems: 'center',
                 gap: 8,
-                marginTop: 16,
-                fontSize: 20,
-                color: 'rgba(26,20,23,0.7)',
-                cursor: 'pointer',
+                fontSize: 18,
+                color: 'rgba(26,20,23,0.55)',
+                marginTop: 18,
               }}
             >
-              <input
-                type="checkbox"
-                checked={rememberMe}
-                onChange={(e) => setRememberMe(e.target.checked)}
-                disabled={isLoading}
-                style={{
-                  width: 18,
-                  height: 18,
-                  accentColor: 'var(--pink)',
-                  cursor: 'pointer',
-                }}
-              />
-              remember me on this notebook
-            </label>
-
-            {showJustRegisteredBanner && !error && (
-              <div
-                role="status"
-                style={{
-                  marginTop: 16,
-                  padding: '12px 16px',
-                  border: '3px solid var(--ink)',
-                  background: 'rgba(123,63,228,0.12)',
-                  boxShadow: '4px 4px 0 var(--purple)',
-                  position: 'relative',
-                }}
-              >
-                <div className="hand" style={{ fontSize: 20, color: 'var(--ink)' }}>
-                  <Doodle kind="sparkle" size={18} color="var(--purple)" /> hesabın hazır! şifrenle giriş yap ↓
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowJustRegisteredBanner(false)}
-                  aria-label="dismiss"
-                  style={{
-                    position: 'absolute',
-                    top: 4,
-                    right: 8,
-                    background: 'transparent',
-                    border: 'none',
-                    cursor: 'pointer',
-                    fontSize: 18,
-                    color: 'var(--ink)',
-                  }}
-                >
-                  ×
-                </button>
-              </div>
-            )}
-
-            {error && (
-              <div className="shake" style={{ marginTop: 16, textAlign: 'left' }} role="alert">
-                <BurstSticker bg="var(--orange)" rot={-4} w={170} h={110}>
-                  OOPS!
-                </BurstSticker>
-                <div className="hand" style={{ fontSize: 18, marginTop: 6, color: 'var(--ink)' }}>
-                  {normalizeLoginError(error)}
-                </div>
-              </div>
-            )}
-
-            <div
-              className="row"
-              style={{ gap: 18, marginTop: 28, flexWrap: 'wrap', alignItems: 'center' }}
-            >
-              <StickerButton
-                type="submit"
-                color="pink"
-                size="xl"
-                sfx="TAP!"
-                sparks
-                breathe
-                disabled={isLoading || !email.trim() || !password}
-              >
-                {isLoading ? 'SIGNING IN…' : 'SIGN IN'}
-              </StickerButton>
+              <PasskeyIcon size={18} />
+              your face, fingerprint or device PIN — nothing to remember
             </div>
+          </div>
 
-            <div className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)', marginTop: 14 }}>
-              psst — without remember-me you'll be signed out when this tab closes
-            </div>
-
-            {/* Google sign-in alternative. The button hides itself when
-                VITE_GOOGLE_CLIENT_ID is missing (local-dev without the
-                env var), so this whole block becomes invisible — no
-                stranded "or" divider. */}
-            <div
-              style={{
-                marginTop: 22,
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'flex-start',
-                gap: 12,
-              }}
-            >
-              <div
-                className="hand"
-                style={{
-                  fontSize: 18,
-                  color: 'rgba(26,20,23,0.5)',
-                  letterSpacing: 1,
-                }}
-              >
-                — or —
-              </div>
-              <GoogleSignInButton onCredential={handleGoogleCredential} />
-
-              {/* Passkey button. Renders unconditionally — feature-detect
-                  happens inside startAuthentication. Old browsers without
-                  WebAuthn support get a clean error toast via context.error. */}
-              <button
-                type="button"
-                onClick={handlePasskeySignIn}
-                disabled={isLoading}
-                aria-label="Sign in with a passkey"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '10px 16px',
-                  background: 'var(--cream)',
-                  color: 'var(--ink)',
-                  border: '3px solid var(--ink)',
-                  borderRadius: 4,
-                  boxShadow: '3px 3px 0 var(--ink)',
-                  fontFamily: 'var(--font-body)',
-                  fontWeight: 700,
-                  fontSize: 14,
-                  cursor: isLoading ? 'not-allowed' : 'pointer',
-                  opacity: isLoading ? 0.5 : 1,
-                  transform: 'rotate(-0.5deg)',
-                  transition: 'transform 150ms ease, box-shadow 150ms ease',
-                }}
-                onMouseEnter={(e) => {
-                  if (isLoading) return;
-                  e.currentTarget.style.transform = 'rotate(0) translateY(-2px)';
-                  e.currentTarget.style.boxShadow = '5px 5px 0 var(--ink)';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = 'rotate(-0.5deg) translateY(0)';
-                  e.currentTarget.style.boxShadow = '3px 3px 0 var(--ink)';
-                }}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    d="M12 1a4 4 0 014 4v3h1a3 3 0 013 3v9a3 3 0 01-3 3H7a3 3 0 01-3-3v-9a3 3 0 013-3h1V5a4 4 0 014-4zm0 2a2 2 0 00-2 2v3h4V5a2 2 0 00-2-2zm0 11a2 2 0 100 4 2 2 0 000-4z"
-                    fill="currentColor"
-                  />
-                </svg>
-                Sign in with a passkey
-              </button>
-            </div>
-          </form>
-
-          {/* Guest CTA — for people who don't have an invite yet. Visually
-              detached from the form (own bordered card + breathing button)
-              so it reads as "different track entirely", not another sign-in
-              method. Purple to distinguish from the pink sign-in primary. */}
+          {/* No sign-up link on purpose: accounts exist only by invitation, so
+              a "create account" affordance would lead nowhere for everybody who
+              does not already hold a link. Invitees arrive at /invite/:token. */}
           <div
             style={{
               marginTop: 36,
@@ -331,42 +144,110 @@ export function Login() {
               boxShadow: '5px 5px 0 var(--purple)',
               transform: 'rotate(-0.4deg)',
               maxWidth: 520,
-              position: 'relative',
             }}
           >
-            <div
-              className="hand"
-              style={{ fontSize: 22, color: 'var(--ink)', marginBottom: 12 }}
-            >
-              don't have an invite yet?
+            <div className="hand" style={{ fontSize: 22, color: 'var(--ink)', marginBottom: 8 }}>
+              no account yet?
             </div>
-            <div
-              className="hand"
-              style={{ fontSize: 18, color: 'rgba(26,20,23,0.65)', marginBottom: 16 }}
-            >
-              tell us a bit about yourself and we'll send one over.
+            <div className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.65)' }}>
+              WatchTogether is invite-only. ask the friend who told you about it for a link.
             </div>
-            <Link to="/request-demo" style={{ textDecoration: 'none' }}>
-              <StickerButton color="purple" size="xl" sfx="POP!" breathe>
-                GUEST? REQUEST DEMO
-              </StickerButton>
-            </Link>
           </div>
 
-          {/* Margin doodles */}
+          {/* First run only. Disappears permanently the moment root exists. */}
+          {isSetupComplete === false && (
+            <form
+              onSubmit={handleSetup}
+              style={{
+                marginTop: 28,
+                padding: '20px 22px',
+                border: '3px dashed var(--ink)',
+                maxWidth: 520,
+              }}
+            >
+              <div className="hand" style={{ fontSize: 22, color: 'var(--ink)', marginBottom: 4 }}>
+                <Doodle kind="sparkle" size={18} color="var(--purple)" /> first run — claim this
+                instance
+              </div>
+              <div
+                className="hand"
+                style={{ fontSize: 17, color: 'rgba(26,20,23,0.6)', marginBottom: 12 }}
+              >
+                nobody has registered yet. the setup secret is the one set with{' '}
+                <code>wrangler secret put SETUP_SECRET</code>.
+              </div>
+
+              <UsernameField
+                label="username:"
+                value={setupUsername}
+                onChange={(v) => {
+                  setSetupUsername(v);
+                  setError(null);
+                }}
+                disabled={isLoading}
+              />
+
+              <label className="hand" style={{ display: 'block', marginTop: 14, fontSize: 20 }}>
+                setup secret:
+                <input
+                  type="password"
+                  value={setupSecret}
+                  onChange={(e) => setSetupSecret(e.target.value)}
+                  disabled={isLoading}
+                  autoComplete="off"
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    marginTop: 6,
+                    padding: '10px 12px',
+                    border: '3px solid var(--ink)',
+                    background: 'var(--cream)',
+                    fontFamily: 'var(--font-body)',
+                    fontSize: 16,
+                  }}
+                />
+              </label>
+
+              <div style={{ marginTop: 18 }}>
+                <StickerButton
+                  type="submit"
+                  color="purple"
+                  size="md"
+                  sfx="POP!"
+                  disabled={isLoading || !setupUsername.trim() || !setupSecret}
+                >
+                  {isLoading ? 'CLAIMING…' : 'CREATE ROOT ACCOUNT'}
+                </StickerButton>
+              </div>
+            </form>
+          )}
+
           <div className="margin-doodles" style={{ position: 'absolute', right: 24, top: 40 }}>
-            <span className="bob" style={{ ['--r' as string]: '-12deg', ['--r2' as string]: '8deg', display: 'inline-block' } as React.CSSProperties}>
+            <span
+              className="bob"
+              style={
+                {
+                  ['--r' as string]: '-12deg',
+                  ['--r2' as string]: '8deg',
+                  display: 'inline-block',
+                } as React.CSSProperties
+              }
+            >
               <Doodle kind="tv" size={56} color="var(--purple)" />
             </span>
           </div>
           <div className="margin-doodles" style={{ position: 'absolute', right: 80, top: 140 }}>
-            <span className="bob delay-1" style={{ ['--r' as string]: '10deg', ['--r2' as string]: '-6deg', display: 'inline-block' } as React.CSSProperties}>
+            <span
+              className="bob delay-1"
+              style={
+                {
+                  ['--r' as string]: '10deg',
+                  ['--r2' as string]: '-6deg',
+                  display: 'inline-block',
+                } as React.CSSProperties
+              }
+            >
               <Doodle kind="popcorn" size={48} color="var(--orange)" />
-            </span>
-          </div>
-          <div className="margin-doodles" style={{ position: 'absolute', right: 40, bottom: 180 }}>
-            <span className="bob delay-2" style={{ ['--r' as string]: '-6deg', ['--r2' as string]: '10deg', display: 'inline-block' } as React.CSSProperties}>
-              <Doodle kind="heart" size={42} color="var(--pink)" />
             </span>
           </div>
           <div

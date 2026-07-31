@@ -16,9 +16,6 @@
   "dependencies": {
     "@mediapipe/tasks-vision": "^0.10.35",
     "@simplewebauthn/browser": "^13.3.0",
-    "@zxcvbn-ts/core": "^3.0.4",
-    "@zxcvbn-ts/language-common": "^3.0.4",
-    "@zxcvbn-ts/language-en": "^3.0.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.12.0",

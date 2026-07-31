@@ -320,7 +320,7 @@ export function SessionRoom() {
     peerCursor, setPeerCursor, handleLocalCursor,
     peerTypingName, isPeerTyping, setPeerTypingAt, setPeerTypingName, handleLocalTyping,
     reactions, setReactions, handleSendReaction,
-  } = usePeerPresence(sessionIdRef, transportRef, user?.displayName);
+  } = usePeerPresence(sessionIdRef, transportRef, user?.username);
 
   // One sender for "tell the peer what our mic / camera / screen state is."
   // Callers pass the mic + camera values they're holding; screen-share state
@@ -499,7 +499,7 @@ export function SessionRoom() {
         const { stream, streamId } = pendingScreenShareRef.current;
         localScreenStreamIdRef.current = streamId;
         await webrtc.addScreenShareTracks(stream, screenShareQualityRef.current);
-        setCurrentScreenSharer(user?.displayName ?? 'You');
+        setCurrentScreenSharer(user?.username ?? 'You');
 
         await transportRef.current?.notifyScreenShareStarted(sessionIdRef.current, streamId);
 
@@ -850,7 +850,7 @@ export function SessionRoom() {
       if (!sessionIdRef.current || !peerNameRef.current) {
         localScreenStreamIdRef.current = streamId;
         await webrtc.addScreenShareTracks(stream, screenShareQuality);
-        setCurrentScreenSharer(user?.displayName ?? 'You');
+        setCurrentScreenSharer(user?.username ?? 'You');
 
         if (sessionIdRef.current) {
           await transport.notifyScreenShareStarted(sessionIdRef.current, streamId);
@@ -1297,7 +1297,7 @@ export function SessionRoom() {
         <span style={{ flex: 1 }} />
 
         <TagSticker color="cream" rot={2}>
-          {user.displayName}
+          {user.tag}
         </TagSticker>
       </div>
 

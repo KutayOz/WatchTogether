@@ -10,7 +10,7 @@ function TreeNode({ node, level = 0 }: { node: UserTreeNode; level?: number }) {
   const isRoot = level === 0;
   const accent = isRoot ? 'var(--purple)' : level === 1 ? 'var(--pink)' : 'var(--cream)';
   const fg = isRoot ? 'var(--cream)' : 'var(--ink)';
-  const initial = node.displayName.charAt(0).toUpperCase();
+  const initial = node.username.charAt(0).toUpperCase();
 
   return (
     <div style={{ marginLeft: level > 0 ? 28 : 0, borderLeft: level > 0 ? '3px dashed var(--ink)' : 'none', paddingLeft: level > 0 ? 16 : 0 }}>
@@ -49,19 +49,15 @@ function TreeNode({ node, level = 0 }: { node: UserTreeNode; level?: number }) {
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 18, letterSpacing: 1 }}>{node.displayName}</span>
+            <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 18, letterSpacing: 1 }}>{node.username}</span>
             {isRoot && <TagSticker color="orange" rot={4}>ROOT</TagSticker>}
-            {node.isEmailVerified ? (
-              <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 12, padding: '2px 8px', background: 'var(--pink)', color: 'var(--ink)', border: '2px solid var(--ink)', borderRadius: 4 }}>
-                VERIFIED
-              </span>
-            ) : (
+            {node.isDeleted && (
               <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 12, padding: '2px 8px', background: 'var(--orange)', color: 'var(--ink)', border: '2px solid var(--ink)', borderRadius: 4 }}>
-                UNVERIFIED
+                DELETED
               </span>
             )}
           </div>
-          <div style={{ fontSize: 13, opacity: 0.85, fontWeight: 600, marginTop: 2 }}>{node.email}</div>
+          <div style={{ fontSize: 13, opacity: 0.85, fontWeight: 600, marginTop: 2 }}>{node.tag}</div>
         </div>
         {node.children.length > 0 && (
           <span className="hand" style={{ fontSize: 16, color: fg, opacity: 0.9 }}>

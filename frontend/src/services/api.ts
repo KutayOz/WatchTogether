@@ -7,12 +7,7 @@ import type {
   MeResponse,
   IceServerConfig,
   SessionValidation,
-  ValidateInvitationResponse,
-  RegisterResponse,
-  VerifyEmailResponse,
   InvitationSlots,
-  Invitation,
-  CreateInvitationResponse,
   GenerateLinkResponse,
   ValidateLinkResponse,
   ActiveLinkResponse,
@@ -21,13 +16,9 @@ import type {
   JoinWithInviteResponse,
   AdminUser,
   UserTreeResponse,
-  AdminInvitation,
-  DemoRequestSubmitResponse,
-  AdminDemoRequest,
-  ApproveDemoRequestResponse,
 } from '../types';
 
-// Post-C4: auth is via HttpOnly cookie set by /api/auth/login. Every API call
+// Auth is an HttpOnly cookie issued by the passkey endpoints. Every API call
 // uses credentials:'include' so the browser sends the cookie automatically.
 // No more Authorization header, no more token in JS-readable storage.
 //
@@ -90,39 +81,68 @@ export const api = {
     return readJson(response, 'Failed to fetch current user');
   },
 
-  async login(email: string, password: string, rememberMe: boolean = false): Promise<LoginResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/login`, {
+  // ────────────────── Passkeys ──────────────────
+  //
+  // The only way in. Passwords and Google sign-in are gone: BCrypt at work
+  // factor 12 costs ~400ms against the Workers free plan's 10ms CPU budget, so
+  // passwords were not portable, and dropping Google removes an account-linking
+  // surface the invite model does not need.
+
+  /**
+   * Start creating an account from an invite.
+   *
+   * Anonymous, unlike the .NET original where both registration endpoints were
+   * [Authorize] — a passkey could only ever be *added* to an account that
+   * already existed via password. With passwords gone, an invitee holding
+   * nothing but a link has to be able to create the account itself.
+   */
+  async passkeyBeginInviteRegistration(inviteToken: string, username: string): Promise<unknown> {
+    const response = await publicFetch(`${API_URL}/api/auth/passkey/register/begin`, {
       method: 'POST',
-      body: JSON.stringify({ email, password, rememberMe }),
+      body: JSON.stringify({ inviteToken, username }),
     });
-    if (!response.ok) throw await apiError(response, 'Login failed');
-    return readJson(response, 'Login failed');
+    if (!response.ok) throw await apiError(response, 'Failed to start registration');
+    return readJson(response, 'Failed to start registration');
   },
 
-  // ────────────────── Passkeys (WebAuthn) ──────────────────
+  /**
+   * Finish any registration ceremony — new account or added passkey.
+   *
+   * One endpoint for both because the server recovers which it is from the
+   * challenge, not from the caller. The `label` is what the settings screen
+   * shows for this credential.
+   */
+  async passkeyFinishRegistration(attestation: unknown, label?: string): Promise<LoginResponse> {
+    const response = await publicFetch(`${API_URL}/api/auth/passkey/register/finish`, {
+      method: 'POST',
+      body: JSON.stringify({ response: attestation, ...(label ? { label } : {}) }),
+    });
+    if (!response.ok) throw await apiError(response, 'Registration failed');
+    return readJson(response, 'Registration failed');
+  },
 
-  async passkeyBeginRegistration(): Promise<unknown> {
-    const response = await authFetch(`${API_URL}/api/auth/passkey/register/begin`, { method: 'POST' });
+  /** Add another passkey to the signed-in account. Finishes via the call above. */
+  async passkeyBeginAddition(): Promise<unknown> {
+    const response = await authFetch(`${API_URL}/api/auth/passkey/register/add/begin`, {
+      method: 'POST',
+    });
     if (!response.ok) throw await apiError(response, 'Failed to start passkey registration');
     return readJson(response, 'Failed to start passkey registration');
   },
 
-  async passkeyFinishRegistration(attestation: unknown, label: string): Promise<{ label: string }> {
-    const response = await authFetch(`${API_URL}/api/auth/passkey/register/finish`, {
-      method: 'POST',
-      body: JSON.stringify({ response: attestation, label }),
-    });
-    if (!response.ok) throw await apiError(response, 'Passkey registration failed');
-    return readJson(response, 'Passkey registration failed');
-  },
-
-  async passkeyBeginAuth(email?: string): Promise<unknown> {
-    const response = await publicFetch(`${API_URL}/api/auth/passkey/auth/begin`, {
-      method: 'POST',
-      body: JSON.stringify({ email: email ?? null }),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to start passkey authentication');
-    return readJson(response, 'Failed to start passkey authentication');
+  /**
+   * Start sign-in. Takes nothing.
+   *
+   * Usernameless: the server sends no allowCredentials, so the authenticator
+   * offers whichever discoverable credential it holds for this site. Besides
+   * being the only option once email is gone, it removes the account
+   * enumeration surface that the old optional-email scoping needed a
+   * constant-time workaround to paper over.
+   */
+  async passkeyBeginAuth(): Promise<unknown> {
+    const response = await publicFetch(`${API_URL}/api/auth/passkey/auth/begin`, { method: 'POST' });
+    if (!response.ok) throw await apiError(response, 'Failed to start sign-in');
+    return readJson(response, 'Failed to start sign-in');
   },
 
   async passkeyFinishAuth(assertion: unknown): Promise<LoginResponse> {
@@ -130,8 +150,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(assertion),
     });
-    if (!response.ok) throw await apiError(response, 'Passkey authentication failed');
-    return readJson(response, 'Passkey authentication failed');
+    if (!response.ok) throw await apiError(response, 'Sign-in failed');
+    return readJson(response, 'Sign-in failed');
   },
 
   async passkeyList(): Promise<{ items: PasskeyListItem[] }> {
@@ -140,30 +160,47 @@ export const api = {
     return readJson(response, 'Failed to load passkeys');
   },
 
-  async passkeyRemove(credentialIdBase64Url: string): Promise<void> {
+  async passkeyRemove(credentialId: string): Promise<void> {
     const response = await authFetch(
-      `${API_URL}/api/auth/passkey/${encodeURIComponent(credentialIdBase64Url)}`,
+      `${API_URL}/api/auth/passkey/${encodeURIComponent(credentialId)}`,
       { method: 'DELETE' },
     );
     if (!response.ok) throw await apiError(response, 'Failed to remove passkey');
   },
 
-  async googleSignIn(idToken: string, invitationLinkToken?: string): Promise<LoginResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/google`, {
+  // ────────────────── First-run bootstrap ──────────────────
+  //
+  // With no email and no password, the very first account needs a way in that
+  // does not depend on an invite from someone who does not exist yet. Gated on
+  // both the database being empty and a deployment secret.
+
+  async setupStatus(): Promise<{ isSetupComplete: boolean }> {
+    const response = await publicFetch(`${API_URL}/api/auth/setup/status`);
+    if (!response.ok) throw await apiError(response, 'Failed to check setup status');
+    return readJson(response, 'Failed to check setup status');
+  },
+
+  async setupBegin(username: string, setupSecret: string): Promise<unknown> {
+    const response = await publicFetch(`${API_URL}/api/auth/passkey/setup/begin`, {
       method: 'POST',
-      // Send the invitation link only when present — the backend treats Google
-      // sign-in as invitation-gated for new accounts, but ignores the token
-      // for existing users (matched by GoogleId or email).
-      body: JSON.stringify({ idToken, ...(invitationLinkToken ? { invitationLinkToken } : {}) }),
+      body: JSON.stringify({ username, setupSecret }),
     });
-    if (!response.ok) throw await apiError(response, 'Google sign-in failed');
-    return readJson(response, 'Google sign-in failed');
+    if (!response.ok) throw await apiError(response, 'Setup failed');
+    return readJson(response, 'Setup failed');
+  },
+
+  async setupFinish(attestation: unknown): Promise<LoginResponse> {
+    const response = await publicFetch(`${API_URL}/api/auth/passkey/setup/finish`, {
+      method: 'POST',
+      body: JSON.stringify({ response: attestation }),
+    });
+    if (!response.ok) throw await apiError(response, 'Setup failed');
+    return readJson(response, 'Setup failed');
   },
 
   async logout(): Promise<void> {
-    // Tell the server to clear the auth cookie. The server-side handler is
-    // idempotent — safe even if already expired. Errors are swallowed so a
-    // network blip doesn't leave the user stuck on the logged-in UI.
+    // Errors swallowed: a network blip must not strand the user on logged-in UI
+    // when the local cache is about to be cleared regardless.
     try {
       await authFetch(`${API_URL}/api/auth/logout`, { method: 'POST' });
     } catch {
@@ -171,65 +208,14 @@ export const api = {
     }
   },
 
-  async validateInvitation(token: string): Promise<ValidateInvitationResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/invitation/${token}`);
-    if (!response.ok) throw await apiError(response, 'Failed to validate invitation');
-    return readJson(response, 'Failed to validate invitation');
-  },
-
-  async register(invitationToken: string, displayName: string, password: string): Promise<RegisterResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/register`, {
-      method: 'POST',
-      body: JSON.stringify({ invitationToken, displayName, password }),
-    });
-    if (!response.ok) throw await apiError(response, 'Registration failed');
-    return readJson(response, 'Registration failed');
-  },
-
-  async verifyEmailByToken(token: string): Promise<VerifyEmailResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/verify-email/${encodeURIComponent(token)}`);
-    if (!response.ok) throw await apiError(response, 'Verification failed');
-    return readJson(response, 'Verification failed');
-  },
-
-  async resendVerification(email: string): Promise<{ message: string }> {
-    const response = await publicFetch(`${API_URL}/api/auth/resend-verification`, {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to resend verification');
-    return readJson(response, 'Failed to resend verification');
-  },
-
-  // Invitations
   async getAvailableSlots(): Promise<InvitationSlots> {
     const response = await authFetch(`${API_URL}/api/invitation/available-slots`);
     if (!response.ok) throw await apiError(response, 'Failed to get invitation slots');
     return readJson(response, 'Failed to get invitation slots');
   },
 
-  async createInvitation(email: string): Promise<CreateInvitationResponse> {
-    const response = await authFetch(`${API_URL}/api/invitation/create`, {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to create invitation');
-    return readJson(response, 'Failed to create invitation');
-  },
 
-  async getMyInvitations(): Promise<Invitation[]> {
-    const response = await authFetch(`${API_URL}/api/invitation/my-invitations`);
-    if (!response.ok) throw await apiError(response, 'Failed to get invitations');
-    return readJson(response, 'Failed to get invitations');
-  },
 
-  async revokeInvitation(id: string): Promise<{ message: string }> {
-    const response = await authFetch(`${API_URL}/api/invitation/${id}/revoke`, {
-      method: 'DELETE',
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to revoke invitation');
-    return readJson(response, 'Failed to revoke invitation');
-  },
 
   // New link-based invitations
   async generateInviteLink(): Promise<GenerateLinkResponse> {
@@ -260,14 +246,6 @@ export const api = {
     return readJson(response, 'Failed to revoke invite link');
   },
 
-  async registerWithLink(linkToken: string, email: string, displayName: string, password: string): Promise<RegisterResponse> {
-    const response = await publicFetch(`${API_URL}/api/auth/register-with-link`, {
-      method: 'POST',
-      body: JSON.stringify({ linkToken, email, displayName, password }),
-    });
-    if (!response.ok) throw await apiError(response, 'Registration failed');
-    return readJson(response, 'Registration failed');
-  },
 
   // Session
   async createSession(): Promise<{ sessionId: string }> {
@@ -341,20 +319,7 @@ export const api = {
     return readJson(response, 'Failed to get user tree');
   },
 
-  async getAdminInvitations(): Promise<AdminInvitation[]> {
-    const response = await authFetch(`${API_URL}/api/admin/invitations`);
-    if (!response.ok) throw await apiError(response, 'Failed to get invitations');
-    return readJson(response, 'Failed to get invitations');
-  },
 
-  async updateAdminUser(id: string, data: { displayName?: string; email?: string; isEmailVerified?: boolean }): Promise<{ message: string }> {
-    const response = await authFetch(`${API_URL}/api/admin/users/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to update user');
-    return readJson(response, 'Failed to update user');
-  },
 
   async deleteAdminUser(id: string): Promise<{ message: string }> {
     const response = await authFetch(`${API_URL}/api/admin/users/${id}`, {
@@ -364,53 +329,9 @@ export const api = {
     return readJson(response, 'Failed to delete user');
   },
 
-  async deleteAdminInvitation(id: string): Promise<{ message: string }> {
-    const response = await authFetch(`${API_URL}/api/admin/invitations/${id}`, {
-      method: 'DELETE',
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to delete invitation');
-    return readJson(response, 'Failed to delete invitation');
-  },
 
-  // Demo requests (public submit)
-  async submitDemoRequest(email: string, displayName: string, message?: string): Promise<DemoRequestSubmitResponse> {
-    const response = await publicFetch(`${API_URL}/api/demo-requests`, {
-      method: 'POST',
-      body: JSON.stringify({ email, displayName, message: message?.trim() || null }),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to submit demo request');
-    return readJson(response, 'Failed to submit demo request');
-  },
 
-  // Demo requests (admin)
-  async getAdminDemoRequests(): Promise<AdminDemoRequest[]> {
-    const response = await authFetch(`${API_URL}/api/admin/demo-requests`);
-    if (!response.ok) throw await apiError(response, 'Failed to get demo requests');
-    return readJson(response, 'Failed to get demo requests');
-  },
 
-  async approveAdminDemoRequest(id: string): Promise<ApproveDemoRequestResponse> {
-    const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/approve`, {
-      method: 'POST',
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to approve demo request');
-    return readJson(response, 'Failed to approve demo request');
-  },
 
-  async rejectAdminDemoRequest(id: string, reason?: string): Promise<{ message: string }> {
-    const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/reject`, {
-      method: 'POST',
-      body: JSON.stringify({ reason: reason?.trim() || null }),
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to reject demo request');
-    return readJson(response, 'Failed to reject demo request');
-  },
 
-  async resendAdminDemoRequest(id: string): Promise<ApproveDemoRequestResponse> {
-    const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/resend`, {
-      method: 'POST',
-    });
-    if (!response.ok) throw await apiError(response, 'Failed to resend invitation');
-    return readJson(response, 'Failed to resend invitation');
-  },
 };

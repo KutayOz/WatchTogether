@@ -59,9 +59,19 @@ const memoryStorage = (): Storage => {
 };
 
 beforeEach(() => {
-  vi.stubGlobal('window', { location: { pathname: '/lobby', href: '/lobby' } });
-  vi.stubGlobal('localStorage', memoryStorage());
-  vi.stubGlobal('sessionStorage', memoryStorage());
+  // The storages hang off `window` as well as the bare global: authStorage
+  // reads window.localStorage explicitly, because modern Node's own
+  // experimental localStorage global shadows the DOM one under a test
+  // environment and throws on every method.
+  const local = memoryStorage();
+  const session = memoryStorage();
+  vi.stubGlobal('window', {
+    location: { pathname: '/lobby', href: '/lobby' },
+    localStorage: local,
+    sessionStorage: session,
+  });
+  vi.stubGlobal('localStorage', local);
+  vi.stubGlobal('sessionStorage', session);
 });
 
 afterEach(() => {
@@ -169,8 +179,10 @@ describe('api error handling — untouched behaviour', () => {
   });
 
   it('still returns array bodies', async () => {
+    // getAdminUsers is the surviving endpoint that returns a bare array rather
+    // than an object — getMyInvitations went with the email-based invitations.
     respondWith(200, JSON.stringify([{ id: '1' }]), 'application/json');
-    await expect(api.getMyInvitations()).resolves.toEqual([{ id: '1' }]);
+    await expect(api.getAdminUsers()).resolves.toEqual([{ id: '1' }]);
   });
 
   // passkeyRemove returns void and never parses a body, so a bodiless 204 —

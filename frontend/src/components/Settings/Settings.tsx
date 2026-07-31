@@ -51,7 +51,7 @@ export function Settings() {
       // Lazy import for the same reason as login — only users on this page
       // pay the ~15KB cost of @simplewebauthn/browser.
       const { startRegistration } = await import('@simplewebauthn/browser');
-      const options = await api.passkeyBeginRegistration();
+      const options = await api.passkeyBeginAddition();
       const attestation = await startRegistration({
         optionsJSON: options as Parameters<typeof startRegistration>[0]['optionsJSON'],
       });
@@ -61,8 +61,8 @@ export function Settings() {
       const defaultLabel = guessDeviceLabel();
       const label = window.prompt('Label this passkey:', defaultLabel) ?? defaultLabel;
 
-      const result = await api.passkeyFinishRegistration(attestation, label);
-      setSuccess(`Added "${result.label}"`);
+      await api.passkeyFinishRegistration(attestation, label);
+      setSuccess(`Added "${label}"`);
       await load();
     } catch (err) {
       // SimpleWebAuthn throws a friendly DOMException on user cancel —
@@ -86,7 +86,7 @@ export function Settings() {
     setError(null);
     setSuccess(null);
     try {
-      await api.passkeyRemove(item.credentialIdBase64Url);
+      await api.passkeyRemove(item.credentialId);
       setSuccess(`Removed "${item.label}"`);
       await load();
     } catch (err) {
@@ -158,10 +158,10 @@ export function Settings() {
                     textAlign: 'center',
                   }}
                 >
-                  no passkeys yet — add one to skip the password next time ↑
+                  no passkeys on file — add one so you can sign in from another device ↑
                 </div>
               ) : (
-                items.map((item) => <PasskeyRow key={item.credentialIdBase64Url} item={item} onRemove={() => handleRemove(item)} disabled={busy} />)
+                items.map((item) => <PasskeyRow key={item.credentialId} item={item} onRemove={() => handleRemove(item)} disabled={busy} />)
               )}
             </div>
           </section>
