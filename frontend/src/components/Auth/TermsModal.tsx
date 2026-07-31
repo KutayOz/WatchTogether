@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { api } from '../../services/api';
 import { SectionTitle, StickerButton, TagSticker } from '../manga';
 
@@ -13,6 +13,7 @@ export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
   const [isAccepting, setIsAccepting] = useState(false);
   const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -32,13 +33,38 @@ export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
     }
   };
 
-  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
-    const target = e.target as HTMLDivElement;
-    const isAtBottom = target.scrollHeight - target.scrollTop <= target.clientHeight + 50;
-    if (isAtBottom) {
+  /**
+   * The bottom of the terms is "reached" either by scrolling there or by the
+   * whole document being visible at once — on a tall window the text fits with
+   * room to spare, and a box that cannot scroll never fires a scroll event.
+   * Gating purely on onScroll left the accept button permanently disabled for
+   * anyone whose viewport was taller than ~960px.
+   */
+  const checkAtBottom = useCallback(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop <= el.clientHeight + 50) {
       setHasScrolledToBottom(true);
     }
-  };
+  }, []);
+
+  useLayoutEffect(() => {
+    // Only once the real text is on screen. The loading placeholder is a single
+    // line that always fits, and unlatching on that would hand out the button
+    // before there was anything to read.
+    const el = bodyRef.current;
+    if (!terms || !el) return;
+
+    checkAtBottom();
+
+    // Re-check as the box or its contents are resized: window resizes, and
+    // late-arriving webfonts reflowing the text either way across the
+    // fits/overflows line.
+    const observer = new ResizeObserver(checkAtBottom);
+    observer.observe(el);
+    if (el.firstElementChild) observer.observe(el.firstElementChild);
+    return () => observer.disconnect();
+  }, [terms, checkAtBottom]);
 
   const handleAccept = async () => {
     setIsAccepting(true);
@@ -106,8 +132,9 @@ export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
 
         {/* Body */}
         <div
+          ref={bodyRef}
           className="scroll-y"
-          onScroll={handleScroll}
+          onScroll={checkAtBottom}
           style={{
             flex: 1,
             padding: '20px 28px',
