@@ -22,5 +22,10 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["vite.config.ts"]
+  /*
+   * tests/ lives here rather than under src/ because it reads repo files off
+   * disk — the shipped _headers, index.html, the hooks it cross-checks — so it
+   * needs node's types, which browser code deliberately does not have.
+   */
+  "include": ["vite.config.ts", "tests"]
 }
