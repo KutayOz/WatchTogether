@@ -135,7 +135,7 @@ export function ChatPanel({
             <ChatMessageItem
               key={i}
               message={msg}
-              isOwnMessage={msg.sender === user?.displayName}
+              isOwnMessage={msg.sender === user?.username}
             />
           ))
         )}

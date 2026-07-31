@@ -1,143 +1,93 @@
-// Auth storage — post-C4
+// Cached UI identity.
 //
 // SECURITY MODEL:
-//   - The JWT auth token lives in an HttpOnly cookie set by /api/auth/login.
-//   - JS *cannot* read that cookie. Token theft via XSS is no longer possible.
-//   - What's stored here is *public UI state* (displayName, role, etc.) for
-//     optimistic boot rendering. None of it grants any privilege server-side
-//     — that's solely the cookie's job.
-//   - The /api/auth/me endpoint is the source of truth; the storage is just
-//     a cached hint so the app doesn't flash an empty-state shell on reload.
+//   - The JWT lives in an HttpOnly cookie. JS cannot read it, so token theft
+//     via XSS is not possible.
+//   - What is stored here is public UI state (username, tag, role) so boot does
+//     not flash an empty shell. None of it grants anything server-side — that is
+//     solely the cookie's job.
+//   - /api/auth/me is the source of truth; this is an optimistic hint that gets
+//     overwritten on every boot.
 //
-// The "remember me" preference still lives here (it controls the cookie's
-// Max-Age via the login request body), and we still split between localStorage
-// and sessionStorage based on that preference — for consistency with how the
-// cookie behaves (persistent vs session).
+// "Remember me" is gone along with passwords. It used to choose between
+// localStorage and sessionStorage to mirror a cookie whose Max-Age the login
+// request controlled. The Worker now issues one cookie lifetime for every
+// sign-in, so honouring a stored preference would actively desynchronise the
+// two: a sessionStorage cache dies with the tab while the cookie lives on, and
+// the app would render logged-out for a user whose session is perfectly valid.
+// One storage, matching one cookie.
+//
+// Accessed as window.localStorage rather than the bare global: modern Node
+// ships its own experimental localStorage, which shadows the DOM one under a
+// test environment and throws on every method unless the process was started
+// with --localstorage-file. Naming the window explicitly means this code reads
+// the same object in a browser and in a test.
 
-const AUTH_KEYS = [
-  'email',
-  'displayName',
-  'isRootUser',
-  'isInvitationTicketUsed',
-  'hasAcceptedTerms',
-] as const;
+const AUTH_KEYS = ['username', 'discriminator', 'tag', 'isRootUser', 'hasAcceptedTerms'] as const;
 
-const REMEMBER_ME_KEY = 'rememberMe';
+export interface CachedUser {
+  username: string;
+  discriminator: string;
+  tag: string;
+  isRootUser: boolean;
+  hasAcceptedTerms: boolean;
+}
 
-/**
- * Check if user has "remember me" enabled
- */
-export function isRememberMeEnabled(): boolean {
-  return localStorage.getItem(REMEMBER_ME_KEY) === 'true';
+export function setAuthData(data: CachedUser): void {
+  window.localStorage.setItem('username', data.username);
+  window.localStorage.setItem('discriminator', data.discriminator);
+  window.localStorage.setItem('tag', data.tag);
+  window.localStorage.setItem('isRootUser', String(data.isRootUser));
+  window.localStorage.setItem('hasAcceptedTerms', String(data.hasAcceptedTerms));
 }
 
 /**
- * Get the appropriate storage based on remember me setting
- */
-function getStorage(): Storage {
-  return isRememberMeEnabled() ? localStorage : sessionStorage;
-}
-
-/**
- * Get auth item from storage (checks both storages for existing sessions)
- */
-export function getAuthItem(key: string): string | null {
-  // First check the preferred storage
-  const storage = getStorage();
-  const value = storage.getItem(key);
-  if (value) return value;
-
-  // Fallback: check the other storage (for migration/edge cases)
-  const otherStorage = isRememberMeEnabled() ? sessionStorage : localStorage;
-  return otherStorage.getItem(key);
-}
-
-/**
- * Set all auth items and remember me preference. No `token` field any more —
- * the server sets an HttpOnly cookie. We only cache the UI display fields.
- */
-export function setAuthData(
-  data: {
-    email: string;
-    displayName: string;
-    isRootUser: boolean;
-    isInvitationTicketUsed: boolean;
-    hasAcceptedTerms: boolean;
-  },
-  rememberMe: boolean
-): void {
-  // First clear any existing auth data from both storages
-  clearAuthData();
-
-  // Set remember me preference in localStorage (must persist to know which storage to use)
-  localStorage.setItem(REMEMBER_ME_KEY, String(rememberMe));
-
-  // Now set data in the appropriate storage
-  const storage = rememberMe ? localStorage : sessionStorage;
-  storage.setItem('email', data.email);
-  storage.setItem('displayName', data.displayName);
-  storage.setItem('isRootUser', String(data.isRootUser));
-  storage.setItem('isInvitationTicketUsed', String(data.isInvitationTicketUsed));
-  storage.setItem('hasAcceptedTerms', String(data.hasAcceptedTerms));
-}
-
-/**
- * Clear all auth data from both storages.
+ * Clear the JS-readable hint state.
  *
- * IMPORTANT: this only clears the JS-readable hint state. The HttpOnly auth
- * cookie can only be cleared by the server — call POST /api/auth/logout to
- * actually invalidate the session. (api.logout() does both in the right order.)
+ * This cannot clear the HttpOnly cookie — only the server can, via
+ * POST /api/auth/logout. api.logout() does both, in the order that leaves no
+ * live token behind.
  */
 export function clearAuthData(): void {
   for (const key of AUTH_KEYS) {
-    localStorage.removeItem(key);
-    sessionStorage.removeItem(key);
+    window.localStorage.removeItem(key);
+    // Swept too: sessions cached under the old remember-me split would
+    // otherwise linger in sessionStorage forever, invisible to every other
+    // function here.
+    window.sessionStorage.removeItem(key);
   }
-  localStorage.removeItem(REMEMBER_ME_KEY);
+  window.localStorage.removeItem('rememberMe');
 }
 
-/**
- * Update a single auth item (preserves storage location)
- */
 export function updateAuthItem(key: string, value: string): void {
-  // Update in whichever storage has the displayName (our "is logged in" sentinel)
-  if (localStorage.getItem('displayName')) {
-    localStorage.setItem(key, value);
-  } else if (sessionStorage.getItem('displayName')) {
-    sessionStorage.setItem(key, value);
-  }
+  if (window.localStorage.getItem('username')) window.localStorage.setItem(key, value);
 }
 
 /**
- * Get cached user info if present. Note: returning data here does NOT mean the
- * server still considers the user authenticated — only the cookie + /me check
- * can answer that. Callers should treat this as an *optimistic* hint and
- * verify via api.getMe() on boot.
+ * The cached user, if any.
+ *
+ * Returning something does NOT mean the server still considers the session
+ * valid — only the cookie and /me can answer that. Treat it as optimistic and
+ * verify.
  */
-export function getCachedUser(): {
-  email: string;
-  displayName: string;
-  isRootUser: boolean;
-  isInvitationTicketUsed: boolean;
-  hasAcceptedTerms: boolean;
-} | null {
-  // Check both storages for displayName (used as the "have any cached user" sentinel)
-  const displayName = localStorage.getItem('displayName') || sessionStorage.getItem('displayName');
-  if (!displayName) return null;
+export function getCachedUser(): CachedUser | null {
+  const username = window.localStorage.getItem('username');
+  if (!username) return null;
 
-  // Determine which storage has the data
-  const storage = localStorage.getItem('displayName') ? localStorage : sessionStorage;
-  const email = storage.getItem('email');
-  if (!email) {
+  const tag = window.localStorage.getItem('tag');
+  const discriminator = window.localStorage.getItem('discriminator');
+  // A half-written cache is worse than none: it renders a user with a blank
+  // handle. Drop it and let /me repopulate.
+  if (!tag || !discriminator) {
     clearAuthData();
     return null;
   }
 
   return {
-    email,
-    displayName,
-    isRootUser: storage.getItem('isRootUser') === 'true',
-    isInvitationTicketUsed: storage.getItem('isInvitationTicketUsed') === 'true',
-    hasAcceptedTerms: storage.getItem('hasAcceptedTerms') === 'true',
+    username,
+    discriminator,
+    tag,
+    isRootUser: window.localStorage.getItem('isRootUser') === 'true',
+    hasAcceptedTerms: window.localStorage.getItem('hasAcceptedTerms') === 'true',
   };
 }

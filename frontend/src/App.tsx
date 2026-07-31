@@ -29,11 +29,7 @@ import { ScreentoneDefs } from './components/manga';
  * the lazy() call just makes the import dynamic.
  */
 const Login = lazy(() => import('./components/Login/Login').then((m) => ({ default: m.Login })));
-const Register = lazy(() => import('./components/Auth/Register').then((m) => ({ default: m.Register })));
 const InviteSignup = lazy(() => import('./components/Auth/InviteSignup').then((m) => ({ default: m.InviteSignup })));
-const VerifyEmail = lazy(() => import('./components/Auth/VerifyEmail').then((m) => ({ default: m.VerifyEmail })));
-const CheckEmail = lazy(() => import('./components/Auth/CheckEmail').then((m) => ({ default: m.CheckEmail })));
-const RequestDemo = lazy(() => import('./components/Auth/RequestDemo').then((m) => ({ default: m.RequestDemo })));
 const Lobby = lazy(() => import('./components/Lobby/Lobby').then((m) => ({ default: m.Lobby })));
 const SessionRoom = lazy(() => import('./components/Session/SessionRoom').then((m) => ({ default: m.SessionRoom })));
 const JoinSession = lazy(() => import('./components/Session/JoinSession').then((m) => ({ default: m.JoinSession })));
@@ -112,11 +108,10 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
 function AppRoutes() {
   return (
     <Routes>
-      {/* Registration flow */}
-      <Route path="/register/:token" element={<Register />} />
+      {/* The only way to create an account. /register, /verify-email,
+          /check-email and /request-demo are gone with passwords and email —
+          any stale bookmark falls through to the catch-all below. */}
       <Route path="/invite/:token" element={<InviteSignup />} />
-      <Route path="/verify-email/:token" element={<VerifyEmail />} />
-      <Route path="/check-email" element={<CheckEmail />} />
 
       {/* Login */}
       <Route
@@ -124,16 +119,6 @@ function AppRoutes() {
         element={
           <PublicRoute>
             <Login />
-          </PublicRoute>
-        }
-      />
-
-      {/* Public demo-request landing — for guests who don't have an invite */}
-      <Route
-        path="/request-demo"
-        element={
-          <PublicRoute>
-            <RequestDemo />
           </PublicRoute>
         }
       />

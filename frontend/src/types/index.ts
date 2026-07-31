@@ -1,37 +1,40 @@
-// Post-C4: token is no longer client-visible. The JWT lives in an HttpOnly
-// cookie set by /api/auth/login; JS can't read it (defence vs XSS theft).
-// What's stored client-side is just public UI state — name, role, etc.
+// The JWT lives in an HttpOnly cookie; JS cannot read it. What is stored
+// client-side is just public UI state — name, role, terms.
+//
+// Identity is `username#1234`, not an email. The discriminator is generated at
+// registration and never chosen, so two people can both be "kutay" without one
+// of them having to be kutay_47. `username` alone is what peers see in chat and
+// in the session; `tag` is the full handle, used wherever identity has to be
+// unambiguous (settings, admin, invites).
 export interface User {
-  email: string;
-  displayName: string;
+  username: string;
+  discriminator: string;
+  /** `username#1234`, precomputed server-side so the two never drift apart. */
+  tag: string;
   isRootUser?: boolean;
-  isInvitationTicketUsed?: boolean;
   hasAcceptedTerms?: boolean;
 }
 
+/** Returned by every endpoint that establishes a session. */
 export interface LoginResponse {
-  displayName: string;
-  email: string;
+  username: string;
+  discriminator: string;
+  tag: string;
   isRootUser: boolean;
-  isInvitationTicketUsed: boolean;
   hasAcceptedTerms: boolean;
 }
 
 export interface PasskeyListItem {
-  credentialIdBase64Url: string;
+  credentialId: string;
   label: string;
-  aaGuid: string;
-  registeredAt: string;
-  lastUsedAt: string | null;
+  aaguid: string | null;
+  /** Unix millis. */
+  registeredAt: number;
+  lastUsedAt: number | null;
+  backedUp: boolean;
 }
 
-export interface MeResponse {
-  email: string;
-  displayName: string;
-  isRootUser: boolean;
-  isInvitationTicketUsed: boolean;
-  hasAcceptedTerms: boolean;
-}
+export type MeResponse = LoginResponse;
 
 // Registration
 export interface ValidateInvitationResponse {
@@ -40,66 +43,37 @@ export interface ValidateInvitationResponse {
   message?: string;
 }
 
-export interface RegisterResponse {
-  email: string;
-  message: string;
-}
-
-export interface VerifyEmailResponse {
-  success: boolean;
-  message: string;
-}
-
-// Invitations
+// Invitations — shapes mirror worker/src/routes/invitation.ts.
 export interface InvitationSlots {
-  maxSlots: number;
-  /** Total slots taken — sum of pendingSlots + trulyUsedSlots. */
+  /** null for root, who has no cap. Render "∞" rather than a sentinel number. */
+  maxSlots: number | null;
   usedSlots: number;
-  /** Outstanding links (generated, not yet consumed, not expired). */
-  pendingSlots: number;
-  /** Links a friend has already registered through (UsedAt set). */
-  trulyUsedSlots: number;
-  remainingSlots: number;
-  /** True when the user has no quota cap (root). When set, maxSlots /
-   *  remainingSlots carry int.MaxValue as a sentinel — render "∞" not the
-   *  raw number. UsedSlots / pendingSlots / trulyUsedSlots stay meaningful. */
-  isUnlimited?: boolean;
+  remainingSlots: number | null;
+  isUnlimited: boolean;
 }
 
-export interface Invitation {
-  id: string;
-  inviteeEmail: string;
-  status: string;
-  createdAt: string;
-  expiresAt: string;
-  usedAt?: string;
-}
-
-export interface CreateInvitationResponse {
-  success: boolean;
-  message?: string;
-  invitationLink?: string;
-  invitation?: Invitation;
-}
-
-// New link-based invitation types
 export interface GenerateLinkResponse {
   success: boolean;
   message?: string;
   inviteUrl?: string;
-  expiresAt?: string;
+  /** Unix millis. */
+  expiresAt?: number;
 }
 
 export interface ValidateLinkResponse {
   valid: boolean;
   message?: string;
-  inviterDisplayName?: string;
+  /** `username#1234` of whoever minted the link. */
+  inviterTag?: string | null;
 }
 
 export interface ActiveLinkResponse {
   hasActiveLink: boolean;
-  inviteUrl?: string;
-  expiresAt?: string;
+  /**
+   * Deliberately absent — the raw token exists only in the response that minted
+   * it, so an outstanding link can be reported but never re-shown.
+   */
+  expiresAt: number | null;
 }
 
 export interface IceServer {
@@ -217,66 +191,39 @@ export interface JoinWithInviteResponse {
   sessionId?: string;
 }
 
-// Admin
+// Admin — shapes mirror worker/src/routes/admin.ts's UserSummary exactly.
 export interface AdminUser {
   id: string;
-  email: string;
-  displayName: string;
+  username: string;
+  discriminator: string;
+  tag: string;
   isRootUser: boolean;
-  isEmailVerified: boolean;
-  isInvitationTicketUsed: boolean;
   invitedByUserId: string | null;
-  createdAt: string;
-  hasAcceptedTerms: boolean;
+  /** Unix millis. */
+  createdAt: number;
+  isDeleted: boolean;
 }
 
-export interface UserTreeNode {
-  id: string;
-  displayName: string;
-  email: string;
-  isRootUser: boolean;
-  isEmailVerified: boolean;
-  createdAt: string;
+export interface UserTreeNode extends AdminUser {
   children: UserTreeNode[];
 }
 
 export interface UserTreeResponse {
   root: UserTreeNode | null;
+  /** Users whose inviter is missing — soft-deleted, or data predating the tree. */
+  orphans?: UserTreeNode[];
   totalUsers: number;
 }
 
-export interface AdminInvitation {
+export interface AuditEntry {
   id: string;
-  inviterUserId: string;
-  inviteeEmail: string;
-  status: string;
-  createdAt: string;
-  expiresAt: string;
-  usedAt?: string;
-  registeredUserId?: string;
-}
-
-// Demo requests
-export interface DemoRequestSubmitResponse {
-  message: string;
-}
-
-export interface AdminDemoRequest {
-  id: string;
-  email: string;
-  displayName: string;
-  message?: string;
-  status: string;
-  submittedAt: string;
-  reviewedAt?: string;
-  reviewedByUserId?: string;
-  rejectionReason?: string;
-}
-
-export interface ApproveDemoRequestResponse {
-  message: string;
-  invitationUrl?: string;
-  expiresAt?: string;
+  actorUserId: string;
+  actorTag: string | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  details: string | null;
+  createdAt: number;
 }
 
 // Network quality monitoring types

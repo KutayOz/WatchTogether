@@ -6,9 +6,12 @@ interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   error: string | null;
-  login: (email: string, password: string, rememberMe?: boolean) => Promise<User>;
-  loginWithGoogle: (idToken: string, invitationLinkToken?: string) => Promise<User>;
-  loginWithPasskey: (email?: string) => Promise<User>;
+  /** Screens clear this when the user edits a field, so a stale error does not linger. */
+  setError: (error: string | null) => void;
+  /** Usernameless — the authenticator picks the credential, so there is nothing to pass. */
+  loginWithPasskey: () => Promise<User>;
+  registerWithPasskey: (inviteToken: string, username: string) => Promise<User>;
+  setupRootWithPasskey: (username: string, setupSecret: string) => Promise<User>;
   logout: () => void;
   updateTermsAccepted: () => void;
   refreshUser: () => Promise<void>;

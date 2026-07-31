@@ -107,12 +107,9 @@ export function Lobby() {
   const totalSlots = isUnlimited
     ? usedSlots + 1
     : invitationSlots?.maxSlots ?? 0;
-  // The "X left" label in the corner of the ticket book. Show "∞" rather
-  // than the int.MaxValue numeral the backend sends for unlimited users.
+  // The "X left" label in the corner of the ticket book. Root has no cap, and
+  // the Worker sends null rather than a sentinel numeral for that.
   const remainingLabel = isUnlimited ? '∞' : String(remainingSlots);
-  // Backend now returns these directly — no more guessing from a boolean.
-  const pendingCount = invitationSlots?.pendingSlots ?? 0;
-  const trulyUsedCount = invitationSlots?.trulyUsedSlots ?? 0;
 
   return (
     <div className="app">
@@ -123,7 +120,7 @@ export function Lobby() {
             <div className="hand" style={{ fontSize: 32, color: 'var(--ink)' }}>
               hey,{' '}
               <span style={{ color: 'var(--pink)', textDecoration: 'underline wavy' }}>
-                {user?.displayName ?? 'friend'}!
+                {user?.username ?? 'friend'}!
               </span>
             </div>
             <TagSticker color="pink" rot={-3}>
@@ -270,9 +267,13 @@ export function Lobby() {
           <div className="col" style={{ gap: 14 }}>
             {invitationSlots ? (
               Array.from({ length: totalSlots }, (_, i) => {
-                // Layout: truly-used first, then pending, then available.
-                const used = i < trulyUsedCount;
-                const pending = !used && i < trulyUsedCount + pendingCount;
+                // A slot is either spent or free. The old pending/used split
+                // needed a per-invitation record to distinguish "link is out
+                // there" from "someone signed up through it"; the Worker tracks
+                // one active-link count per user instead, so the ticket book
+                // shows spent-then-free and nothing in between.
+                const used = i < usedSlots;
+                const pending = false;
                 const available = i >= usedSlots;
                 const label = `invite #${String(i + 1).padStart(3, '0')}`;
                 return (

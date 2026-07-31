@@ -121,15 +121,15 @@ export default defineConfig({
             }
             // Mediapipe is already dynamic-imported from useBackgroundBlur
             // and emits its own chunk via the runtime import. Don't override.
-            // Zxcvbn dictionaries are dynamic-imported from zxcvbnLoader.ts
-            // and already emit their own chunks. Don't override.
+            // @simplewebauthn/browser is likewise dynamic-imported, only when
+            // a ceremony actually starts.
           }
         },
       },
     },
-    // Now that we've consciously sized each chunk, push the warning ceiling
-    // up so CI doesn't flag legitimate large chunks (the zxcvbn dictionaries
-    // are 1.2 MB on their own, but they're lazy + only hit on /register).
-    chunkSizeWarningLimit: 700,
+    // Back down to Rollup's default now that the largest chunks are gone: the
+    // zxcvbn dictionaries were 1.2 MB and 465 kB, and they left with passwords.
+    // A low ceiling is the point — it complains when something big sneaks back.
+    chunkSizeWarningLimit: 500,
   },
 })
