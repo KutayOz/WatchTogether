@@ -5,6 +5,7 @@ import { buildClearedAuthCookie, readAuthCookie } from "../lib/cookies";
 import { verifyToken } from "../lib/jwt";
 import { revokeToken } from "../db/revokedTokens";
 import { anyUserExists, tagOf } from "../db/users";
+import { hasAcceptedCurrentTerms } from "../lib/terms";
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -16,7 +17,7 @@ authRoutes.get("/me", requireAuth, (c) => {
     discriminator: user.discriminator,
     tag: tagOf(user),
     isRootUser: user.is_root === 1,
-    hasAcceptedTerms: user.accepted_terms_at !== null,
+    hasAcceptedTerms: hasAcceptedCurrentTerms(user),
   });
 });
 

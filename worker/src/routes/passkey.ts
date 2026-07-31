@@ -13,6 +13,7 @@ import { buildAuthCookie } from "../lib/cookies";
 import { issueToken } from "../lib/jwt";
 import { fromBase64Url, randomToken, sha256Hex, toBase64Url } from "../lib/crypto";
 import { USERNAME_ERROR_MESSAGES, normalizeUsername } from "../lib/identity";
+import { hasAcceptedCurrentTerms } from "../lib/terms";
 import {
   createRootUser,
   createUser,
@@ -94,7 +95,7 @@ async function loginResponse(c: Context<AppEnv>, user: UserRow) {
     discriminator: user.discriminator,
     tag: tagOf(user),
     isRootUser: user.is_root === 1,
-    hasAcceptedTerms: user.accepted_terms_at !== null,
+    hasAcceptedTerms: hasAcceptedCurrentTerms(user),
   });
 }
 
