@@ -1,13 +1,7 @@
 import type { QualityLevel } from '../../types';
-
-interface QualityMetrics {
-  packetsLost: number;
-  packetsReceived: number;
-  jitterMs: number;
-  rttMs: number;
-  fps: number;
-  framesDropped: number;
-}
+// The producer's type, not a copy of it. This interface used to be redeclared
+// here field-for-field, which is only ever right until one side changes.
+import type { QualityMetrics } from '../../hooks/useQualityMonitor';
 
 interface ConnectionQualityBadgeProps {
   quality: QualityLevel | null;
@@ -42,14 +36,17 @@ function formatTooltip(metrics: QualityMetrics | null): string {
   const total = metrics.packetsReceived + metrics.packetsLost;
   const lossPct = total > 0 ? (metrics.packetsLost / total) * 100 : 0;
   // Compact "RTT · loss · jitter" — only include fps if it's actually being
-  // measured (>0). framesDropped only included if non-trivial.
+  // measured (>0). Freezes replace the old frames-dropped line: dropped frames
+  // were a running total that only ever grew, so once it passed the threshold
+  // the badge said "drops" for the rest of the call. Freeze seconds are
+  // per-interval, so this reads as what is happening now.
   const parts = [
     `RTT ${Math.round(metrics.rttMs)}ms`,
     `loss ${lossPct.toFixed(1)}%`,
     `jitter ${Math.round(metrics.jitterMs)}ms`,
   ];
   if (metrics.fps > 0) parts.push(`${Math.round(metrics.fps)} fps`);
-  if (metrics.framesDropped > 5) parts.push(`${metrics.framesDropped} drops`);
+  if (metrics.freezeSeconds > 0.1) parts.push(`${metrics.freezeSeconds.toFixed(1)}s frozen`);
   return parts.join(' · ');
 }
 
