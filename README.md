@@ -26,7 +26,8 @@ this](#why-it-is-shaped-like-this).
 ## Features
 
 - **P2P video calling** — WebRTC direct peer connections, no media servers
-- **Screen sharing** — full-resolution, with adaptive bitrate
+- **Screen sharing** — full-resolution, clamped to what the connection's own
+  bandwidth estimate says it can carry
 - **Synced YouTube co-watching** — paste a link, both sides stay in step
 - **Background blur** — MediaPipe segmentation, lazy-loaded (~2 MB, only when switched on)
 - **Passkey sign-in** — usernameless and discoverable; nothing to type, nothing to leak
@@ -269,8 +270,7 @@ git show archive/dotnet:backend/API/Hubs/WatchTogetherHub.cs
 Not planned, deliberately: 3+ party calling (the whole design assumes two
 people), recording, chat history.
 
-Possible: custom background images, vanity session URLs, replacing the speed
-test with `getStats()`-driven quality adaptation.
+Possible: custom background images, vanity session URLs.
 
 ## License
 

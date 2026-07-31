@@ -6,7 +6,7 @@ import { useSessionContext } from '../../context/SessionContext';
 import { useTransport } from '../../hooks/useTransport';
 import { useWebRTC } from '../../hooks/useWebRTC';
 import { useMediaDevices } from '../../hooks/useMediaDevices';
-import { useSpeedTest } from '../../hooks/useSpeedTest';
+import { useUplinkEstimate } from '../../hooks/useUplinkEstimate';
 import { useQualityMonitor } from '../../hooks/useQualityMonitor';
 import { useTalkingWhileMuted } from '../../hooks/useTalkingWhileMuted';
 import { api } from '../../services/api';
@@ -159,8 +159,6 @@ export function SessionRoom() {
   };
 
   const { isMuted, isCameraOn, toggleMute, toggleCamera } = useMediaDevices();
-
-  const speedTest = useSpeedTest(true);
 
   const handleIceCandidate = useCallback(async (candidate: string) => {
     const currentSessionId = sessionIdRef.current;
@@ -623,32 +621,36 @@ export function SessionRoom() {
     isWatchingRemoteScreen ? handleQualityFeedback : undefined,
   );
 
-  // Proactive bandwidth clamp — THE wire that was missing. The speed test used
-  // to only paint a "recommended" badge; here we actually apply it. When the
-  // measured uplink can't sustain the current quality, drop to the recommended
-  // preset (unless the user manually overrode this session). This is the primary
-  // fix for over-driving the link — the root cause of stutter + growing latency.
+  const uplink = useUplinkEstimate(isCallActive);
+
+  // Proactive bandwidth clamp. When the estimator says the link cannot sustain
+  // the selected preset, drop to the best one it can — unless the user picked
+  // this quality themselves, in which case their choice stands.
+  //
+  // Only ever downward. Nothing here raises quality, because a link that
+  // *could* carry more is not a reason to override what someone chose.
   useEffect(() => {
-    const result = speedTest.result;
-    if (!result || userOverrodeQualityRef.current) return;
+    // No estimate means no opinion — a browser that does not publish
+    // availableOutgoingBitrate (Firefox) must not have quality decided for it.
+    if (!uplink || userOverrodeQualityRef.current) return;
     const current = screenShareQualityRef.current;
-    if (result.supportedQualities[current] === false) {
-      const next = result.recommendedQuality;
-      if (next && next !== current) {
-        screenShareQualityRef.current = next;
-        setScreenShareQuality(next);
-        localStorage.setItem('screenShareQuality', next);
-        if (webrtc.isScreenSharing) {
-          webrtc.updateScreenShareQuality(next).catch(() => {});
-        }
-        setToast({
-          message: `Quality set to ${next} for your connection (${result.uploadSpeedMbps} Mbps up)`,
-          type: 'info',
-        });
-      }
+    if (uplink.supportedQualities[current] !== false) return;
+
+    const next = uplink.recommendedQuality;
+    if (!next || next === current) return;
+
+    screenShareQualityRef.current = next;
+    setScreenShareQuality(next);
+    localStorage.setItem('screenShareQuality', next);
+    if (webrtc.isScreenSharing) {
+      webrtc.updateScreenShareQuality(next).catch(() => {});
     }
+    setToast({
+      message: `Quality set to ${next} for your connection (${uplink.uplinkMbps} Mbps up)`,
+      type: 'info',
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [speedTest.result]);
+  }, [uplink]);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -1398,7 +1400,7 @@ export function SessionRoom() {
               canShare={canRequestShare || webrtc.isScreenSharing}
               screenShareQuality={screenShareQuality}
               onQualityChange={handleQualityChange}
-              speedTestResult={speedTest.result}
+              uplink={uplink}
               isSharer={isLocalSharing}
               hasPeer={!!peerName}
               peerDisplayName={peerName ?? undefined}

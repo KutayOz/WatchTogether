@@ -32,16 +32,25 @@ On the Workers & Pages overview page in the dashboard. Not a secret in the
 strict sense — it is an identifier, useless without the token — but it lives
 alongside it for convenience.
 
-## Turning CI into an actual gate
+## The gate
 
-A green tick nobody is required to look at protects nothing. Under
-**Settings → Rules → Rulesets**, add a ruleset targeting `main` that requires:
+A green tick nobody is required to look at protects nothing, so `main` carries
+a ruleset (**Settings → Rules → Rulesets → main**) requiring:
 
-- a pull request before merging
-- the `worker`, `frontend` and `e2e` status checks to pass
-- branches to be up to date before merging — this is the one that would have
-  caught the first two pull requests on this repo, which were branched off a
-  `main` that predated the Cloudflare rewrite
+- a pull request before merging, with **0 required approvals** — deliberately.
+  This is a one-maintainer repository and GitHub does not let you approve your
+  own pull request, so requiring one approval would make merging impossible.
+  The gate here is the checks, not a second pair of eyes that does not exist.
+- `checks / worker`, `checks / frontend` and `checks / e2e` passing
+- branches up to date before merging — the one that would have caught the first
+  two pull requests on this repo, which were branched off a `main` that
+  predated the Cloudflare rewrite
+- no force-pushes and no deleting `main`
+
+There are no bypass actors, so this applies to the owner too: `git push origin
+main` is rejected outright. That is the intent — but it is not a lockout, since
+a repository admin can edit or disable the ruleset in the settings UI at any
+time.
 
 ## Cost
 

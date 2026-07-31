@@ -205,10 +205,9 @@ invite, join it from another profile, and confirm video both ways, chat
 - **Background blur is verified only as far as the CSP.** WebAssembly compiles
   under the live policy and both MediaPipe origins load; that it segments a
   real camera feed correctly in production is untested.
-- **The speed test is dead weight.** `speedTestService.ts` POSTs to
-  `/api/speedtest/upload`, which this Worker does not implement — a 404 every
-  five minutes per user. Worse, on Workers it would measure client-to-edge
-  latency, so it would report absurd speeds and clamp screen-share quality to
-  maximum for everyone. It should be deleted and quality driven from
-  `RTCPeerConnection.getStats()`, which `useQualityMonitor.ts` already reads.
-- **CI is advisory until a ruleset requires it.** See the workflows README.
+- **Quality adaptation has not been watched on a real link.** It now reads
+  `availableOutgoingBitrate` off the peer connection
+  (`frontend/src/hooks/useUplinkEstimate.ts`); the arithmetic is unit-tested,
+  but no one has yet sat on a slow connection and confirmed the clamp fires at
+  a sensible moment. Firefox does not publish that statistic, and there the
+  hook deliberately has no opinion — quality stays wherever the user put it.

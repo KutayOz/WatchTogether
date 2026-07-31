@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { type ScreenShareQuality, type SpeedTestResult, QUALITY_PRESETS } from '../../types';
+import { type ScreenShareQuality, type UplinkEstimate, QUALITY_PRESETS } from '../../types';
 
 interface MediaControlsProps {
   isMuted: boolean;
@@ -24,7 +24,8 @@ interface MediaControlsProps {
   hasScreenAudio?: boolean;
   screenAudioVolume?: number;
   onScreenAudioVolumeChange?: (volume: number) => void;
-  speedTestResult?: SpeedTestResult | null;
+  /** Null means the browser gives no bitrate estimate — show no advice at all. */
+  uplink?: UplinkEstimate | null;
 }
 
 export function MediaControls({
@@ -50,7 +51,7 @@ export function MediaControls({
   hasScreenAudio = false,
   screenAudioVolume = 100,
   onScreenAudioVolumeChange,
-  speedTestResult,
+  uplink,
 }: MediaControlsProps) {
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showVoiceMenu, setShowVoiceMenu] = useState(false);
@@ -158,7 +159,7 @@ export function MediaControls({
 
             {showQualityMenu && onQualityChange && (
               <PopMenu onClose={() => setShowQualityMenu(false)} title={isScreenSharing ? 'CHANGE QUALITY' : 'STREAM QUALITY'}>
-                {speedTestResult && (
+                {uplink && (
                   <div
                     className="hand"
                     style={{
@@ -169,7 +170,7 @@ export function MediaControls({
                       borderBottom: '2px dashed rgba(26,20,23,0.3)',
                     }}
                   >
-                    ↑ upload: {speedTestResult.uploadSpeedMbps} Mbps
+                    ↑ uplink: {uplink.uplinkMbps} Mbps
                   </div>
                 )}
                 {isScreenSharing && (
@@ -180,8 +181,8 @@ export function MediaControls({
                 {(Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]).map((key) => {
                   const preset = QUALITY_PRESETS[key];
                   const isSelected = screenShareQuality === key;
-                  const isRecommended = speedTestResult?.recommendedQuality === key;
-                  const isSupported = !speedTestResult || speedTestResult.supportedQualities[key] !== false;
+                  const isRecommended = uplink?.recommendedQuality === key;
+                  const isSupported = !uplink || uplink.supportedQualities[key] !== false;
                   return (
                     <button
                       key={key}
