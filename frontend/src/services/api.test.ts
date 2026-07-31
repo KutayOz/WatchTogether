@@ -25,8 +25,12 @@ import { api } from './api';
 const EDGE_HTML =
   '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><h1>Error 502</h1></body></html>';
 
-/** Make the next fetch resolve with a canned response. */
-const respondWith = (status: number, body: string, contentType?: string) => {
+/**
+ * Make the next fetch resolve with a canned response. Pass `null` for a
+ * genuinely bodiless response — the Response constructor auto-stamps
+ * `Content-Type: text/plain` onto a '' body, and rejects a 204 that has one.
+ */
+const respondWith = (status: number, body: string | null, contentType?: string) => {
   vi.stubGlobal(
     'fetch',
     vi.fn(
@@ -74,7 +78,7 @@ describe('api error handling — non-JSON bodies', () => {
     ['HTML 504 gateway timeout', 504, '<html>gateway timeout</html>', 'text/html', 'gateway timeout'],
     ['HTML 503 during a restart', 503, '<html>no healthy upstream</html>', 'text/html', 'service unavailable — the server may be restarting'],
     ['413 from a proxy body limit', 413, '<html>413 Request Entity Too Large</html>', 'text/html', 'request too large'],
-    ['empty body', 500, '', undefined, 'server error'],
+    ['empty body', 500, null, undefined, 'server error'],
   ])('surfaces the status for %s', async (_name, status, body, contentType, expected) => {
     respondWith(status, body, contentType);
 
@@ -122,10 +126,58 @@ describe('api error handling — JSON bodies', () => {
   });
 });
 
+// The success side has the same exposure for a different reason. A 200 can
+// still carry a non-JSON body — the realistic case being a proxy or SPA
+// fallback answering an /api/* path with index.html — and there the parsed
+// value IS the return value, so it has to throw. What it must not throw is the
+// raw SyntaxError, whose message says nothing about which call failed.
+describe('api success handling — non-JSON 200s', () => {
+  it.each([
+    ['index.html from an SPA fallback', '<!DOCTYPE html><html><body><div id="root"></div></body></html>', 'text/html', 'the server sent text/html instead of JSON'],
+    ['a truncated body', '{"sessionId":"ab', 'application/json', 'the server sent application/json instead of JSON'],
+    ['an empty body', null, undefined, 'the server sent a response we could not read'],
+    ['a literal null body', 'null', 'application/json', 'the server sent application/json instead of JSON'],
+  ])('rejects readably when a 200 carries %s', async (_name, body, contentType, expected) => {
+    respondWith(200, body, contentType);
+
+    const error = await api.createSession().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(SyntaxError);
+    expect((error as Error).message).toBe(`Failed to create session (${expected})`);
+  });
+
+  // The message has to name the failing call, not just the transport — the
+  // whole point is that the user can tell what broke.
+  it('carries the calling method’s wording', async () => {
+    respondWith(200, '<!DOCTYPE html>', 'text/html');
+    await expect(api.getMe()).rejects.toThrow(
+      'Failed to fetch current user (the server sent text/html instead of JSON)',
+    );
+
+    respondWith(200, '<!DOCTYPE html>', 'text/html');
+    await expect(api.getTerms()).rejects.toThrow(
+      'Failed to get terms (the server sent text/html instead of JSON)',
+    );
+  });
+});
+
 describe('api error handling — untouched behaviour', () => {
   it('leaves the success path alone', async () => {
     respondWith(200, JSON.stringify({ sessionId: 'abc' }), 'application/json');
     await expect(api.createSession()).resolves.toEqual({ sessionId: 'abc' });
+  });
+
+  it('still returns array bodies', async () => {
+    respondWith(200, JSON.stringify([{ id: '1' }]), 'application/json');
+    await expect(api.getMyInvitations()).resolves.toEqual([{ id: '1' }]);
+  });
+
+  // passkeyRemove returns void and never parses a body, so a bodiless 204 —
+  // which would throw if it went through readJson — must still resolve.
+  it('tolerates a bodiless 204 on a void endpoint', async () => {
+    respondWith(204, null);
+    await expect(api.passkeyRemove('abc')).resolves.toBeUndefined();
   });
 
   // authFetch short-circuits on 401 before the body is ever read, so an HTML
