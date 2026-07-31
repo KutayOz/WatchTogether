@@ -1,15 +1,26 @@
-/// <reference types="vitest/config" />
 import { fileURLToPath, URL } from 'node:url'
-import { defineConfig } from 'vite'
+// defineConfig comes from 'vitest/config' rather than 'vite' so the `test`
+// block below is typed. It's a superset of vite's — every non-test option
+// behaves identically, and vitest is a devDependency that `npm ci` installs.
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
   test: {
-    // wsService reads window.location to build its URL and compares against
-    // WebSocket's static readyState constants, so it needs a DOM. The socket
-    // itself is replaced by a fake in the tests — nothing dials out.
+    /*
+     * Unit tests. Separate from e2e/ — those are Playwright specs against a
+     * running app (`npm run e2e`) and must NOT be picked up here, hence the
+     * explicit include rather than vitest's default glob.
+     *
+     * environment: happy-dom, not node and not jsdom. wsService builds its URL
+     * from window.location and compares against WebSocket's static readyState
+     * constants, so a real DOM is needed; the socket itself is a fake, so
+     * nothing dials out. jsdom is the wrong DOM here specifically because it
+     * refuses to perform navigation, which would hide the 401 login redirect
+     * api.test.ts asserts on.
+     */
     environment: 'happy-dom',
     include: ['src/**/*.test.ts'],
   },

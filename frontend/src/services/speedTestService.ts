@@ -1,8 +1,18 @@
 import { API_URL } from '../utils/constants';
+import { apiError, readJson } from './http';
 import type { SpeedTestResult, ScreenShareQuality } from '../types';
 
 const PAYLOAD_SIZE = 256 * 1024; // 256KB (reduced for reliability)
 const CHUNK_SIZE = 65536; // 64KB - max for crypto.getRandomValues
+
+// What POST /api/speedtest/upload returns on success (SpeedTestResponse
+// server-side). As in api.ts this is an assertion about the contract, not a
+// validated shape — readJson only guarantees the body parsed as JSON.
+interface SpeedTestUploadResponse {
+  uploadSpeedMbps: number;
+  recommendedQuality: string;
+  supportedQualities: Record<string, boolean>;
+}
 
 export const speedTestService = {
   async runTest(): Promise<SpeedTestResult> {
@@ -31,11 +41,14 @@ export const speedTestService = {
 
     const endTime = performance.now();
 
+    // This endpoint is unusually exposed to non-JSON bodies on both sides: it
+    // POSTs 256KB against a 512KB [RequestSizeLimit], so a proxy with a
+    // stricter cap rejects it with its own HTML 413 before the API ever runs.
     if (!response.ok) {
-      throw new Error('Speed test failed');
+      throw await apiError(response, 'Speed test failed');
     }
 
-    const result = await response.json();
+    const result = await readJson<SpeedTestUploadResponse>(response, 'Speed test failed');
 
     // Calculate client-side speed as fallback/verification
     const durationSec = (endTime - startTime) / 1000;

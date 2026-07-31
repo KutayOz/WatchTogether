@@ -205,17 +205,17 @@ export function SessionRoom() {
   }, [webrtc]);
 
   /**
-   * Send the offer, plus the state the peer needs to render us correctly.
+   * Offer, and re-announce any screen share we are already running.
    *
    * One path for all four ways a peer can appear: they join, we join and find
-   * them already there, they refresh, we refresh. Only the offerer acts, so
-   * this is safe to call unconditionally.
+   * them already there, they refresh, we refresh. Only the offerer acts, so it
+   * is safe to call unconditionally.
    *
-   * Media state is passed in rather than read from isMuted/isCameraOn because
-   * the join-time caller has just toggled them and would still be looking at
-   * the pre-toggle render's values.
+   * Media state deliberately does NOT belong here. It used to, and that was a
+   * bug: the answering side returns early and so never told the peer whether
+   * its mic was on. sendMediaState covers both roles.
    */
-  const offerToPeer = useCallback(async (mediaState: MediaState) => {
+  const offerToPeer = useCallback(async () => {
     const currentSessionId = sessionIdRef.current;
     if (!isInitiatorRef.current || !currentSessionId) return;
 
@@ -229,8 +229,6 @@ export function SessionRoom() {
           localScreenStreamIdRef.current,
         );
       }
-
-      await transportRef.current?.notifyMediaStateChange(currentSessionId, mediaState);
     } catch (err) {
       logger.error('[transport] Failed to create/send offer:', err);
     }
@@ -324,6 +322,30 @@ export function SessionRoom() {
     reactions, setReactions, handleSendReaction,
   } = usePeerPresence(sessionIdRef, transportRef, user?.displayName);
 
+  // One sender for "tell the peer what our mic / camera / screen state is."
+  // Callers pass the mic + camera values they're holding; screen-share state
+  // comes from the ref, which is authoritative at every call site.
+  const sendMediaState = useCallback(
+    // Tied to MediaState rather than spelled out, so renaming a field there is
+    // a compile error here instead of a silently-ignored property.
+    async (state: Omit<MediaState, 'isScreenSharing'>) => {
+      const transport = transportRef.current;
+      // No session or no peer → nobody to tell.
+      if (!transport || !sessionIdRef.current || !peerNameRef.current) return;
+      try {
+        await transport.notifyMediaStateChange(sessionIdRef.current, {
+          ...state,
+          isScreenSharing: !!localScreenStreamIdRef.current,
+        });
+      } catch (err) {
+        // Stale badges aren't worth interrupting the call over — the next
+        // toggle or screen-share event resyncs them.
+        logger.error('[Session] Failed to notify media state change:', err);
+      }
+    },
+    [],
+  );
+
   // Post-C4: auth is via cookie. We just gate connection on whether the user
   // is logged in at all — the cookie travels with the WebSocket handshake.
   const transport = useTransport(!!user, {
@@ -333,16 +355,21 @@ export function SessionRoom() {
       peerNameRef.current = displayName;
       setToast({ message: `${displayName} joined the session`, type: 'info' });
 
-      await offerToPeer({
-        isMuted,
-        isCameraOn,
-        isScreenSharing: !!localScreenStreamIdRef.current,
-      });
+      await offerToPeer();
+      // Deliberately outside offerToPeer, which no-ops for the answering side:
+      // the peer needs our badges whether or not we are the one who offers.
+      await sendMediaState({ isMuted, isCameraOn });
     },
     onExistingPeer: (displayName) => {
       setPeerHasLeft(false);
       setPeerName(displayName);
       peerNameRef.current = displayName;
+      // We're the side that just walked in, so nobody has heard our state yet
+      // — and the preflight lobby may already have put us in muted /
+      // camera-off (see the initial?.micOff handling in joinExistingSession).
+      // Without this the peer renders default badges for us until our first
+      // in-call toggle.
+      void sendMediaState({ isMuted, isCameraOn });
     },
     // The peer replaced their socket — refresh, tab restore, network flap. The
     // server tells us rather than leaving us to infer it from a PeerLeft that
@@ -355,11 +382,10 @@ export function SessionRoom() {
       setPeerName(displayName);
       peerNameRef.current = displayName;
 
-      await offerToPeer({
-        isMuted,
-        isCameraOn,
-        isScreenSharing: !!localScreenStreamIdRef.current,
-      });
+      await offerToPeer();
+      // Their reload wiped whatever we last told them, so this is a re-announce
+      // rather than an update.
+      await sendMediaState({ isMuted, isCameraOn });
     },
     onReconnecting: () => {
       setToast({ message: 'reconnecting…', type: 'warning' });
@@ -628,6 +654,25 @@ export function SessionRoom() {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
 
+  // Push our media state to the peer whenever the mic or camera toggles.
+  // The toggle handlers (MediaControls, ScreenShareView, keyboard shortcuts)
+  // only flip local state + the sender's enabled flag — nothing on the wire.
+  // Without this the peer's mute / camera-off badges stay frozen at whatever
+  // the last peer-joined or screen-share event happened to push. A few
+  // messages per session, so the extra signalling traffic is noise.
+  const hasSyncedInitialMediaStateRef = useRef(false);
+  useEffect(() => {
+    // Skip the first run: there's no peer at mount, and the peer-appeared
+    // handlers already send whatever state is current at that moment.
+    if (!hasSyncedInitialMediaStateRef.current) {
+      hasSyncedInitialMediaStateRef.current = true;
+      return;
+    }
+    // sendMediaState no-ops when there's no peer yet — whoever joins next
+    // picks up the current state from onPeerJoined / onExistingPeer.
+    void sendMediaState({ isMuted, isCameraOn });
+  }, [isMuted, isCameraOn, sendMediaState]);
+
   const joinExistingSession = useCallback(async (
     targetSessionId: string,
     preflightStream?: MediaStream,
@@ -701,12 +746,15 @@ export function SessionRoom() {
       // We arrived second. Nobody will announce the peer to us — they were
       // already here — so if we are the offerer, this is our cue.
       if (joined.existingPeers.length > 0) {
-        await offerToPeer({
-          // The lobby's toggles were applied moments ago and this render still
-          // sees the pre-toggle values, so read them from what the lobby said.
+        await offerToPeer();
+        // Read from what the lobby said rather than from isMuted/isCameraOn:
+        // the toggles above were applied moments ago and this closure still
+        // sees the pre-toggle render. onExistingPeer also sends, but whether
+        // its handler is the fresh one is a race — this is the authoritative
+        // send, and the [isMuted, isCameraOn] effect below is the backstop.
+        await sendMediaState({
           isMuted: initial?.micOff ?? false,
           isCameraOn: !(initial?.camOff ?? false),
-          isScreenSharing: false,
         });
       }
     } catch (err) {
@@ -721,7 +769,7 @@ export function SessionRoom() {
     } finally {
       setIsJoining(false);
     }
-  }, [user, isJoining, webrtc, transport, offerToPeer, setSessionId, toggleMute, toggleCamera]);
+  }, [user, isJoining, webrtc, transport, offerToPeer, sendMediaState, setSessionId, toggleMute, toggleCamera]);
 
   const handlePreflightReady = useCallback((stream: MediaStream, initial: PreflightInitialState) => {
     if (!urlSessionId) {
