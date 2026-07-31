@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
 import { api } from '../../services/api';
 import { useAuthContext } from '../../context/AuthContext';
-import { TermsModal } from './TermsModal';
 import { PasskeyIcon } from './PasskeyIcon';
 import { UsernameField } from './UsernameField';
 import { isUsernameValid } from '../../utils/username';
@@ -31,13 +30,12 @@ import {
 export function InviteSignup() {
   const navigate = useNavigate();
   const { token } = useParams<{ token: string }>();
-  const { registerWithPasskey, isLoading, error, setError, updateTermsAccepted } = useAuthContext();
+  const { registerWithPasskey, isLoading, error, setError } = useAuthContext();
 
   const [username, setUsername] = useState('');
   const [isValidating, setIsValidating] = useState(true);
   const [inviterTag, setInviterTag] = useState<string | null>(null);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
-  const [showTermsModal, setShowTermsModal] = useState(false);
 
   const validateInviteLink = useCallback(async () => {
     if (!token) {
@@ -65,20 +63,15 @@ export function InviteSignup() {
     if (!token || !isUsernameValid(username)) return;
 
     try {
-      const user = await registerWithPasskey(token, username.trim());
-      // Brand-new accounts have never accepted terms, so this modal is the
-      // normal path here rather than an edge case.
-      if (user.hasAcceptedTerms) navigate('/');
-      else setShowTermsModal(true);
+      await registerWithPasskey(token, username.trim());
+      // Off the one-time invite URL either way: a brand-new account has never
+      // accepted the House Rules, so TermsGate (see App.tsx) will render over
+      // the lobby, and re-rendering this screen behind it would only re-check
+      // an invite that has already been spent.
+      navigate('/');
     } catch {
       // useAuth has already turned this into a readable message.
     }
-  };
-
-  const handleTermsAccepted = () => {
-    updateTermsAccepted();
-    setShowTermsModal(false);
-    navigate('/');
   };
 
   if (isValidating) {
@@ -214,8 +207,6 @@ export function InviteSignup() {
           </div>
         </Sketchbook>
       </div>
-
-      <TermsModal isOpen={showTermsModal} onAccept={handleTermsAccepted} />
     </div>
   );
 }

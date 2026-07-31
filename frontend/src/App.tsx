@@ -35,6 +35,11 @@ const SessionRoom = lazy(() => import('./components/Session/SessionRoom').then((
 const JoinSession = lazy(() => import('./components/Session/JoinSession').then((m) => ({ default: m.JoinSession })));
 const AdminDashboard = lazy(() => import('./components/Admin/AdminDashboard').then((m) => ({ default: m.AdminDashboard })));
 const Settings = lazy(() => import('./components/Settings/Settings').then((m) => ({ default: m.Settings })));
+// Lazy for the same reason as the routes, and load-bearing beyond that: a
+// static import from here would pull the whole `auth` chunk into the main
+// bundle, which is exactly the inlining the manualChunks comment in
+// vite.config.ts warns about.
+const TermsModal = lazy(() => import('./components/Auth/TermsModal').then((m) => ({ default: m.TermsModal })));
 
 /**
  * Suspense fallback used while a route chunk is downloading. The visible delay
@@ -103,6 +108,36 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
     return <Navigate to="/" replace />;
   }
   return <>{children}</>;
+}
+
+/**
+ * The House Rules gate.
+ *
+ * It lives here rather than inside Login and InviteSignup because acceptance
+ * has to hold for every way into the app, not just the two screens that create
+ * accounts. It used to be a `showTermsModal` flag on each of those, and the
+ * Login copy could never render at all: PublicRoute sends an authenticated user
+ * to "/" the moment sign-in populates the user, which unmounts Login before its
+ * own modal gets a frame. So the only people who ever saw the gate were brand
+ * new invitees — /invite/:token is the one route with no PublicRoute around it.
+ *
+ * That made the version bump documented in worker/src/routes/terms.ts ("raising
+ * it re-prompts everyone") untrue: a returning user with a valid session gets
+ * hasAcceptedTerms=false back from /me and then walks straight into the app,
+ * because they never pass through a screen that was watching for it.
+ *
+ * The gate replaces the route tree rather than floating over it. As an overlay
+ * it would leave the Lobby's buttons reachable behind the backdrop by keyboard,
+ * and a prompt you can tab around is not a gate. Nothing navigates on accept —
+ * the routes simply come back, so a user re-prompted at /join/:token keeps the
+ * link they arrived on.
+ */
+function TermsGate({ children }: { children: React.ReactNode }) {
+  const { user, updateTermsAccepted } = useAuthContext();
+  if (!user || user.hasAcceptedTerms) {
+    return <>{children}</>;
+  }
+  return <TermsModal isOpen onAccept={updateTermsAccepted} />;
 }
 
 function AppRoutes() {
@@ -206,7 +241,9 @@ function App() {
               lazy now. The fallback only shows while a chunk is in flight —
               warm cache = invisible, cold = manga-styled loader. */}
           <Suspense fallback={<RouteLoader />}>
-            <AppRoutes />
+            <TermsGate>
+              <AppRoutes />
+            </TermsGate>
           </Suspense>
         </SessionProvider>
       </AuthProvider>

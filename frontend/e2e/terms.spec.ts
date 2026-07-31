@@ -1,18 +1,27 @@
 import { test, expect, type Page } from '@playwright/test';
-import { disableAnimations } from './helpers';
+import {
+  disableAnimations,
+  mockLoggedInUser,
+  mockLoggedOut,
+  mockPasskeySignIn,
+  mockSetupStatus,
+} from './helpers';
 
 /**
  * The House Rules gate.
  *
- * Driven through /invite/:token rather than /login, because that is the only
- * route that actually reaches the modal: a brand-new account has never accepted
- * anything, and InviteSignup is not wrapped in PublicRoute. (Login's copy of
- * the modal is unreachable — PublicRoute bounces to "/" the moment sign-in
- * populates the user, before showTermsModal can render. Separate bug.)
+ * Two things are covered here, and they used to be separate bugs.
  *
- * The accept button unlatches when the reader has reached the bottom of the
- * terms. "Reached the bottom" has two shapes, and only one of them produces a
- * scroll event:
+ * Reachability (the "gate opens at all" block at the bottom): the modal used to
+ * be a flag on Login and InviteSignup, and Login's copy could never render —
+ * PublicRoute sends an authenticated user to "/" the moment sign-in populates
+ * them, unmounting Login first. Only brand-new invitees ever saw it, so raising
+ * TERMS_VERSION did not in fact re-prompt anyone with an existing account. It
+ * is now TermsGate in App.tsx, above the router, covering every entry point.
+ *
+ * Scroll gating (the first block): the accept button unlatches when the reader
+ * has reached the bottom of the terms. "Reached the bottom" has two shapes, and
+ * only one of them produces a scroll event:
  *
  *   - the text is taller than the box, and you scroll down through it;
  *   - the text fits in the box, and you are already looking at all of it.
@@ -22,7 +31,7 @@ import { disableAnimations } from './helpers';
  * enough window the button stayed disabled forever with the whole document
  * visible above it — no way forward, and the hint still asking for a scroll.
  *
- * Both tests use fixture text sized to force one case or the other rather than
+ * Those two use fixture text sized to force one case or the other rather than
  * the real terms at a chosen viewport: the real terms cross the fits/overflows
  * line at around 960px of viewport height, and a test that depended on staying
  * one side of that would rot the moment someone added a paragraph.
@@ -157,5 +166,101 @@ test.describe('House Rules gate', () => {
 
     await expect(acceptButton(page)).toBeEnabled();
     await expect(scrollHint(page)).toBeHidden();
+  });
+});
+
+/**
+ * Reachability: who actually meets the gate.
+ *
+ * Every test here would have passed straight through to the lobby before
+ * TermsGate existed, because the gate was a flag on two account-creation
+ * screens rather than a property of being signed in.
+ */
+test.describe('House Rules gate is reachable from every entry point', () => {
+  const lobbyGreeting = (page: Page) => page.getByText(/ready to hang/i);
+
+  test.beforeEach(async ({ page }) => {
+    await disableAnimations(page);
+    await page.setViewportSize({ width: 1200, height: 1000 });
+    await page.route('**/api/terms/current', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ version: '1.0', lastUpdated: '2026-01-01', content: SHORT_TERMS }),
+      });
+    });
+  });
+
+  /**
+   * The PublicRoute bug. Login's own modal never got a frame — sign-in populates
+   * the user, PublicRoute redirects to "/", Login unmounts. The user landed in
+   * the lobby having accepted nothing.
+   */
+  test('signing in with terms outstanding lands on the gate, not the lobby', async ({ page }) => {
+    await mockLoggedOut(page);
+    await mockSetupStatus(page, true);
+    await mockPasskeySignIn(page, 'success', { hasAcceptedTerms: false });
+
+    await page.goto('/login');
+    await page.getByRole('button', { name: /sign in with a passkey/i }).click();
+
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
+    await expect(lobbyGreeting(page)).toBeHidden();
+  });
+
+  /**
+   * The version bump. worker/src/routes/terms.ts says raising TERMS_VERSION
+   * re-prompts everyone; this is the case that made that false. A returning user
+   * has a valid session and never touches /login, so nothing was watching.
+   * Cache says accepted, /me says otherwise — /me wins.
+   */
+  test('a returning session is re-gated when the server says terms are outstanding', async ({ page }) => {
+    await mockLoggedInUser(page, { hasAcceptedTerms: true });
+    // Registered after mockLoggedInUser so this handler takes precedence.
+    await page.route('**/api/auth/me', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          username: 'alice',
+          discriminator: '0042',
+          tag: 'alice#0042',
+          isRootUser: false,
+          hasAcceptedTerms: false,
+        }),
+      });
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
+    await expect(lobbyGreeting(page)).toBeHidden();
+  });
+
+  /**
+   * The gate replaces the route tree instead of floating over it, so the app's
+   * controls are genuinely gone rather than merely covered — an overlay would
+   * leave them reachable by keyboard behind the backdrop.
+   */
+  test('holds every route until accepted, then hands the app back', async ({ page }) => {
+    await mockLoggedInUser(page, { hasAcceptedTerms: false });
+
+    // Deep-linking past it does not work either.
+    await page.goto('/settings');
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /create a session/i })).toBeHidden();
+
+    await page.route('**/api/terms/accept', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, message: 'ok' }),
+      });
+    });
+    await acceptButton(page).click();
+
+    // Accepting navigates nowhere — the route the user was already on comes back.
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeHidden();
+    await expect(page).toHaveURL(/\/settings$/);
   });
 });

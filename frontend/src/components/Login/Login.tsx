@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import { TermsModal } from '../Auth/TermsModal';
 import { PasskeyIcon } from '../Auth/PasskeyIcon';
 import { UsernameField } from '../Auth/UsernameField';
 import {
@@ -28,10 +27,8 @@ import {
  */
 export function Login() {
   const navigate = useNavigate();
-  const { loginWithPasskey, setupRootWithPasskey, isLoading, error, setError, updateTermsAccepted } =
-    useAuthContext();
+  const { loginWithPasskey, setupRootWithPasskey, isLoading, error, setError } = useAuthContext();
 
-  const [showTermsModal, setShowTermsModal] = useState(false);
   // undefined while unknown — the setup panel must not flash on a normal load.
   const [isSetupComplete, setIsSetupComplete] = useState<boolean | undefined>(undefined);
   const [setupUsername, setSetupUsername] = useState('');
@@ -46,14 +43,13 @@ export function Login() {
       .catch(() => setIsSetupComplete(true));
   }, []);
 
-  const land = (hasAcceptedTerms?: boolean) => {
-    if (hasAcceptedTerms) navigate('/');
-    else setShowTermsModal(true);
-  };
-
+  // Always land on the lobby. Whether the House Rules still need accepting is
+  // TermsGate's business now (see App.tsx) — it renders over whatever route the
+  // user ends up on, so this screen no longer has to know.
   const handleSignIn = async () => {
     try {
-      land((await loginWithPasskey()).hasAcceptedTerms);
+      await loginWithPasskey();
+      navigate('/');
     } catch {
       // useAuth has already turned this into a readable message.
     }
@@ -62,16 +58,11 @@ export function Login() {
   const handleSetup = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      land((await setupRootWithPasskey(setupUsername.trim(), setupSecret)).hasAcceptedTerms);
+      await setupRootWithPasskey(setupUsername.trim(), setupSecret);
+      navigate('/');
     } catch {
       // Same.
     }
-  };
-
-  const handleTermsAccepted = () => {
-    updateTermsAccepted();
-    setShowTermsModal(false);
-    navigate('/');
   };
 
   return (
@@ -265,8 +256,6 @@ export function Login() {
           </div>
         </Sketchbook>
       </div>
-
-      <TermsModal isOpen={showTermsModal} onAccept={handleTermsAccepted} />
     </div>
   );
 }
