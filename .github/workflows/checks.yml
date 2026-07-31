@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   worker:
-    name: worker (174 tests)
+    name: worker
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -48,7 +48,7 @@ jobs:
       - run: npm test
 
   frontend:
-    name: frontend (34 tests)
+    name: frontend
     runs-on: ubuntu-latest
     defaults:
       run:
