@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   FakeMediaStream,
   FakeMediaStreamTrack,
@@ -198,5 +198,79 @@ describe('webrtcService screen share codec', () => {
     expect(senderFor(pc, 'cam-v').maxBitrate).toBeLessThan(
       QUALITY_PRESETS.medium.video.bitrate,
     );
+  });
+});
+
+/**
+ * Which sender is the camera's.
+ *
+ * "The first video sender" is only the camera by accident of ordering, and the
+ * accident stops holding as soon as the camera is toggled off: replaceTrack(null)
+ * leaves the camera's sender in place with no track, so a scan for a *live* video
+ * sender walks straight past it and lands on the screen share. Everything that
+ * hot-swaps the outgoing camera frame then aims at the wrong sender, and the peer
+ * — with no renegotiation and no error to explain it — watches the shared screen
+ * turn into a webcam.
+ */
+describe('webrtcService camera sender identity', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    pc = await freshService();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(globalThis.navigator, 'mediaDevices');
+  });
+
+  /** getUserMedia, answering with a camera the test can recognise by track id. */
+  function stubCameraDevice(track: FakeMediaStreamTrack): void {
+    const stream = new FakeMediaStream([track], 'camera-stream-2');
+    Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: async () => stream as unknown as MediaStream },
+    });
+  }
+
+  /** Camera off, then a share started — the state where the senders disagree. */
+  async function cameraOffWhileSharing() {
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    const camera = senderFor(pc, 'cam-v');
+
+    await webrtcService.toggleVideo(false);
+    // The sender outlives the track: this is what the "first live video sender"
+    // scan trips over.
+    expect(camera.track).toBeNull();
+
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      'medium',
+    );
+    return { camera, screen: senderFor(pc, 'scr-v') };
+  }
+
+  it('re-acquires the camera onto the camera sender, leaving the share alone', async () => {
+    const { camera, screen } = await cameraOffWhileSharing();
+    stubCameraDevice(new FakeMediaStreamTrack('video', 'cam-v2'));
+
+    await webrtcService.toggleVideo(true);
+
+    // The requirement: turning the camera back on is invisible to the viewer's
+    // screen share. The bug replaced it with the webcam feed.
+    expect(screen.track?.id).toBe('scr-v');
+    expect(camera.track?.id).toBe('cam-v2');
+  });
+
+  it('swaps a blurred camera track onto the camera sender, leaving the share alone', async () => {
+    const { camera, screen } = await cameraOffWhileSharing();
+    const blurred = new FakeMediaStreamTrack('video', 'blur-v');
+
+    const applied = await webrtcService.replaceVideoTrack(
+      blurred as unknown as MediaStreamTrack,
+    );
+
+    expect(applied).toBe(true);
+    expect(screen.track?.id).toBe('scr-v');
+    expect(camera.track?.id).toBe('blur-v');
   });
 });

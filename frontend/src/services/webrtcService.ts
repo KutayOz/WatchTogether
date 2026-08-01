@@ -48,6 +48,10 @@ class WebRTCService {
   // was what used to drop quality changes into the disruptive recapture path).
   private screenVideoSender: RTCRtpSender | null = null;
   private screenAudioSender: RTCRtpSender | null = null;
+  // Same treatment for the camera, and for a sharper reason: a camera toggled
+  // off keeps its sender with track === null, so nothing about the *tracks* can
+  // point back at it. See getCameraVideoSender.
+  private cameraVideoSender: RTCRtpSender | null = null;
   private handlers: WebRTCEventHandlers = {};
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private hasRemoteDescription = false;
@@ -171,7 +175,7 @@ class WebRTCService {
    */
   async replaceVideoTrack(newTrack: MediaStreamTrack | null): Promise<boolean> {
     if (!this.peerConnection) return false;
-    const sender = this.peerConnection.getSenders().find((s) => s.track?.kind === 'video');
+    const sender = this.getCameraVideoSender();
     if (!sender) return false;
     try {
       await sender.replaceTrack(newTrack);
@@ -216,7 +220,8 @@ class WebRTCService {
     stream.getTracks().forEach(track => {
       if (existingTrackIds.has(track.id)) return;
       try {
-        this.peerConnection!.addTrack(track, stream);
+        const sender = this.peerConnection!.addTrack(track, stream);
+        if (track.kind === 'video') this.cameraVideoSender = sender;
       } catch (err) {
         logger.warn('[WebRTC] addTrack failed for', track.kind, err);
       }
@@ -297,20 +302,30 @@ class WebRTCService {
   /**
    * The sender carrying the camera.
    *
-   * Identified by track id against localStream rather than by "first video
-   * sender": once a screen share is up there are two video senders, and their
-   * order is an accident of when addTrack ran. Background blur swaps the camera
-   * track through localStream too, so localStream stays the authority on which
-   * track is the camera.
+   * Held by reference from the addTrack that created it, because neither of the
+   * cheaper answers survives a screen share. "First video sender" is ordering
+   * luck — once the share is up there are two, and which comes first is an
+   * accident of when addTrack ran. "First video sender with a live track" is
+   * worse: toggleVideo(false) leaves the camera's sender in place with
+   * track === null, so that scan skips the camera and returns the *screen*, and
+   * the next replaceTrack silently paints the webcam over the shared screen.
+   *
+   * The track-id lookup against localStream stays as the fallback for a sender
+   * we never recorded — it is still correct whenever the camera has a track,
+   * including after background blur swaps a canvas track in through localStream.
    */
   private getCameraVideoSender(): RTCRtpSender | null {
-    if (!this.peerConnection || !this.localStream) return null;
+    if (!this.peerConnection) return null;
+    const senders = this.peerConnection.getSenders();
+    if (this.cameraVideoSender && senders.includes(this.cameraVideoSender)) {
+      return this.cameraVideoSender;
+    }
+
+    if (!this.localStream) return null;
     const cameraTrackIds = new Set(this.localStream.getVideoTracks().map((t) => t.id));
-    return (
-      this.peerConnection
-        .getSenders()
-        .find((s) => s.track?.kind === 'video' && cameraTrackIds.has(s.track.id)) ?? null
-    );
+    this.cameraVideoSender =
+      senders.find((s) => s.track?.kind === 'video' && cameraTrackIds.has(s.track.id)) ?? null;
+    return this.cameraVideoSender;
   }
 
   /**
@@ -798,9 +813,10 @@ class WebRTCService {
   async toggleVideo(enabled: boolean): Promise<void> {
     if (!this.peerConnection || !this.localStream) return;
 
-    const videoSender = this.peerConnection
-      .getSenders()
-      .find((s) => s.track?.kind === 'video');
+    // Not "the first video sender": with a share up that is a coin flip, and
+    // once this method has run once with enabled=false the camera's own sender
+    // has no track to be found by. See getCameraVideoSender.
+    const videoSender = this.getCameraVideoSender();
 
     if (!enabled) {
       const videoTracks = this.localStream.getVideoTracks();
@@ -846,12 +862,12 @@ class WebRTCService {
         await videoSender.replaceTrack(newVideoTrack);
       } catch (err) {
         logger.warn('[WebRTC] replaceTrack(new) failed, adding fresh:', err);
-        this.peerConnection.addTrack(newVideoTrack, this.localStream);
+        this.cameraVideoSender = this.peerConnection.addTrack(newVideoTrack, this.localStream);
       }
     } else {
       // No previous video sender (shouldn't happen post-PreflightLobby, but
       // belt-and-braces for edge cases like permission-denied initial join).
-      this.peerConnection.addTrack(newVideoTrack, this.localStream);
+      this.cameraVideoSender = this.peerConnection.addTrack(newVideoTrack, this.localStream);
     }
     this.localStream.addTrack(newVideoTrack);
   }
@@ -885,6 +901,7 @@ class WebRTCService {
     this.screenStreamId = null;
     this.screenVideoSender = null;
     this.screenAudioSender = null;
+    this.cameraVideoSender = null;
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];
