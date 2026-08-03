@@ -18,7 +18,17 @@ import { QUALITY_PRESETS as QualityPresets } from '../types';
  * thing both people are actually watching, so the thumbnail yields to it.
  */
 const CAMERA_MAX_BITRATE_IDLE = 800_000;
-const CAMERA_MAX_BITRATE_WHILE_SHARING = 250_000;
+const CAMERA_MAX_BITRATE_WHILE_SHARING = 150_000;
+
+/**
+ * How far the camera is scaled down while a screen share is running.
+ *
+ * 2 takes 640x480 to 320x240, which is more than the corner thumbnail is ever
+ * displayed at. Without this the encoder keeps trying to hold 640x480 inside a
+ * 150 kbps ceiling and spends the budget on macroblock noise; told to shrink,
+ * it spends the same bits on a clean small picture.
+ */
+const CAMERA_SCALE_DOWN_WHILE_SHARING = 2;
 
 export type WebRTCEventHandlers = {
   onTrack?: (event: RTCTrackEvent) => void;
@@ -38,6 +48,10 @@ class WebRTCService {
   // was what used to drop quality changes into the disruptive recapture path).
   private screenVideoSender: RTCRtpSender | null = null;
   private screenAudioSender: RTCRtpSender | null = null;
+  // Same treatment for the camera, and for a sharper reason: a camera toggled
+  // off keeps its sender with track === null, so nothing about the *tracks* can
+  // point back at it. See getCameraVideoSender.
+  private cameraVideoSender: RTCRtpSender | null = null;
   private handlers: WebRTCEventHandlers = {};
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private hasRemoteDescription = false;
@@ -161,7 +175,7 @@ class WebRTCService {
    */
   async replaceVideoTrack(newTrack: MediaStreamTrack | null): Promise<boolean> {
     if (!this.peerConnection) return false;
-    const sender = this.peerConnection.getSenders().find((s) => s.track?.kind === 'video');
+    const sender = this.getCameraVideoSender();
     if (!sender) return false;
     try {
       await sender.replaceTrack(newTrack);
@@ -206,7 +220,8 @@ class WebRTCService {
     stream.getTracks().forEach(track => {
       if (existingTrackIds.has(track.id)) return;
       try {
-        this.peerConnection!.addTrack(track, stream);
+        const sender = this.peerConnection!.addTrack(track, stream);
+        if (track.kind === 'video') this.cameraVideoSender = sender;
       } catch (err) {
         logger.warn('[WebRTC] addTrack failed for', track.kind, err);
       }
@@ -287,20 +302,30 @@ class WebRTCService {
   /**
    * The sender carrying the camera.
    *
-   * Identified by track id against localStream rather than by "first video
-   * sender": once a screen share is up there are two video senders, and their
-   * order is an accident of when addTrack ran. Background blur swaps the camera
-   * track through localStream too, so localStream stays the authority on which
-   * track is the camera.
+   * Held by reference from the addTrack that created it, because neither of the
+   * cheaper answers survives a screen share. "First video sender" is ordering
+   * luck — once the share is up there are two, and which comes first is an
+   * accident of when addTrack ran. "First video sender with a live track" is
+   * worse: toggleVideo(false) leaves the camera's sender in place with
+   * track === null, so that scan skips the camera and returns the *screen*, and
+   * the next replaceTrack silently paints the webcam over the shared screen.
+   *
+   * The track-id lookup against localStream stays as the fallback for a sender
+   * we never recorded — it is still correct whenever the camera has a track,
+   * including after background blur swaps a canvas track in through localStream.
    */
   private getCameraVideoSender(): RTCRtpSender | null {
-    if (!this.peerConnection || !this.localStream) return null;
+    if (!this.peerConnection) return null;
+    const senders = this.peerConnection.getSenders();
+    if (this.cameraVideoSender && senders.includes(this.cameraVideoSender)) {
+      return this.cameraVideoSender;
+    }
+
+    if (!this.localStream) return null;
     const cameraTrackIds = new Set(this.localStream.getVideoTracks().map((t) => t.id));
-    return (
-      this.peerConnection
-        .getSenders()
-        .find((s) => s.track?.kind === 'video' && cameraTrackIds.has(s.track.id)) ?? null
-    );
+    this.cameraVideoSender =
+      senders.find((s) => s.track?.kind === 'video' && cameraTrackIds.has(s.track.id)) ?? null;
+    return this.cameraVideoSender;
   }
 
   /**
@@ -364,9 +389,64 @@ class WebRTCService {
     };
     enc.maxBitrate = isSharing ? CAMERA_MAX_BITRATE_WHILE_SHARING : CAMERA_MAX_BITRATE_IDLE;
     enc.networkPriority = isSharing ? 'low' : 'medium';
+    if (isSharing) {
+      enc.scaleResolutionDownBy = CAMERA_SCALE_DOWN_WHILE_SHARING;
+    } else {
+      delete enc.scaleResolutionDownBy;
+    }
 
     if (await this.setParametersSafely(sender, params, 'camera')) {
       logger.debug(`[WebRTC] Camera capped at ${enc.maxBitrate} bps (sharing: ${isSharing})`);
+    }
+  }
+
+  /**
+   * Ask for VP9 on the screen share.
+   *
+   * The measured session encoded with `libvpx` — VP8 — and the picture was the
+   * complaint. VP9 carries roughly the same quality in 30-50% fewer bits, and
+   * on a link that is bandwidth-limited every hour of the day, fewer bits per
+   * frame converts directly into resolution: the encoder stops having to choose
+   * 318x178 to stay inside its ceiling. This is the only lever here that
+   * improves the picture without taking bandwidth from something else.
+   *
+   * Promote-only, rather than sorting the whole list: RTX, RED and FEC entries
+   * keep their original relative order, and a browser without VP9 is left
+   * exactly as it was. setCodecPreferences also only reorders *our* offer — the
+   * answerer still picks from the intersection — so a peer that cannot do VP9
+   * negotiates VP8 as before rather than failing.
+   *
+   * The trade is CPU: VP9 encode costs more than VP8. The measured session had
+   * `qualityLimitationDurations.cpu` at 0, so there was headroom, but that was
+   * headroom at 318x178. If this flips the limitation from 'bandwidth' to
+   * 'cpu', this is the change to revert.
+   */
+  private preferVp9(sender: RTCRtpSender): void {
+    if (!this.peerConnection) return;
+
+    const transceiver = this.peerConnection
+      .getTransceivers()
+      .find((t) => t.sender === sender);
+    if (!transceiver?.setCodecPreferences) return;
+
+    // typeof, not a bare reference: this runs inside addScreenShareTracks'
+    // per-track try block, and a ReferenceError here would be swallowed by it
+    // *after* skipping the setParameters call that applies the bitrate ceiling.
+    if (typeof RTCRtpSender === 'undefined') return;
+    const codecs = RTCRtpSender.getCapabilities?.('video')?.codecs;
+    if (!codecs?.length) return;
+
+    const isVp9 = (mime: string) => /\/vp9$/i.test(mime);
+    const vp9 = codecs.filter((c) => isVp9(c.mimeType));
+    if (vp9.length === 0) return; // nothing to promote — leave the order alone
+
+    try {
+      transceiver.setCodecPreferences([...vp9, ...codecs.filter((c) => !isVp9(c.mimeType))]);
+      logger.debug('[WebRTC] Screen share will offer VP9 first');
+    } catch (err) {
+      // Not fatal in any way: we simply negotiate whatever the browser would
+      // have negotiated on its own.
+      logger.debug('[WebRTC] setCodecPreferences(VP9) rejected:', err);
     }
   }
 
@@ -441,6 +521,9 @@ class WebRTCService {
                 // Motion-optimized: maintain-framerate + maxFramerate, and
                 // crucially NO scaleResolutionDownBy pin (see applyVideoEncoding).
                 this.applyVideoEncoding(params, preset);
+                // Before the renegotiation this addTrack triggers, so the codec
+                // order lands in the offer rather than needing a second one.
+                this.preferVp9(sender);
               } else if (track.kind === 'audio') {
                 // Use audio bitrate from quality preset
                 if (preset.audio.bitrate > 0) {
@@ -730,9 +813,10 @@ class WebRTCService {
   async toggleVideo(enabled: boolean): Promise<void> {
     if (!this.peerConnection || !this.localStream) return;
 
-    const videoSender = this.peerConnection
-      .getSenders()
-      .find((s) => s.track?.kind === 'video');
+    // Not "the first video sender": with a share up that is a coin flip, and
+    // once this method has run once with enabled=false the camera's own sender
+    // has no track to be found by. See getCameraVideoSender.
+    const videoSender = this.getCameraVideoSender();
 
     if (!enabled) {
       const videoTracks = this.localStream.getVideoTracks();
@@ -778,12 +862,12 @@ class WebRTCService {
         await videoSender.replaceTrack(newVideoTrack);
       } catch (err) {
         logger.warn('[WebRTC] replaceTrack(new) failed, adding fresh:', err);
-        this.peerConnection.addTrack(newVideoTrack, this.localStream);
+        this.cameraVideoSender = this.peerConnection.addTrack(newVideoTrack, this.localStream);
       }
     } else {
       // No previous video sender (shouldn't happen post-PreflightLobby, but
       // belt-and-braces for edge cases like permission-denied initial join).
-      this.peerConnection.addTrack(newVideoTrack, this.localStream);
+      this.cameraVideoSender = this.peerConnection.addTrack(newVideoTrack, this.localStream);
     }
     this.localStream.addTrack(newVideoTrack);
   }
@@ -817,6 +901,7 @@ class WebRTCService {
     this.screenStreamId = null;
     this.screenVideoSender = null;
     this.screenAudioSender = null;
+    this.cameraVideoSender = null;
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];
