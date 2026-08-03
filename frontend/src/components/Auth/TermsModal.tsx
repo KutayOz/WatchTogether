@@ -1,13 +1,19 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { api } from '../../services/api';
-import { SectionTitle, StickerButton, TagSticker } from '../manga';
+import { BackButton, SectionTitle, StickerButton, TagSticker } from '../manga';
 
 interface TermsModalProps {
   isOpen: boolean;
   onAccept: () => void;
+  /**
+   * Way out for a reader who will not agree. Optional only so the modal stays
+   * usable without one; the gate in App.tsx always passes a sign-out, because
+   * the modal is the entire screen there and refusing has to lead somewhere.
+   */
+  onDecline?: () => void;
 }
 
-export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
+export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
   const [terms, setTerms] = useState<{ version: string; content: string } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isAccepting, setIsAccepting] = useState(false);
@@ -226,7 +232,15 @@ export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
               {error}
             </p>
           )}
-          <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              gap: 18,
+              flexWrap: 'wrap',
+            }}
+          >
             <StickerButton
               color="pink"
               size="md"
@@ -236,6 +250,9 @@ export function TermsModal({ isOpen, onAccept }: TermsModalProps) {
             >
               {isAccepting ? 'STAMPING…' : 'I ACCEPT'}
             </StickerButton>
+            {onDecline && (
+              <BackButton onClick={onDecline}>no thanks — sign out</BackButton>
+            )}
           </div>
         </div>
       </div>

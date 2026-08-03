@@ -121,8 +121,8 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
  * own modal gets a frame. So the only people who ever saw the gate were brand
  * new invitees — /invite/:token is the one route with no PublicRoute around it.
  *
- * That made the version bump documented in worker/src/routes/terms.ts ("raising
- * it re-prompts everyone") untrue: a returning user with a valid session gets
+ * That made the version bump documented in worker/src/lib/terms.ts ("raising it
+ * re-prompts everyone") untrue: a returning user with a valid session gets
  * hasAcceptedTerms=false back from /me and then walks straight into the app,
  * because they never pass through a screen that was watching for it.
  *
@@ -133,11 +133,14 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
  * link they arrived on.
  */
 function TermsGate({ children }: { children: React.ReactNode }) {
-  const { user, updateTermsAccepted } = useAuthContext();
+  const { user, updateTermsAccepted, logout } = useAuthContext();
   if (!user || user.hasAcceptedTerms) {
     return <>{children}</>;
   }
-  return <TermsModal isOpen onAccept={updateTermsAccepted} />;
+  // Declining is a sign-out. Without it the modal is a trap for anyone who does
+  // not want the new terms — it is the whole screen, and nothing else on it
+  // leads anywhere.
+  return <TermsModal isOpen onAccept={updateTermsAccepted} onDecline={logout} />;
 }
 
 function AppRoutes() {

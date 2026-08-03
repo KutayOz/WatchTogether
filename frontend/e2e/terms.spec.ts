@@ -209,10 +209,15 @@ test.describe('House Rules gate is reachable from every entry point', () => {
   });
 
   /**
-   * The version bump. worker/src/routes/terms.ts says raising TERMS_VERSION
+   * The version bump. worker/src/lib/terms.ts says raising TERMS_VERSION
    * re-prompts everyone; this is the case that made that false. A returning user
    * has a valid session and never touches /login, so nothing was watching.
    * Cache says accepted, /me says otherwise — /me wins.
+   *
+   * The server half of that promise is hasAcceptedCurrentTerms, which compares
+   * the accepted version against the current one. This test mocks /me directly,
+   * so it pins the client's reaction rather than what makes the server say it —
+   * that side is covered in worker/src/lib/terms.test.ts.
    */
   test('a returning session is re-gated when the server says terms are outstanding', async ({ page }) => {
     await mockLoggedInUser(page, { hasAcceptedTerms: true });
@@ -262,5 +267,29 @@ test.describe('House Rules gate is reachable from every entry point', () => {
     // Accepting navigates nowhere — the route the user was already on comes back.
     await expect(page.getByRole('heading', { name: /house rules/i })).toBeHidden();
     await expect(page).toHaveURL(/\/settings$/);
+  });
+
+  /**
+   * Refusing has to lead somewhere. The gate replaces the route tree, so the
+   * modal is the entire screen — without this the only way out for someone who
+   * will not agree to a new version is to clear site data.
+   */
+  test('declining signs out and returns to the sign-in screen', async ({ page }) => {
+    await mockLoggedInUser(page, { hasAcceptedTerms: false });
+    await page.route('**/api/auth/logout', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'Signed out.' }),
+      });
+    });
+
+    await page.goto('/');
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
+
+    await page.getByRole('button', { name: /no thanks — sign out/i }).click();
+
+    await expect(page).toHaveURL(/\/login$/);
+    await expect(page.getByRole('heading', { name: /house rules/i })).toBeHidden();
   });
 });
