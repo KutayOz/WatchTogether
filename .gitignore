@@ -22,3 +22,8 @@ logs/
 
 # Node modules (frontend and worker each have their own gitignore too)
 node_modules/
+
+# Agent scratch space. Holds full worktree copies of the repo, including old
+# revisions of files that have since been scrubbed — committing it would put
+# the removed contents straight back into history.
+.claude/
