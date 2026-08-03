@@ -10,8 +10,15 @@ MODE: ship
 Plan: none — the migration plan was never copied into the repo (see Needs me)
 
 ## Now
-Mine: PR #14 is MERGEABLE but BEHIND main. Update the branch, then merge.
-Check: gh pr view 14 --json mergeStateStatus -> {"mergeStateStatus":"CLEAN"}
+Mine: #14 made the version comparison real, but nothing has run it end to end — terms.test.ts
+hand-builds the user object, the e2e mocks /me's answer, and neither one touches the seam
+between them. Pin /me to a real D1 row with a stale terms_version, before the first revision
+leans on it.
+Then: revise the terms text and raise TERMS_VERSION to 1.1 — the first real use of the control #14 built.
+Then: deploy and confirm the live account is re-prompted on its next request, not only at /login.
+Then: take the decline button once on that live prompt; leaving the gate exists only as an e2e mock.
+Check: cd worker && npm test -- src/routes/auth.test.ts -> "Tests  N passed", incl.
+"/me reads the accepted version, not just the timestamp" (today: "No test files found")
 
 ## Needs me
 - Copy the migration plan from ~/.claude/plans/ into docs/PLAN.md and name it on the Plan: line
@@ -32,6 +39,9 @@ Check: gh pr view 14 --json mergeStateStatus -> {"mergeStateStatus":"CLEAN"}
 - SQLite-backed Durable Objects (new_sqlite_classes) — KV-backed are paid-only. (from wrangler.toml)
 - The screen share outranks the camera for uplink; the camera is capped. (from PR #15, #16)
 - Terms gate lives at the app level, not on the two account-creation screens. (from PR #13)
+- The gate has a way out: declining signs you out. Rejected making a version bump non-negotiable —
+  the gate replaces the route tree, so with "I ACCEPT" as its only control, a user who will not
+  agree has no exit but clearing site data. (from PR #14)
 
 ## Rejected
 - Fly.io — the apps were deleted and both domains stopped resolving; this migration exists
