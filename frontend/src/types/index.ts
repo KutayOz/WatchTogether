@@ -98,8 +98,107 @@ export interface MediaState {
   isScreenSharing: boolean;
 }
 
-// Screen share quality presets
+/** ICE candidate types, in the order RFC 8445 prefers them. */
+export type IceCandidateKind = 'host' | 'srflx' | 'prflx' | 'relay';
+
+/**
+ * Which path the media is actually taking.
+ *
+ * Nothing in the app confirmed this before, and the two failure modes it
+ * distinguishes look identical from the outside: `worker/src/lib/ice.ts`
+ * degrades to STUN-only on any TURN mint failure rather than erroring, and a
+ * peer behind symmetric NAT then silently falls back to a relay that was never
+ * minted (i.e. fails) — or succeeds over a relay and pays the extra hop's RTT.
+ * "Is this actually peer-to-peer" is the first question to answer before
+ * judging any encoder tuning, so it has to be observable.
+ */
+export interface TransportPath {
+  local: IceCandidateKind;
+  remote: IceCandidateKind;
+  /** Transport of the candidate pair itself — 'udp' or 'tcp'. */
+  protocol: string;
+  /** How we reach the TURN server, when `local` is a relay: udp | tcp | tls. */
+  relayProtocol?: string;
+  isRelayed: boolean;
+  rttMs: number | null;
+}
+
+/**
+ * What the screen-share encoder is actually doing, as opposed to what it was
+ * asked to do. `targetBitrate` sitting far below the configured ceiling with
+ * `qualityLimitationReason === 'bandwidth'` is the signal that the link cannot
+ * carry the current operating point; the same gap with reason `'cpu'` means the
+ * opposite and must never be answered by lowering the bitrate.
+ */
+export interface OutboundScreenStats {
+  frameWidth: number | null;
+  frameHeight: number | null;
+  framesPerSecond: number | null;
+  /** What the rate controller is aiming for right now, bps. */
+  targetBitrate: number | null;
+  qualityLimitationReason: 'none' | 'cpu' | 'bandwidth' | 'other' | null;
+  /** e.g. 'libvpx-vp9', 'ExternalEncoder' — how Step 6 detects hardware AV1. */
+  encoderImplementation: string | null;
+  /** Seconds of encode time across `framesEncoded`; the CPU-cliff detector. */
+  totalEncodeTime: number | null;
+  framesEncoded: number | null;
+}
+
+/**
+ * What kind of thing is on the screen, which is really a question about frame
+ * rate — and frame rate is the cheapest quality lever in the whole system.
+ *
+ * Film and series are 24 fps at source. Encoding them at 30 spends the budget
+ * across 25% more frames than carry any information, so every frame gets 25%
+ * fewer bits to describe itself. Dropping to 24 on 24 fps content is free
+ * sharpness: nothing is lost, because there was nothing there.
+ *
+ * Games are the opposite case and get 60 where the budget allows.
+ */
+export type ContentMode = 'film' | 'motion' | 'games';
+
+export const CONTENT_MODES: Record<ContentMode, { label: string; description: string; fps: number }> = {
+  film: { label: 'Film', description: 'movies & series — 24 fps, sharpest', fps: 24 },
+  motion: { label: 'Motion', description: 'general video — 30 fps', fps: 30 },
+  games: { label: 'Games', description: 'fast action — 60 fps, smoothest', fps: 60 },
+};
+
+/**
+ * Screen share quality — now a CEILING the user picks, not a fixed operating
+ * point.
+ *
+ * The numbers that actually reach the encoder come from
+ * `chooseOperatingPoint()`, which sits the resolution on the rate-distortion
+ * convex hull for whatever bandwidth is measured. These presets bound that
+ * choice from above: `low` means "never spend more than 1.5 Mbps and never
+ * exceed 720p", `auto` means "up to 1080p, let the link decide".
+ */
 export type ScreenShareQuality = 'auto' | 'low' | 'medium' | 'high' | 'ultra' | 'extreme';
+
+/** Ladder order, cheapest first. The single source of this ordering. */
+export const QUALITY_LADDER: readonly ScreenShareQuality[] = [
+  'low',
+  'medium',
+  'high',
+  'ultra',
+  'extreme',
+];
+
+/**
+ * Guard for values read back from localStorage.
+ *
+ * `saved as ScreenShareQuality` was an unchecked cast, so any stale or
+ * unrecognised string flowed into QUALITY_PRESETS[quality], yielded undefined,
+ * and threw on `preset.video.bitrate` inside captureScreen.
+ */
+export function isScreenShareQuality(v: unknown): v is ScreenShareQuality {
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(QUALITY_PRESETS, v);
+}
+
+/** Same guard for the content mode. */
+export function isContentMode(v: unknown): v is ContentMode {
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(CONTENT_MODES, v);
+}
 
 export interface QualityPreset {
   label: string;
@@ -116,53 +215,64 @@ export interface QualityPreset {
 }
 
 /**
- * Screen-share quality ladder.
+ * Screen-share quality ceilings.
  *
- * Smoothness note: the encoder now runs with degradationPreference=
- * 'maintain-framerate' (see webrtcService.applyVideoEncoding). That means
- * when a preset's `bitrate` is too low to sustain its width×height at
- * `frameRate`, the stream stays SMOOTH and instead drops resolution
- * (gets softer) — it no longer goes choppy. So for motion content
- * (film/dizi/oyun) these bitrates control sharpness-under-load, not
- * smoothness. Frame rate: 30 is plenty for film/dizi (24–30 fps source);
- * 60 mainly helps fast games. Tune per your TURN bandwidth budget.
+ * These are upper bounds, not targets. `chooseOperatingPoint()` picks the
+ * actual width/height/fps/bitrate from the measured budget and clamps the
+ * result to whichever preset the user selected; a preset never forces the
+ * encoder UP to its numbers, only stops it going past them.
+ *
+ * `frameRate` is 60 everywhere because the content mode (film/motion/games)
+ * owns frame rate now — the preset only prevents a mode asking for more than
+ * the tier allows.
+ *
+ * `bitrate: 0` on `auto` means "the budget decides", NOT "uncapped". Uncapped
+ * was the old behaviour and it was the single worst state in the system: an
+ * unbounded encoder on a slow link overshoots, builds a standing queue, and
+ * goes soft AND laggy at once. AUTO_MAX_BITRATE in operatingPoint.ts is the
+ * hard safety ceiling that replaces it.
+ *
+ * The encoder runs `degradationPreference='maintain-framerate'` with
+ * scaleResolutionDownBy deliberately unpinned (see
+ * webrtcService.applyVideoEncoding), so under pressure the stream stays SMOOTH
+ * and sheds resolution rather than going choppy.
  */
 export const QUALITY_PRESETS: Record<ScreenShareQuality, QualityPreset> = {
   auto: {
     label: 'Auto',
-    description: 'Adapts to network',
-    video: { width: 1920, height: 1080, frameRate: 30, bitrate: 0 }, // 0 = no limit, let WebRTC adapt
-    audio: { bitrate: 128000 },
+    description: 'up to 1080p • follows your link',
+    video: { width: 1920, height: 1080, frameRate: 60, bitrate: 0 }, // 0 = budget decides
+    audio: { bitrate: 96000 },
   },
   low: {
     label: 'Low',
-    description: '720p30 • 1.5 Mbps',
-    video: { width: 1280, height: 720, frameRate: 30, bitrate: 1500000 },
-    audio: { bitrate: 96000 },
+    description: 'up to 720p • 1.5 Mbps cap',
+    video: { width: 1280, height: 720, frameRate: 60, bitrate: 1500000 },
+    audio: { bitrate: 64000 },
   },
   medium: {
     label: 'Medium',
-    description: '1080p30 • 4 Mbps',
-    video: { width: 1920, height: 1080, frameRate: 30, bitrate: 4000000 },
-    audio: { bitrate: 128000 },
+    description: 'up to 1080p • 4 Mbps cap',
+    video: { width: 1920, height: 1080, frameRate: 60, bitrate: 4000000 },
+    audio: { bitrate: 96000 },
   },
   high: {
     label: 'High',
-    description: '1080p30 • 8 Mbps',
-    video: { width: 1920, height: 1080, frameRate: 30, bitrate: 8000000 },
-    audio: { bitrate: 256000 },
+    description: 'up to 1080p • 8 Mbps cap',
+    video: { width: 1920, height: 1080, frameRate: 60, bitrate: 8000000 },
+    audio: { bitrate: 128000 },
   },
   ultra: {
     label: 'Ultra',
-    description: '4K60 • 15 Mbps',
+    description: 'up to 4K • 15 Mbps cap',
     video: { width: 3840, height: 2160, frameRate: 60, bitrate: 15000000 },
-    audio: { bitrate: 320000 },
+    audio: { bitrate: 256000 },
   },
   extreme: {
     label: 'Extreme',
-    description: '4K60 • 28 Mbps',
+    description: 'up to 4K • 28 Mbps cap',
     video: { width: 3840, height: 2160, frameRate: 60, bitrate: 28000000 },
-    audio: { bitrate: 510000 }, // Near max Opus bitrate
+    audio: { bitrate: 320000 },
   },
 };
 
@@ -248,6 +358,10 @@ export interface QualityFeedback {
  */
 export interface UplinkEstimate {
   uplinkMbps: number;
+  /** Unrounded, for arithmetic. uplinkMbps is rounded for display only. */
+  uplinkBps: number;
+  /** Spendable budget: the estimate after headroom. Feeds chooseOperatingPoint. */
+  budgetBps: number;
   recommendedQuality: ScreenShareQuality;
   supportedQualities: Record<ScreenShareQuality, boolean>;
 }

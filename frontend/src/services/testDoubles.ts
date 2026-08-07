@@ -138,8 +138,37 @@ export class FakeMediaStreamTrack {
     this.readyState = 'ended';
   }
 
-  async applyConstraints(): Promise<void> {}
-  addEventListener(): void {}
+  /**
+   * Every applyConstraints() call, newest last.
+   *
+   * Recorded rather than swallowed: a capture track that had been clamped to
+   * 720p once stayed 720p for the rest of the session because the re-apply path
+   * only ever sent frameRate, and with a no-op double there was nothing a test
+   * could assert to notice.
+   */
+  readonly constraints: MediaTrackConstraints[] = [];
+
+  async applyConstraints(constraints?: MediaTrackConstraints): Promise<void> {
+    this.constraints.push(structuredClone(constraints ?? {}));
+  }
+
+  /** The most recent constraint set, or null if never constrained. */
+  get lastConstraints(): MediaTrackConstraints | null {
+    return this.constraints[this.constraints.length - 1] ?? null;
+  }
+
+  private listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+  addEventListener(type: string, listener: (event?: unknown) => void): void {
+    const existing = this.listeners.get(type) ?? [];
+    existing.push(listener);
+    this.listeners.set(type, existing);
+  }
+
+  /** Fire a track event, e.g. 'configurationchange' after a surface swap. */
+  emit(type: string, event?: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
 }
 
 export class FakeMediaStream {
@@ -210,6 +239,24 @@ export class FakeRtpSender {
   get scaleResolutionDownBy(): number | undefined {
     return this.params.encodings?.[0]?.scaleResolutionDownBy;
   }
+
+  get maxFramerate(): number | undefined {
+    return this.params.encodings?.[0]?.maxFramerate;
+  }
+
+  /** Stats this sender will report. Set by the test; empty by default. */
+  stats: RTCStatsReport = new Map() as unknown as RTCStatsReport;
+
+  async getStats(): Promise<RTCStatsReport> {
+    return this.stats;
+  }
+}
+
+/** Build a stats report from plain objects, keyed by their `id`. */
+export function fakeStatsReport(
+  entries: Array<Record<string, unknown> & { id: string; type: string }>,
+): RTCStatsReport {
+  return new Map(entries.map((e) => [e.id, e])) as unknown as RTCStatsReport;
 }
 
 /** Records the codec order the code under test asked to offer. */
@@ -274,5 +321,40 @@ export class FakePeerConnection {
     return [...this.senders];
   }
 
+  /** Connection-wide stats. Set by the test; empty by default. */
+  stats: RTCStatsReport = new Map() as unknown as RTCStatsReport;
+
+  async getStats(): Promise<RTCStatsReport> {
+    return this.stats;
+  }
+
   close(): void {}
+}
+
+/**
+ * A getDisplayMedia stub, so what captureScreen actually ASKS FOR is testable.
+ *
+ * It had no coverage at all, which is how it shipped requesting
+ * `max: 3840/2160/60` for every quality preset — on a 4K desktop that means the
+ * track arrives at 3840x2160 and the quality scaler steps down through 1080p
+ * rather than defending it.
+ *
+ * Returns the stream and records every constraint set it was called with.
+ */
+export function stubDisplayMedia(stream: FakeMediaStream): {
+  calls: DisplayMediaStreamOptions[];
+} {
+  const calls: DisplayMediaStreamOptions[] = [];
+  const existing = globalThis.navigator.mediaDevices as MediaDevices | undefined;
+  Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+    configurable: true,
+    value: {
+      ...existing,
+      getDisplayMedia: async (constraints?: DisplayMediaStreamOptions) => {
+        calls.push(structuredClone(constraints ?? {}));
+        return stream as unknown as MediaStream;
+      },
+    },
+  });
+  return { calls };
 }

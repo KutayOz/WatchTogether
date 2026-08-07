@@ -1,5 +1,15 @@
 import { useState, type ReactNode } from 'react';
-import { type ScreenShareQuality, type UplinkEstimate, QUALITY_PRESETS } from '../../types';
+import {
+  type ScreenShareQuality,
+  type UplinkEstimate,
+  type ContentMode,
+  QUALITY_PRESETS,
+  CONTENT_MODES,
+} from '../../types';
+import {
+  formatTransportPath,
+  type TransportDiagnostics,
+} from '../../hooks/useTransportDiagnostics';
 
 interface MediaControlsProps {
   isMuted: boolean;
@@ -26,6 +36,10 @@ interface MediaControlsProps {
   onScreenAudioVolumeChange?: (volume: number) => void;
   /** Null means the browser gives no bitrate estimate — show no advice at all. */
   uplink?: UplinkEstimate | null;
+  /** Live transport path + encoder readout. Null entries render nothing. */
+  diagnostics?: TransportDiagnostics | null;
+  contentMode?: ContentMode;
+  onContentModeChange?: (mode: ContentMode) => void;
 }
 
 export function MediaControls({
@@ -52,6 +66,9 @@ export function MediaControls({
   screenAudioVolume = 100,
   onScreenAudioVolumeChange,
   uplink,
+  diagnostics,
+  contentMode = 'film',
+  onContentModeChange,
 }: MediaControlsProps) {
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showVoiceMenu, setShowVoiceMenu] = useState(false);
@@ -159,7 +176,7 @@ export function MediaControls({
 
             {showQualityMenu && onQualityChange && (
               <PopMenu onClose={() => setShowQualityMenu(false)} title={isScreenSharing ? 'CHANGE QUALITY' : 'STREAM QUALITY'}>
-                {uplink && (
+                {(uplink || diagnostics?.path || diagnostics?.outbound) && (
                   <div
                     className="hand"
                     style={{
@@ -168,14 +185,88 @@ export function MediaControls({
                       marginBottom: 8,
                       paddingBottom: 8,
                       borderBottom: '2px dashed rgba(26,20,23,0.3)',
+                      lineHeight: 1.5,
                     }}
                   >
-                    ↑ uplink: {uplink.uplinkMbps} Mbps
+                    {uplink && <div>↑ uplink: {uplink.uplinkMbps} Mbps</div>}
+                    {diagnostics?.path && (
+                      <div
+                        style={{
+                          color: diagnostics.path.isRelayed
+                            ? 'var(--orange-deep)'
+                            : 'rgba(26,20,23,0.6)',
+                        }}
+                      >
+                        path: {formatTransportPath(diagnostics.path)}
+                        {diagnostics.path.rttMs !== null && ` · ${diagnostics.path.rttMs} ms`}
+                      </div>
+                    )}
+                    {diagnostics?.outbound?.frameWidth != null && (
+                      <div>
+                        sending: {diagnostics.outbound.frameWidth}×{diagnostics.outbound.frameHeight}
+                        {diagnostics.outbound.framesPerSecond != null &&
+                          ` @ ${Math.round(diagnostics.outbound.framesPerSecond)}`}
+                        {diagnostics.outbound.targetBitrate != null &&
+                          ` · ${(diagnostics.outbound.targetBitrate / 1_000_000).toFixed(2)} Mbps`}
+                        {diagnostics.bpp != null && ` · ${diagnostics.bpp.toFixed(3)} bpp`}
+                      </div>
+                    )}
+                    {/* Only worth surfacing when it is actually limiting something. */}
+                    {diagnostics?.outbound?.qualityLimitationReason &&
+                      diagnostics.outbound.qualityLimitationReason !== 'none' && (
+                        <div style={{ color: 'var(--orange-deep)' }}>
+                          limited by: {diagnostics.outbound.qualityLimitationReason}
+                        </div>
+                      )}
                   </div>
                 )}
                 {isScreenSharing && (
                   <div className="hand" style={{ fontSize: 15, color: 'rgba(26,20,23,0.55)', marginBottom: 6 }}>
                     adjusts live — no interruption
+                  </div>
+                )}
+
+                {/* Content mode. Frame rate is the cheapest sharpness lever
+                    there is: film is 24 fps at source, so encoding it at 30
+                    divides the budget over 25% more frames for nothing. */}
+                {onContentModeChange && (
+                  <div style={{ marginBottom: 10 }}>
+                    <div
+                      className="hand"
+                      style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)', marginBottom: 4 }}
+                    >
+                      what are you sharing?
+                    </div>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      {(Object.keys(CONTENT_MODES) as ContentMode[]).map((mode) => {
+                        const isActive = contentMode === mode;
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            title={CONTENT_MODES[mode].description}
+                            onClick={() => onContentModeChange(mode)}
+                            style={{
+                              flex: 1,
+                              padding: '5px 4px',
+                              background: isActive ? 'var(--purple)' : 'transparent',
+                              color: isActive ? 'var(--paper)' : 'var(--ink)',
+                              border: '2.5px solid var(--ink)',
+                              borderRadius: 8,
+                              cursor: 'pointer',
+                              fontFamily: 'var(--font-sfx)',
+                              fontSize: 14,
+                              letterSpacing: 0.5,
+                            }}
+                          >
+                            {CONTENT_MODES[mode].label}
+                            <div className="hand" style={{ fontSize: 12, opacity: 0.75 }}>
+                              {CONTENT_MODES[mode].fps} fps
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
                 {(Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]).map((key) => {

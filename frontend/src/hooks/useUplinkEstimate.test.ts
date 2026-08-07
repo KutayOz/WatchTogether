@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { estimateFromBitrate } from './useUplinkEstimate';
-import { QUALITY_PRESETS, type ScreenShareQuality } from '../types';
+import { estimateFromBitrate, shouldClamp } from './useUplinkEstimate';
+import { QUALITY_LADDER, QUALITY_PRESETS, type ScreenShareQuality } from '../types';
 
 /**
  * The bitrate-to-presets decision.
@@ -12,7 +12,9 @@ import { QUALITY_PRESETS, type ScreenShareQuality } from '../types';
  * implementation got backwards.
  */
 
-const LADDER: ScreenShareQuality[] = ['low', 'medium', 'high', 'ultra', 'extreme'];
+// Imported, not restated. A local copy would keep passing while quietly not
+// covering any rung added to the real ladder — the worst kind of green.
+const LADDER = QUALITY_LADDER;
 
 /** Bits per second a preset asks for, video and audio together. */
 const cost = (q: ScreenShareQuality) =>
@@ -94,5 +96,43 @@ describe('estimateFromBitrate', () => {
   it('reports the estimate in Mbps to one decimal', () => {
     expect(estimateFromBitrate(7_240_000).uplinkMbps).toBe(7.2);
     expect(estimateFromBitrate(1_596_000).uplinkMbps).toBe(1.6);
+  });
+
+  it('exposes an unrounded budget for the operating-point chooser', () => {
+    // uplinkMbps is for display. Arithmetic that rounds to one decimal first
+    // would quantise the budget into ~100 kbps steps.
+    const estimate = estimateFromBitrate(2_345_678);
+    expect(estimate.uplinkBps).toBe(2_345_678);
+    expect(estimate.budgetBps).toBeLessThan(estimate.uplinkBps);
+    expect(estimate.budgetBps).toBeGreaterThan(estimate.uplinkBps * 0.8);
+  });
+});
+
+/**
+ * The clamp is deliberately slacker than the selection, and that is a guard
+ * against a feedback spiral rather than laxity.
+ *
+ * Chrome's availableOutgoingBitrate is bounded by what you are already sending.
+ * Clamp down and the next estimate falls with you, which justifies clamping
+ * again — the estimator ends up measuring the cage it is locked in, and a link
+ * ratchets to the floor without ever having been that slow. This is the exact
+ * mechanism that stranded users at the bottom preset.
+ */
+describe('shouldClamp', () => {
+  it('does not clamp merely because we are self-limited', () => {
+    // Sitting at 'low' (1.596 Mbps) and the estimator reports 1.7 — which is
+    // roughly what it WOULD report, since it cannot see past our own ceiling.
+    // Clamping here is how the spiral starts.
+    expect(shouldClamp('low', 1_700_000)).toBe(false);
+  });
+
+  it('clamps when the current ask is flatly unaffordable', () => {
+    expect(shouldClamp('medium', 2_000_000)).toBe(true);
+  });
+
+  it('treats no estimate as no opinion, never as slow', () => {
+    // Firefox does not publish the statistic. Guessing would silently cap
+    // quality for every user of a browser that simply declines to answer.
+    expect(shouldClamp('extreme', null)).toBe(false);
   });
 });
