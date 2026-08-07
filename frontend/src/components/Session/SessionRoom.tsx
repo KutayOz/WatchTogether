@@ -1,5 +1,5 @@
 import { logger } from '../../services/logger';
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { useAuthContext } from '../../context/AuthContext';
 import { useSessionContext } from '../../context/SessionContext';
@@ -7,6 +7,21 @@ import { useTransport } from '../../hooks/useTransport';
 import { useWebRTC } from '../../hooks/useWebRTC';
 import { useMediaDevices } from '../../hooks/useMediaDevices';
 import { useUplinkEstimate } from '../../hooks/useUplinkEstimate';
+import { useTransportDiagnostics } from '../../hooks/useTransportDiagnostics';
+import { useSenderHealth } from '../../hooks/useSenderHealth';
+import {
+  chooseOperatingPoint,
+  nextBudget,
+  sameOperatingPoint,
+  type OperatingPoint,
+} from '../../hooks/operatingPoint';
+import { HEADROOM_SELECT } from '../../hooks/useUplinkEstimate';
+import {
+  initialLadderState,
+  nextLadderState,
+  withUserChoice,
+  type LadderState,
+} from '../../hooks/qualityLadder';
 import { useQualityMonitor } from '../../hooks/useQualityMonitor';
 import { useTalkingWhileMuted } from '../../hooks/useTalkingWhileMuted';
 import { api } from '../../services/api';
@@ -34,8 +49,14 @@ import {
   BackButton,
   Doodle,
 } from '../manga';
-import type { MediaState, ScreenShareQuality, QualityFeedback } from '../../types';
-import { QUALITY_PRESETS } from '../../types';
+import type {
+  MediaState,
+  ScreenShareQuality,
+  QualityFeedback,
+  QualityLevel,
+  ContentMode,
+} from '../../types';
+import { QUALITY_PRESETS, isContentMode, isScreenShareQuality } from '../../types';
 
 export function SessionRoom() {
   const { id: urlSessionId } = useParams<{ id: string }>();
@@ -77,14 +98,48 @@ export function SessionRoom() {
   // so we don't need an explicit reset path.
   const [stage, setStage] = useState<'preflight' | 'joining' | 'live'>('preflight');
 
+  /**
+   * The user's quality CEILING, not the operating point.
+   *
+   * Read from a new key. The old 'screenShareQuality' value cannot be trusted
+   * and cannot be repaired: three different code paths wrote it — an explicit
+   * pick, a proactive bandwidth clamp, and a reactive auto-downgrade — and
+   * nothing recorded which. A value of 'low' might mean "I chose this" or might
+   * mean "one bad three-second window pinned me here, permanently, on a link
+   * that was fine". Since only the first is worth keeping and they are
+   * indistinguishable, the honest migration is to discard and start clean.
+   *
+   * Default 'auto': up to 1080p, with the actual numbers coming from the
+   * measured link via chooseOperatingPoint.
+   */
   const [screenShareQuality, setScreenShareQuality] = useState<ScreenShareQuality>(() => {
-    const saved = localStorage.getItem('screenShareQuality');
-    // Default to 'medium' (1080p30 @ 4 Mbps): a safe ceiling that fits most home
-    // uplinks and is plenty for 1080p30. The old 'high' (8 Mbps) over-drove
-    // slower links → bufferbloat (latency) + loss (stutter). The speed-test
-    // clamp below pulls this down further when the measured uplink can't sustain it.
-    return (saved as ScreenShareQuality) || 'medium';
+    if (typeof window === 'undefined') return 'auto';
+    const saved = window.localStorage.getItem('wt:screenShareQuality');
+    if (saved === null) {
+      // First run under the new scheme — clear the untrustworthy old key so a
+      // stuck user is unstuck rather than inheriting the pin.
+      window.localStorage.removeItem('screenShareQuality');
+      return 'auto';
+    }
+    return isScreenShareQuality(saved) ? saved : 'auto';
   });
+
+  /**
+   * What is on the screen, which is really a frame-rate decision — and the
+   * cheapest quality lever available. Film is 24 fps at source; encoding it at
+   * 30 divides the same budget across 25% more frames for nothing.
+   */
+  const [contentMode, setContentMode] = useState<ContentMode>(() => {
+    if (typeof window === 'undefined') return 'film';
+    const saved = window.localStorage.getItem('wt:contentMode');
+    return isContentMode(saved) ? saved : 'film';
+  });
+
+  // Where automatic quality movement currently stands. `ceiling` is the user's
+  // pick; `current` is what the link has earned underneath it.
+  const [ladder, setLadder] = useState<LadderState>(() =>
+    initialLadderState(screenShareQuality, Date.now()),
+  );
   const [peerQualityFeedback, setPeerQualityFeedback] = useState<QualityFeedback | null>(null);
 
   const [hasScreenAudio, setHasScreenAudio] = useState(false);
@@ -151,16 +206,22 @@ export function SessionRoom() {
   // True once the user manually picks a quality this session — suppresses the
   // automatic speed-test clamp so we never override a deliberate choice.
   const userOverrodeQualityRef = useRef(false);
-  // Throttle timestamp for the reactive (viewer-feedback-driven) auto-downgrade.
-  const lastAutoDowngradeRef = useRef(0);
-  // Whether the previous viewer report was already 'critical'. The downgrade
-  // needs two in a row so a single bad 3-second window can't ratchet quality
-  // down permanently — nothing ever raises it back.
-  const lastFeedbackWasCriticalRef = useRef(false);
-  // One step down the quality ladder, used by the reactive downgrade. Floor at 'low'.
-  const QUALITY_DOWNGRADE: Record<ScreenShareQuality, ScreenShareQuality> = {
-    extreme: 'ultra', ultra: 'high', high: 'medium', medium: 'low', low: 'low', auto: 'low',
-  };
+  // Latest viewer verdict, fed into the ladder policy. A ref because it arrives
+  // on the data channel between renders and must not itself trigger one.
+  const viewerLevelRef = useRef<QualityLevel | null>(null);
+
+  /**
+   * Budget assumed before the estimator has an opinion.
+   *
+   * Start safe and climb, rather than start high and ratchet down. 2 Mbps lands
+   * on a good 1080p24 for film and does not oversubscribe a modest uplink
+   * during the ~9 s before the first real estimate; a faster link is back above
+   * this within a couple of ladder probes. The reverse policy is what produced
+   * the original complaint — the old default asked 4.1 Mbps of every link on
+   * contact, and on anything slower that means overshoot, a standing queue, and
+   * a picture that is soft and laggy at once.
+   */
+  const COLD_START_BUDGET_BPS = 2_000_000;
 
   const { isMuted, isCameraOn, toggleMute, toggleCamera } = useMediaDevices();
 
@@ -500,7 +561,9 @@ export function SessionRoom() {
       if (approved && sessionIdRef.current && pendingScreenShareRef.current) {
         const { stream, streamId } = pendingScreenShareRef.current;
         localScreenStreamIdRef.current = streamId;
-        await webrtc.addScreenShareTracks(stream, screenShareQualityRef.current);
+        // Via the ref, not the render-time value: this callback is registered
+        // once and its closure is stale by the time an approval arrives.
+        await webrtc.addScreenShareTracks(stream, operatingPointRef.current);
         setCurrentScreenSharer(user?.username ?? 'You');
 
         await transportRef.current?.notifyScreenShareStarted(sessionIdRef.current, streamId);
@@ -578,37 +641,11 @@ export function SessionRoom() {
           type: 'warning',
         });
       }
-      // Close the adaptation loop: on sustained CRITICAL viewer feedback while
-      // sharing, step the encoder down one preset (throttled to once / 8s).
-      // Reactive safety net on top of the proactive uplink clamp. 'poor' only
-      // warns — only 'critical' acts, so we don't thrash the quality up and down.
-      //
-      // Two readings, not one. The score used to be incapable of reaching
-      // 'critical' on a frame-rate collapse, so this branch effectively never
-      // ran; now that it reports honestly, a single bad 3-second window — a
-      // passing wifi hiccup, someone else on the link starting a download —
-      // would be enough to permanently step quality down, and nothing here ever
-      // steps it back up. Requiring the next window to agree costs 3 seconds of
-      // reaction time and buys us not reacting to noise.
-      const criticalNow = feedback.level === 'critical';
-      const criticalTwice = criticalNow && lastFeedbackWasCriticalRef.current;
-      lastFeedbackWasCriticalRef.current = criticalNow;
-
-      if (criticalTwice && webrtc.isScreenSharing) {
-        const now = Date.now();
-        if (now - lastAutoDowngradeRef.current > 8000) {
-          const current = screenShareQualityRef.current;
-          const next = QUALITY_DOWNGRADE[current];
-          if (next && next !== current) {
-            lastAutoDowngradeRef.current = now;
-            screenShareQualityRef.current = next;
-            setScreenShareQuality(next);
-            localStorage.setItem('screenShareQuality', next);
-            webrtc.updateScreenShareQuality(next).catch(() => {});
-            setToast({ message: `Auto-lowered to ${next} — viewer connection critical`, type: 'info' });
-          }
-        }
-      }
+      // The viewer's verdict is one of two inputs to the ladder; the other is
+      // our own encoder's health. Recorded here, acted on in the ladder effect
+      // below, so both signals go through one policy rather than two racing
+      // ad-hoc branches that could only ever move quality downward.
+      viewerLevelRef.current = feedback.level;
     },
   });
 
@@ -637,36 +674,109 @@ export function SessionRoom() {
     isWatchingRemoteScreen ? handleQualityFeedback : undefined,
   );
 
-  const uplink = useUplinkEstimate(isCallActive);
+  // Samples reset when sharing starts: eighteen seconds of camera-only readings
+  // describe a completely different load than the one a share is about to place.
+  const uplink = useUplinkEstimate(isCallActive, webrtc.isScreenSharing);
+  const diagnostics = useTransportDiagnostics(isCallActive);
 
-  // Proactive bandwidth clamp. When the estimator says the link cannot sustain
-  // the selected preset, drop to the best one it can — unless the user picked
-  // this quality themselves, in which case their choice stands.
-  //
-  // Only ever downward. Nothing here raises quality, because a link that
-  // *could* carry more is not a reason to override what someone chose.
+  /** What the link has earned, held across polls so it cannot decay. */
+  const [budgetBps, setBudgetBps] = useState(COLD_START_BUDGET_BPS);
+
+  /**
+   * The operating point actually applied to the encoder.
+   *
+   * Derived, never stored: budget (measured, or a conservative cold start) plus
+   * content mode plus the user's ceiling, run through the convex-hull chooser.
+   * Six fixed rungs could not sit on that curve — which is why a 2 Mbps link
+   * used to run 720p and leave a third of its uplink unused.
+   */
+  const operatingPoint = useMemo(
+    () => chooseOperatingPoint(budgetBps, contentMode, ladder.applied),
+    [budgetBps, contentMode, ladder.applied],
+  );
+
+  // Sender health is the control input for BOTH the budget and the ladder.
+  // Judged against the ceiling we actually set, so "is it getting its ask" is a
+  // real question rather than a restatement of what we chose to send.
+  const senderHealth = useSenderHealth(webrtc.isScreenSharing, operatingPoint.videoBps);
+
+  // Move the budget on each estimate, but only downward on real evidence — see
+  // nextBudget for why spending a fixed fraction of the estimate every tick
+  // walks the stream to the floor all by itself.
   useEffect(() => {
-    // No estimate means no opinion — a browser that does not publish
-    // availableOutgoingBitrate (Firefox) must not have quality decided for it.
-    if (!uplink || userOverrodeQualityRef.current) return;
-    const current = screenShareQualityRef.current;
-    if (uplink.supportedQualities[current] !== false) return;
+    setBudgetBps(
+      (prev) =>
+        nextBudget(prev, uplink?.uplinkBps ?? null, senderHealth.health === 'under-served', HEADROOM_SELECT) ??
+        prev,
+    );
+  }, [uplink, senderHealth.health]);
 
-    const next = uplink.recommendedQuality;
-    if (!next || next === current) return;
+  // A new share is a new load; carrying the old budget across would judge it by
+  // the previous one's behaviour.
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) setBudgetBps(COLD_START_BUDGET_BPS);
+  }, [webrtc.isScreenSharing]);
 
-    screenShareQualityRef.current = next;
-    setScreenShareQuality(next);
-    localStorage.setItem('screenShareQuality', next);
-    if (webrtc.isScreenSharing) {
-      webrtc.updateScreenShareQuality(next).catch(() => {});
+  // Long-lived signalling callbacks (screen-share approval, in particular) are
+  // registered once and close over their first render, so anything they need
+  // from the current point has to come through a ref.
+  const operatingPointRef = useRef(operatingPoint);
+  useEffect(() => {
+    operatingPointRef.current = operatingPoint;
+  }, [operatingPoint]);
+
+  // Apply the point whenever it genuinely changes. sameOperatingPoint guards
+  // against re-applying identical parameters every time the estimate wobbles by
+  // a few kbps — setParameters is cheap but not free, and churn here shows up
+  // as encoder resets.
+  const appliedPointRef = useRef<OperatingPoint | null>(null);
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) {
+      appliedPointRef.current = null;
+      return;
     }
-    setToast({
-      message: `Quality set to ${next} for your connection (${uplink.uplinkMbps} Mbps up)`,
-      type: 'info',
-    });
+    if (sameOperatingPoint(appliedPointRef.current, operatingPoint)) return;
+    appliedPointRef.current = operatingPoint;
+    webrtc.updateScreenShareQuality(operatingPoint).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uplink]);
+  }, [operatingPoint, webrtc.isScreenSharing]);
+
+  /**
+   * Advance the ladder on every sender-health observation.
+   *
+   * Both directions, unlike everything this replaces. The old design only ever
+   * stepped down and persisted the result, so one bad three-second window
+   * pinned a user at the floor for every future session.
+   */
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) return;
+    setLadder((prev) => {
+      const next = nextLadderState(prev, {
+        now: Date.now(),
+        isSharing: true,
+        senderHealth: senderHealth.health,
+        viewerLevel: viewerLevelRef.current,
+      });
+      if (next.applied !== prev.applied) {
+        // Deliberately NOT persisted. Only an explicit human pick is written to
+        // storage; an automatic move is a response to this moment's link, not a
+        // statement about what the user wants next week.
+        screenShareQualityRef.current = next.applied;
+        setScreenShareQuality(next.applied);
+      }
+      return next;
+    });
+  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
+
+  // CPU pressure needs a different answer than bandwidth pressure, and the
+  // ladder deliberately refuses to act on it — say so rather than sitting on it.
+  useEffect(() => {
+    if (senderHealth.health !== 'cpu-bound') return;
+    setToast({
+      message: 'Encoder is CPU-limited — try a smaller share or close some tabs',
+      type: 'warning',
+    });
+  }, [senderHealth.health]);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -821,38 +931,44 @@ export function SessionRoom() {
   };
 
   const handleQualityChange = async (quality: ScreenShareQuality) => {
-    // Manual pick — from now on, don't let the speed-test clamp override the user.
+    // An explicit pick is a CEILING and a fresh statement of intent: it moves
+    // quality now, bounds every later automatic step, and resets the probe
+    // backoff. It is also the ONLY thing in this component that writes storage.
     userOverrodeQualityRef.current = true;
     setScreenShareQuality(quality);
     screenShareQualityRef.current = quality;
-    localStorage.setItem('screenShareQuality', quality);
+    setLadder(withUserChoice(quality, Date.now()));
+    localStorage.setItem('wt:screenShareQuality', quality);
 
-    if (!webrtc.isScreenSharing) return;
-
-    // Live quality change is ALWAYS non-disruptive now. updateScreenShareQuality
-    // adjusts the encoder on the existing sender (no track swap, no renegotiation,
-    // no getDisplayMedia re-prompt) and is best-effort internally — so we NEVER
-    // tear down and recapture for a mere quality tweak. That recapture was the old
-    // bug: it froze the viewer and re-asked for screen permission. Worst case here
-    // is "quality didn't change", never "stream broke".
-    try {
-      const updated = await webrtc.updateScreenShareQuality(quality);
-      setToast(
-        updated
-          ? { message: `quality → ${QUALITY_PRESETS[quality].label.toLowerCase()}`, type: 'info' }
-          : { message: 'Quality saved — applies to your next share', type: 'info' },
-      );
-    } catch (err) {
-      // Shouldn't happen (the service swallows browser quirks), but if it does we
-      // keep the stream running rather than restarting it.
-      logger.warn('[Session] live quality update failed; stream left running:', err);
-      setToast({ message: 'Quality unchanged — stream kept running', type: 'warning' });
+    // No direct call to updateScreenShareQuality here. Changing the ceiling
+    // changes the derived operating point, and the effect that watches it does
+    // the applying — one code path to the encoder rather than two racing ones.
+    // That path is always non-disruptive: it adjusts the existing sender (no
+    // track swap, no renegotiation, no getDisplayMedia re-prompt), so a quality
+    // tweak can never freeze the viewer or re-ask for screen permission.
+    if (!webrtc.isScreenSharing) {
+      setToast({ message: 'Quality saved — applies to your next share', type: 'info' });
+      return;
     }
+    setToast({
+      message: `quality → ${QUALITY_PRESETS[quality].label.toLowerCase()}`,
+      type: 'info',
+    });
+  };
+
+  /**
+   * Content mode is a user preference, so it persists — unlike anything the
+   * ladder does on its own. The live share picks the new frame rate up through
+   * the operating-point effect; no renegotiation, no re-prompt.
+   */
+  const handleContentModeChange = (mode: ContentMode) => {
+    setContentMode(mode);
+    localStorage.setItem('wt:contentMode', mode);
   };
 
   const handleRequestScreenShare = async () => {
     try {
-      const { stream, streamId, hasAudio } = await webrtc.captureScreen(screenShareQuality);
+      const { stream, streamId, hasAudio } = await webrtc.captureScreen(operatingPoint);
 
       // Warn the sharer when no audio was captured. Most common cause: Safari +
       // "Window" or "Entire Screen" share (Safari only captures audio for *Tab*
@@ -867,7 +983,7 @@ export function SessionRoom() {
 
       if (!sessionIdRef.current || !peerNameRef.current) {
         localScreenStreamIdRef.current = streamId;
-        await webrtc.addScreenShareTracks(stream, screenShareQuality);
+        await webrtc.addScreenShareTracks(stream, operatingPoint);
         setCurrentScreenSharer(user?.username ?? 'You');
 
         if (sessionIdRef.current) {
@@ -1417,6 +1533,9 @@ export function SessionRoom() {
               screenShareQuality={screenShareQuality}
               onQualityChange={handleQualityChange}
               uplink={uplink}
+              diagnostics={diagnostics}
+              contentMode={contentMode}
+              onContentModeChange={handleContentModeChange}
               isSharer={isLocalSharing}
               hasPeer={!!peerName}
               peerDisplayName={peerName ?? undefined}

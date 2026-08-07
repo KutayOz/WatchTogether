@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { webrtcService } from '../services/webrtcService';
-import { QUALITY_PRESETS, type ScreenShareQuality, type UplinkEstimate } from '../types';
+import {
+  QUALITY_LADDER,
+  QUALITY_PRESETS,
+  type ScreenShareQuality,
+  type UplinkEstimate,
+} from '../types';
 
 /**
  * How much uplink the browser thinks it has, read off the peer connection.
@@ -30,11 +35,16 @@ const POLL_INTERVAL_MS = 3000;
 const WINDOW = 6;
 
 /**
- * Report nothing until the window is full. The estimator's first readings
- * after a connection comes up are wild, and clamping on them would drop
- * quality at the exact moment the call starts.
+ * How many samples before we will say anything at all.
+ *
+ * Was WINDOW (six samples, eighteen seconds) because this value used to DRIVE
+ * the clamp, and acting on the estimator's wild opening readings would drop
+ * quality at the exact moment a call starts. The control input is now sender
+ * health (useSenderHealth), so this number only gates advice — and a median of
+ * three is still outlier-robust. Nine seconds to a first opinion instead of
+ * eighteen.
  */
-const MIN_SAMPLES = WINDOW;
+const MIN_SAMPLES = 3;
 
 /**
  * Fraction of the estimate a stream is allowed to claim.
@@ -44,7 +54,23 @@ const MIN_SAMPLES = WINDOW;
  * only thing on the wire — camera video, audio and the data channel are all
  * sharing it.
  */
-const HEADROOM = 0.8;
+export const HEADROOM_SELECT = 0.85;
+
+/**
+ * Headroom for the *clamp*, as opposed to the selection above.
+ *
+ * 1.0 deliberately. This is the guard against a feedback spiral that the old
+ * single-headroom design walked straight into: Chrome's
+ * `availableOutgoingBitrate` is bounded by what you are already sending, so
+ * clamping down lowers the next estimate, which justifies clamping again. The
+ * estimator ends up measuring the cage it is locked in, and a link ratchets to
+ * the floor without ever having been that slow.
+ *
+ * At 1.0 the clamp only fires when the estimator says you cannot afford what
+ * you are ALREADY asking for — a statement that cannot be manufactured by your
+ * own restraint.
+ */
+export const HEADROOM_CLAMP = 1.0;
 
 interface CandidatePairStats {
   state?: string;
@@ -66,7 +92,7 @@ function presetBitrate(quality: ScreenShareQuality): number {
  * polling hook.
  */
 export function estimateFromBitrate(bitsPerSecond: number): UplinkEstimate {
-  const budget = bitsPerSecond * HEADROOM;
+  const budget = bitsPerSecond * HEADROOM_SELECT;
   const supportedQualities = {} as Record<ScreenShareQuality, boolean>;
 
   for (const key of Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]) {
@@ -76,14 +102,16 @@ export function estimateFromBitrate(bitsPerSecond: number): UplinkEstimate {
     supportedQualities[key] = key === 'auto' || presetBitrate(key) <= budget;
   }
 
-  // The best fixed preset that fits. Ordered explicitly rather than by
-  // Object.keys, because "cheapest first" is a property of this list and not
-  // of the object literal's declaration order.
-  const ladder: ScreenShareQuality[] = ['low', 'medium', 'high', 'ultra', 'extreme'];
-  const affordable = ladder.filter((key) => supportedQualities[key]);
+  // The best fixed preset that fits. QUALITY_LADDER carries the ordering,
+  // because "cheapest first" is a property of the ladder and not of the object
+  // literal's declaration order — and duplicating it here is how a new rung
+  // ends up silently uncovered.
+  const affordable = QUALITY_LADDER.filter((key) => supportedQualities[key]);
 
   return {
     uplinkMbps: Math.round((bitsPerSecond / 1_000_000) * 10) / 10,
+    uplinkBps: bitsPerSecond,
+    budgetBps: budget,
     // Nothing fixed fits: hand back `auto` so the encoder adapts downward
     // instead of the UI recommending a preset that cannot be sustained.
     recommendedQuality: affordable.at(-1) ?? 'auto',
@@ -123,7 +151,27 @@ function readOutgoingBitrate(stats: RTCStatsReport): number | null {
   return found;
 }
 
-export function useUplinkEstimate(isActive: boolean): UplinkEstimate | null {
+/**
+ * Should the proactive clamp fire?
+ *
+ * Uses HEADROOM_CLAMP (1.0), not the selection headroom: the question is not
+ * "could this link do better" but "is the current ask flatly unaffordable". Any
+ * stricter test is self-fulfilling, because the estimate follows what we send.
+ */
+export function shouldClamp(current: ScreenShareQuality, estimateBps: number | null): boolean {
+  if (estimateBps === null) return false; // no opinion is never a reason to clamp
+  return presetBitrate(current) > estimateBps * HEADROOM_CLAMP;
+}
+
+/**
+ * @param isActive  Poll while true.
+ * @param resetKey  Changing this clears the sample window. Pass the sharing
+ *                  state: samples taken during a camera-only call describe a
+ *                  completely different load than the one a screen share is
+ *                  about to put on the wire, and carrying them across would
+ *                  judge the new load by the old one's behaviour.
+ */
+export function useUplinkEstimate(isActive: boolean, resetKey?: unknown): UplinkEstimate | null {
   const [estimate, setEstimate] = useState<UplinkEstimate | null>(null);
   const samplesRef = useRef<number[]>([]);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -162,7 +210,7 @@ export function useUplinkEstimate(isActive: boolean): UplinkEstimate | null {
       samplesRef.current = [];
       setEstimate(null);
     };
-  }, [isActive, poll]);
+  }, [isActive, poll, resetKey]);
 
   return estimate;
 }

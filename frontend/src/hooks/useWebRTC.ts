@@ -2,7 +2,7 @@ import { logger } from '../services/logger';
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { webrtcService, type WebRTCEventHandlers } from '../services/webrtcService';
 import { api } from '../services/api';
-import type { ScreenShareQuality } from '../types';
+import type { OperatingPoint } from './operatingPoint';
 
 // Receiver-side playout buffer target (ms). Lower = tighter broadcaster↔viewer
 // sync; higher = more cushion against jitter (fewer freezes). This is the #1
@@ -179,21 +179,21 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
   // Capture screen WITHOUT adding to peer connection (for permission flow).
   // `hasAudio` lets the caller surface a UX hint when the browser didn't capture
   // any audio (Safari's most common screen-share gotcha — see webrtcService.captureScreen).
-  const captureScreen = useCallback(async (quality: ScreenShareQuality = 'high') => {
-    const { stream, streamId, hasAudio } = await webrtcService.captureScreen(quality);
+  const captureScreen = useCallback(async (point: OperatingPoint) => {
+    const { stream, streamId, hasAudio } = await webrtcService.captureScreen(point);
     return { stream, streamId, hasAudio };
   }, []);
 
   // Add captured screen to peer connection (after permission granted)
-  const addScreenShareTracks = useCallback(async (stream: MediaStream, quality: ScreenShareQuality = 'high') => {
-    await webrtcService.addScreenShareTracks(stream, quality);
+  const addScreenShareTracks = useCallback(async (stream: MediaStream, point: OperatingPoint) => {
+    await webrtcService.addScreenShareTracks(stream, point);
     setIsScreenSharing(true);
     setLocalScreenStream(stream);
   }, []);
 
   // Legacy method - captures AND adds tracks
-  const startScreenShare = useCallback(async (quality: ScreenShareQuality = 'high') => {
-    const { stream, streamId, needsRenegotiation } = await webrtcService.getDisplayMedia(quality);
+  const startScreenShare = useCallback(async (point: OperatingPoint) => {
+    const { stream, streamId, needsRenegotiation } = await webrtcService.getDisplayMedia(point);
     setIsScreenSharing(true);
     setLocalScreenStream(stream);
     return { stream, streamId, needsRenegotiation };
@@ -212,8 +212,8 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
    * to stop+capture+addTracks for cases like browsers that won't honor
    * setParameters on a getDisplayMedia sender).
    */
-  const updateScreenShareQuality = useCallback(async (quality: ScreenShareQuality) => {
-    return webrtcService.updateScreenShareQuality(quality);
+  const updateScreenShareQuality = useCallback(async (point: OperatingPoint) => {
+    return webrtcService.updateScreenShareQuality(point);
   }, []);
 
   // Called when signaling notifies us of remote screen share stream ID

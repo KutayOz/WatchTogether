@@ -1,7 +1,13 @@
 import { logger } from './logger';
 import { dataChannelService } from './dataChannelService';
-import type { IceServerConfig, ScreenShareQuality, QualityPreset } from '../types';
-import { QUALITY_PRESETS as QualityPresets } from '../types';
+import type {
+  IceServerConfig,
+  TransportPath,
+  IceCandidateKind,
+  OutboundScreenStats,
+} from '../types';
+import type { OperatingPoint } from '../hooks/operatingPoint';
+import { applyOpusOptions, SDP_WARN_LENGTH } from './opusFmtp';
 
 /**
  * Encoder ceilings for the camera, in bps.
@@ -17,18 +23,109 @@ import { QUALITY_PRESETS as QualityPresets } from '../types';
  * IDLE here. WHILE_SHARING is the one that matters: the shared screen is the
  * thing both people are actually watching, so the thumbnail yields to it.
  */
-const CAMERA_MAX_BITRATE_IDLE = 800_000;
-const CAMERA_MAX_BITRATE_WHILE_SHARING = 150_000;
+const CAMERA_MAX_BITRATE_IDLE = 400_000;
+const CAMERA_MAX_BITRATE_WHILE_SHARING = 64_000;
 
 /**
  * How far the camera is scaled down while a screen share is running.
  *
  * 2 takes 640x480 to 320x240, which is more than the corner thumbnail is ever
  * displayed at. Without this the encoder keeps trying to hold 640x480 inside a
- * 150 kbps ceiling and spends the budget on macroblock noise; told to shrink,
- * it spends the same bits on a clean small picture.
+ * tight ceiling and spends the budget on macroblock noise; told to shrink, it
+ * spends the same bits on a clean small picture.
  */
 const CAMERA_SCALE_DOWN_WHILE_SHARING = 2;
+
+/**
+ * Camera frame rate while sharing.
+ *
+ * The cheaper trade than resolution. A corner thumbnail is a near-static
+ * talking head, and temporal detail is the first thing nobody is looking at
+ * once there is a film playing next to it — so buy the bits back from frame
+ * rate rather than shrinking the picture further. 8 fps at 320x240 reads as a
+ * live person; 30 fps at the same size costs three times as much to say it.
+ *
+ * Combined with the ceiling above this frees ~86 kbps against the old
+ * 150 kbps/30 fps setting, which on a 2 Mbps uplink is ~4% of the whole link
+ * handed back to the thing both people are actually watching.
+ */
+const CAMERA_MAX_FRAMERATE_WHILE_SHARING = 8;
+
+/**
+ * Microphone ceiling, in bps.
+ *
+ * The mic sender was never configured at all — attachLocalStream recorded the
+ * video sender and dropped the audio one on the floor — so it ran on Chrome's
+ * default and was neither bounded nor accounted for in any budget. 24 kbps is
+ * comfortably transparent for mono speech in Opus (which is what the codec
+ * picks for a voice track anyway); the point is that it is now a known line
+ * item rather than an assumption.
+ *
+ * networkPriority 'high', not 'low': voice is the last thing that should break.
+ * A call where the picture softens is still a call; a call where the other
+ * person cuts out is not.
+ */
+const MIC_MAX_BITRATE = 24_000;
+
+/**
+ * Capture constraints for an operating point.
+ *
+ * Shared by the initial getDisplayMedia and every later re-apply so the two can
+ * never drift — the drift was a real bug: captureScreen set width/height/fps
+ * from the preset, and updateScreenShareQuality re-applied only frameRate, so a
+ * track captured at 720p stayed 720p forever no matter what the ceiling later
+ * became.
+ *
+ * `max` and not just `ideal`. The old code passed `max: 3840/2160/60` for every
+ * preset, so on a 4K desktop the track arrived at 3840x2160 and Chrome's
+ * quality scaler stepped 2160 -> 1440 -> 1080 -> 720: any pressure at all put
+ * the stream two steps below 1080p, and every frame paid a 4K->1080 downscale
+ * before it even reached the encoder. Capturing at the chosen size makes that
+ * size the ceiling the scaler defends rather than a waypoint it passes through.
+ */
+function displayConstraintsFor(point: OperatingPoint): MediaTrackConstraints {
+  return {
+    width: { ideal: point.width, max: point.width },
+    height: { ideal: point.height, max: point.height },
+    frameRate: { ideal: point.fps, max: point.fps },
+  };
+}
+
+/**
+ * Read a persisted setting without ever throwing.
+ *
+ * `typeof localStorage !== 'undefined'` is not enough of a guard: the object
+ * can exist while `getItem` does not (test environments and some embedded
+ * webviews), and it can throw outright under privacy settings that block
+ * storage. That matters more than it looks — the only caller runs inside
+ * addScreenShareTracks' per-track try block, which also guards the
+ * setParameters call, so a throw here silently skips the encoder's bitrate
+ * ceiling and leaves the share running uncapped.
+ */
+function readSetting(key: string): string | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    if (typeof localStorage.getItem !== 'function') return null;
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opus settings applied to our local description.
+ *
+ * DTX is the one that pays for itself here: this is a co-watching app, so both
+ * people are silent for most of a session, and without it the mic transmits a
+ * continuous ~24 kbps of encoded room tone for the privilege of saying nothing.
+ * In-band FEC costs a little and buys real resilience on a lossy link.
+ *
+ * Stereo is deliberately NOT forced on: the screen-share audio track wants it
+ * and the mic does not, and this applies to the whole session description. The
+ * per-sender maxBitrate set in addScreenShareTracks is what actually
+ * differentiates the two.
+ */
+const OPUS_OPTIONS = { dtx: true, fec: true } as const;
 
 export type WebRTCEventHandlers = {
   onTrack?: (event: RTCTrackEvent) => void;
@@ -52,6 +149,14 @@ class WebRTCService {
   // off keeps its sender with track === null, so nothing about the *tracks* can
   // point back at it. See getCameraVideoSender.
   private cameraVideoSender: RTCRtpSender | null = null;
+  // The mic. Recorded for the same reason as the camera — it needs a ceiling,
+  // and "the first audio sender" stops being the mic the moment a screen share
+  // with audio is added.
+  private micAudioSender: RTCRtpSender | null = null;
+  // The operating point currently applied to the screen share. Held so the
+  // 'configurationchange' handler can re-assert geometry after a surface swap
+  // without the caller having to remember what it asked for.
+  private currentPoint: OperatingPoint | null = null;
   private handlers: WebRTCEventHandlers = {};
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private hasRemoteDescription = false;
@@ -69,6 +174,13 @@ class WebRTCService {
         username: server.username,
         credential: server.credential,
       })),
+      // One ICE transport, one DTLS handshake, and — the reason it is here —
+      // ONE congestion controller shared by all four senders. Every bitrate
+      // decision in this file assumes camera, mic, screen video and screen
+      // audio are drawing on a single budget; 'max-bundle' is what makes that
+      // assumption true rather than merely Chrome's default.
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
     };
 
     this.peerConnection = new RTCPeerConnection(config);
@@ -222,31 +334,63 @@ class WebRTCService {
       try {
         const sender = this.peerConnection!.addTrack(track, stream);
         if (track.kind === 'video') this.cameraVideoSender = sender;
+        else if (track.kind === 'audio') this.micAudioSender = sender;
       } catch (err) {
         logger.warn('[WebRTC] addTrack failed for', track.kind, err);
       }
     });
 
-    // Cap the camera the moment it has a sender. Fire-and-forget: this method
-    // is sync for its callers and a failed cap is never worth blocking a join.
+    // Cap both the moment they have senders. Fire-and-forget: this method is
+    // sync for its callers and a failed cap is never worth blocking a join.
     void this.applyCameraEncoding(!!this.screenStream);
+    void this.applyMicEncoding();
+  }
+
+  /**
+   * Hold the microphone to a known, bounded share of the uplink.
+   *
+   * Not a bandwidth emergency on its own — Opus voice is cheap — but it was the
+   * one sender in the connection with no ceiling and no line in any budget, and
+   * an unmeasured stream is the one that surprises you. High priority so that
+   * when the estimate drops it is the picture that gives ground, not the voice.
+   */
+  private async applyMicEncoding(): Promise<void> {
+    const sender = this.micAudioSender;
+    if (!sender) return;
+
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    const enc = params.encodings[0] as RTCRtpEncodingParameters & {
+      networkPriority?: RTCPriorityType;
+    };
+    enc.maxBitrate = MIC_MAX_BITRATE;
+    enc.networkPriority = 'high';
+
+    if (await this.setParametersSafely(sender, params, 'mic')) {
+      logger.debug(`[WebRTC] Mic capped at ${MIC_MAX_BITRATE} bps`);
+    }
   }
 
   // Capture screen WITHOUT adding to peer connection (for permission flow)
-  async captureScreen(quality: ScreenShareQuality = 'high'): Promise<{ stream: MediaStream; streamId: string; hasAudio: boolean }> {
+  async captureScreen(point: OperatingPoint): Promise<{ stream: MediaStream; streamId: string; hasAudio: boolean }> {
     try {
-      const preset = QualityPresets[quality];
-
-      // Screen share audio should NOT have voice processing
-      // Use quality preset for resolution and frame rate
+      // Screen share audio should NOT have voice processing.
       const constraints: DisplayMediaStreamOptions = {
-        video: {
-          frameRate: { ideal: preset.video.frameRate, max: 60 },
-          width: { ideal: preset.video.width, max: 3840 },
-          height: { ideal: preset.video.height, max: 2160 },
-        } as MediaTrackConstraints,
+        video: displayConstraintsFor(point),
         audio: true, // Simple audio request - let browser handle details
-      };
+        // Never offer this app's own tab as a share target: picking it is a
+        // hall of mirrors and is never what anyone meant.
+        selfBrowserSurface: 'exclude',
+        // Let the user switch which window/tab they are sharing without a fresh
+        // permission prompt. Handled below via 'configurationchange'.
+        surfaceSwitching: 'include',
+        // NOTE: displaySurface is deliberately NOT set. Biasing toward
+        // 'browser' would give better quality for tab-captured video, but DRM
+        // content (Netflix, Disney+) renders black on the protected path under
+        // tab capture — which would break the app's primary use case.
+      } as DisplayMediaStreamOptions;
 
       const stream = await navigator.mediaDevices.getDisplayMedia(constraints);
 
@@ -264,6 +408,19 @@ class WebRTCService {
           // on the SignalR stream-id notification, not on this value.
           track.contentHint = 'motion';
         }
+
+        // surfaceSwitching means the user can change what they are sharing
+        // mid-stream, and the new surface arrives with the browser's own
+        // settings — our pinned geometry and the contentHint are both gone.
+        // Re-assert them rather than silently reverting to an unpinned 4K grab.
+        track.addEventListener('configurationchange', () => {
+          const current = this.currentPoint;
+          if (!current) return;
+          void track.applyConstraints(displayConstraintsFor(current)).catch(() => {
+            /* best effort — the encoder ceiling still holds the line */
+          });
+          if ('contentHint' in track) track.contentHint = 'motion';
+        });
       }
 
       // Surface whether the browser actually captured audio. Safari is the usual
@@ -391,8 +548,11 @@ class WebRTCService {
     enc.networkPriority = isSharing ? 'low' : 'medium';
     if (isSharing) {
       enc.scaleResolutionDownBy = CAMERA_SCALE_DOWN_WHILE_SHARING;
+      // Trade temporal detail, not more spatial detail. See the constant.
+      enc.maxFramerate = CAMERA_MAX_FRAMERATE_WHILE_SHARING;
     } else {
       delete enc.scaleResolutionDownBy;
+      delete enc.maxFramerate;
     }
 
     if (await this.setParametersSafely(sender, params, 'camera')) {
@@ -436,17 +596,63 @@ class WebRTCService {
     const codecs = RTCRtpSender.getCapabilities?.('video')?.codecs;
     if (!codecs?.length) return;
 
-    const isVp9 = (mime: string) => /\/vp9$/i.test(mime);
-    const vp9 = codecs.filter((c) => isVp9(c.mimeType));
-    if (vp9.length === 0) return; // nothing to promote — leave the order alone
+    /**
+     * AV1 is worth roughly 30% over VP9 and is the largest codec lever there
+     * is — but only where the encoder is in hardware. Apple Silicon has AV1
+     * DECODE only, so on this machine choosing AV1 means software libaom in
+     * realtime at 1080p, which trades a bandwidth limit for a CPU limit and
+     * makes the picture worse, not better. Opt-in, so it can be measured before
+     * it is trusted; useSenderHealth reports 'cpu-bound' if it goes wrong.
+     */
+    const wantsAv1 = readSetting('wt:codec') === 'av1';
+
+    const rank = (mime: string): number => {
+      if (wantsAv1 && /\/av01?$/i.test(mime)) return 0;
+      if (/\/vp9$/i.test(mime)) return 1;
+      return 2;
+    };
+
+    /**
+     * VP9 profile 0 ahead of the rest.
+     *
+     * The old filter promoted every VP9 entry while preserving the browser's
+     * own relative order, so a profile-2 entry (10-bit 4:2:0) listed first was
+     * what actually got offered — more CPU and more bits to carry content that
+     * is 8-bit anyway. A missing sdpFmtpLine is treated as profile 0, which is
+     * what browsers that omit it mean.
+     */
+    const isProfile0 = (c: RTCRtpCodec): boolean => {
+      const fmtp = c.sdpFmtpLine;
+      if (!fmtp) return true;
+      const match = /profile-id=(\d+)/.exec(fmtp);
+      return !match || match[1] === '0';
+    };
+
+    // Stable sort by rank, then profile — everything that is neither AV1 nor
+    // VP9 (RTX, RED, FEC, H.264) keeps its original relative order, so a
+    // browser without the preferred codecs is left exactly as it was.
+    const reordered = codecs
+      .map((codec, index) => ({ codec, index }))
+      .sort((a, b) => {
+        const byRank = rank(a.codec.mimeType) - rank(b.codec.mimeType);
+        if (byRank !== 0) return byRank;
+        const byProfile = Number(isProfile0(b.codec)) - Number(isProfile0(a.codec));
+        if (byProfile !== 0) return byProfile;
+        return a.index - b.index;
+      })
+      .map((entry) => entry.codec);
+
+    // Nothing worth promoting — leave the order alone rather than reshuffling
+    // into some guess at a preference.
+    if (reordered.every((c, i) => c === codecs[i])) return;
 
     try {
-      transceiver.setCodecPreferences([...vp9, ...codecs.filter((c) => !isVp9(c.mimeType))]);
-      logger.debug('[WebRTC] Screen share will offer VP9 first');
+      transceiver.setCodecPreferences(reordered);
+      logger.debug('[WebRTC] Screen share codec order:', reordered[0]?.mimeType);
     } catch (err) {
       // Not fatal in any way: we simply negotiate whatever the browser would
       // have negotiated on its own.
-      logger.debug('[WebRTC] setCodecPreferences(VP9) rejected:', err);
+      logger.debug('[WebRTC] setCodecPreferences rejected:', err);
     }
   }
 
@@ -467,19 +673,19 @@ class WebRTCService {
    *    down. The old `scaleResolutionDownBy = 1.0` forbade exactly that.
    *  - maxFramerate gives the encoder an explicit target instead of guessing.
    */
-  private applyVideoEncoding(params: RTCRtpSendParameters, preset: QualityPreset): void {
+  private applyVideoEncoding(params: RTCRtpSendParameters, point: OperatingPoint): void {
     if (!params.encodings || params.encodings.length === 0) {
       params.encodings = [{}];
     }
     const enc = params.encodings[0];
 
-    if (preset.video.bitrate > 0) {
-      enc.maxBitrate = preset.video.bitrate;
-    } else {
-      // 'auto' preset — no ceiling, let adaptive bitrate climb freely.
-      delete enc.maxBitrate;
-    }
-    enc.maxFramerate = preset.video.frameRate;
+    // Always finite. The old 'auto' path did `delete enc.maxBitrate`, leaving
+    // the encoder unbounded — which on a link slower than its ambition means
+    // overshoot, a standing queue in the pacer, and a picture that is soft and
+    // laggy at the same time. chooseOperatingPoint clamps 'auto' to
+    // AUTO_MAX_BITRATE instead, so there is nothing left to special-case here.
+    enc.maxBitrate = point.videoBps;
+    enc.maxFramerate = point.fps;
     // Allow the encoder to drop resolution to protect the frame rate.
     delete enc.scaleResolutionDownBy;
     // Unconditional: the old `'networkPriority' in enc` guard meant this only
@@ -494,11 +700,11 @@ class WebRTCService {
   }
 
   // Add screen share tracks to peer connection (after permission granted)
-  async addScreenShareTracks(stream: MediaStream, quality: ScreenShareQuality = 'high'): Promise<void> {
+  async addScreenShareTracks(stream: MediaStream, point: OperatingPoint): Promise<void> {
     try {
       this.screenStream = stream;
       this.screenStreamId = stream.id;
-      const preset = QualityPresets[quality];
+      this.currentPoint = point;
 
       // ADD screen share tracks as new transceivers (do NOT replace camera)
       if (this.peerConnection) {
@@ -520,19 +726,18 @@ class WebRTCService {
               if (track.kind === 'video') {
                 // Motion-optimized: maintain-framerate + maxFramerate, and
                 // crucially NO scaleResolutionDownBy pin (see applyVideoEncoding).
-                this.applyVideoEncoding(params, preset);
+                this.applyVideoEncoding(params, point);
                 // Before the renegotiation this addTrack triggers, so the codec
                 // order lands in the offer rather than needing a second one.
                 this.preferVp9(sender);
               } else if (track.kind === 'audio') {
-                // Use audio bitrate from quality preset
-                if (preset.audio.bitrate > 0) {
-                  params.encodings[0].maxBitrate = preset.audio.bitrate;
+                if (point.audioBps > 0) {
+                  params.encodings[0].maxBitrate = point.audioBps;
                 }
               }
 
               if (await this.setParametersSafely(sender, params, `screen ${track.kind}`)) {
-                logger.debug(`[WebRTC] Set ${track.kind} encoding (${quality}):`, params.encodings[0]);
+                logger.debug(`[WebRTC] Set ${track.kind} encoding:`, params.encodings[0]);
               }
             }
           } catch {
@@ -557,9 +762,9 @@ class WebRTCService {
   }
 
   // Legacy method - captures AND adds tracks (for direct sharing without peer)
-  async getDisplayMedia(quality: ScreenShareQuality = 'high'): Promise<{ stream: MediaStream; streamId: string; needsRenegotiation: boolean }> {
-    const { stream, streamId } = await this.captureScreen(quality);
-    await this.addScreenShareTracks(stream, quality);
+  async getDisplayMedia(point: OperatingPoint): Promise<{ stream: MediaStream; streamId: string; needsRenegotiation: boolean }> {
+    const { stream, streamId } = await this.captureScreen(point);
+    await this.addScreenShareTracks(stream, point);
     return { stream, streamId, needsRenegotiation: true };
   }
 
@@ -577,10 +782,11 @@ class WebRTCService {
    * justified solely when the captured *surface* changes — never for a
    * bitrate/framerate tweak (that re-prompts for permission and freezes the peer).
    */
-  async updateScreenShareQuality(quality: ScreenShareQuality): Promise<boolean> {
+  async updateScreenShareQuality(point: OperatingPoint): Promise<boolean> {
     if (!this.peerConnection || !this.screenStream) return false;
 
-    const preset = QualityPresets[quality];
+    const previous = this.currentPoint;
+    this.currentPoint = point;
 
     // Use the sender we kept at add time; fall back to a lookup only if that
     // reference went stale (e.g. after a track replace). Matching by exact
@@ -599,34 +805,50 @@ class WebRTCService {
     // Encoder ceiling + degradation strategy. Same helper as the initial add, so
     // a live switch and a fresh share end up byte-for-byte identical.
     const params = videoSender.getParameters();
-    this.applyVideoEncoding(params, preset);
+    this.applyVideoEncoding(params, point);
     // CRITICAL: a bitrate tweak failing must NOT cascade into
     // stop+getDisplayMedia+renegotiate — that re-prompts for screen permission
     // and freezes the viewer. setParametersSafely swallows the failure; the
     // stream keeps running, we just didn't move the cap.
     if (await this.setParametersSafely(videoSender, params, 'screen video')) {
-      logger.debug(`[WebRTC] updateScreenShareQuality video → ${quality}`, params.encodings[0]);
+      logger.debug('[WebRTC] updateScreenShareQuality video →', params.encodings[0]);
     }
 
-    // Best-effort framerate cap on the capture side. Partial browser support; a
-    // failure here is fine — the encoder cap above does the heavy lifting.
+    // Geometry AND frame rate, in ONE call.
+    //
+    // This used to re-apply frameRate alone, which is why a share that had once
+    // been clamped to 720p stayed 720p for the rest of the session no matter
+    // how far the ceiling was later raised: the capture track was never told it
+    // could grow again. One call and not two because applyConstraints replaces
+    // the entire constraint set — a frameRate-only call after a geometry call
+    // silently clears the geometry.
+    //
+    // Only when the geometry actually moved. Re-running applyConstraints on an
+    // unchanged size can make the capturer renegotiate its pipeline for nothing,
+    // and the bitrate above changes far more often than the resolution does.
+    const geometryChanged =
+      !previous ||
+      previous.width !== point.width ||
+      previous.height !== point.height ||
+      previous.fps !== point.fps;
+
     const videoTrack = this.screenStream.getVideoTracks()[0];
-    if (videoTrack) {
+    if (videoTrack && geometryChanged) {
       try {
-        await videoTrack.applyConstraints({ frameRate: { ideal: preset.video.frameRate, max: 60 } });
+        await videoTrack.applyConstraints(displayConstraintsFor(point));
       } catch (err) {
-        logger.debug('[WebRTC] applyConstraints(frameRate) not supported here:', err);
+        logger.debug('[WebRTC] applyConstraints(geometry) not supported here:', err);
       }
     }
 
     // Match the audio encoder cap if there's a screen-share audio track.
     const audioSender = this.screenAudioSender;
-    if (audioSender && audioSender.track && preset.audio.bitrate > 0) {
+    if (audioSender && audioSender.track && point.audioBps > 0) {
       const audioParams = audioSender.getParameters();
       if (!audioParams.encodings || audioParams.encodings.length === 0) {
         audioParams.encodings = [{}];
       }
-      audioParams.encodings[0].maxBitrate = preset.audio.bitrate;
+      audioParams.encodings[0].maxBitrate = point.audioBps;
       try {
         await audioSender.setParameters(audioParams);
       } catch (err) {
@@ -721,6 +943,7 @@ class WebRTCService {
     this.makingOffer = true;
     try {
       const offer = await this.peerConnection.createOffer({ iceRestart });
+      this.tuneOpus(offer);
       logger.debug('[WebRTC] Offer created, setting local description (this should trigger ICE gathering)');
       await this.peerConnection.setLocalDescription(offer);
       logger.debug('[WebRTC] Local description set, ICE gathering state:', this.peerConnection.iceGatheringState);
@@ -728,6 +951,36 @@ class WebRTCService {
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  /**
+   * Rewrite the Opus fmtp line on a local description, in place.
+   *
+   * Mutates rather than returning, because the caller must hand the SAME object
+   * to setLocalDescription — a rebuilt RTCSessionDescriptionInit loses nothing
+   * here, but keeping one object makes it impossible to accidentally set the
+   * untuned original.
+   *
+   * Best-effort by construction: applyOpusOptions returns the input unchanged
+   * on anything it does not recognise, so the worst case is that we negotiate
+   * exactly what the browser would have negotiated on its own.
+   */
+  private tuneOpus(description: RTCSessionDescriptionInit): void {
+    if (!description.sdp) return;
+    const tuned = applyOpusOptions(description.sdp, OPUS_OPTIONS);
+
+    // The Worker silently DROPS a signalling frame whose SDP exceeds
+    // MAX_SDP_LENGTH (30,000 chars) — no error frame, no close code, the offer
+    // simply never arrives and the call hangs with no diagnosis. This edit only
+    // adds a few dozen characters, but it is the one change here that grows the
+    // SDP at all, so it is the one that has to watch the ceiling.
+    if (tuned.length > SDP_WARN_LENGTH) {
+      logger.warn(
+        `[WebRTC] SDP is ${tuned.length} chars, approaching the worker's 30000 limit ` +
+          '— frames over the limit are dropped silently.',
+      );
+    }
+    description.sdp = tuned;
   }
 
   async createIceRestartOffer(): Promise<string> {
@@ -747,6 +1000,7 @@ class WebRTCService {
     })));
 
     const answer = await this.peerConnection.createAnswer();
+    this.tuneOpus(answer);
     logger.debug('[WebRTC] Answer created, setting local description (this should trigger ICE gathering)');
     await this.peerConnection.setLocalDescription(answer);
     logger.debug('[WebRTC] Local description set, ICE gathering state:', this.peerConnection.iceGatheringState);
@@ -885,6 +1139,138 @@ class WebRTCService {
     return this.peerConnection.getStats();
   }
 
+  /**
+   * Which path the media is actually taking: direct, reflexive, or relayed.
+   *
+   * Reads `transport.selectedCandidatePairId` first — that is the authoritative
+   * answer where it exists — and falls back to scanning for the nominated
+   * succeeded pair on browsers that do not publish a transport report.
+   *
+   * Returns null rather than guessing when no pair has been selected yet. Same
+   * discipline as readOutgoingBitrate in useUplinkEstimate: a fabricated answer
+   * here would be worse than none, because the whole point of this method is to
+   * be trusted when it says "you are relayed".
+   */
+  async getTransportPath(): Promise<TransportPath | null> {
+    const stats = await this.getStats();
+    if (!stats) return null;
+
+    type PairReport = RTCStats & {
+      selected?: boolean;
+      nominated?: boolean;
+      state?: string;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+      currentRoundTripTime?: number;
+    };
+    type CandidateReport = RTCStats & {
+      candidateType?: string;
+      protocol?: string;
+      relayProtocol?: string;
+    };
+
+    let selectedId: string | undefined;
+    let fallbackPair: PairReport | undefined;
+
+    stats.forEach((report) => {
+      if (report.type === 'transport') {
+        const t = report as RTCStats & { selectedCandidatePairId?: string };
+        if (t.selectedCandidatePairId) selectedId = t.selectedCandidatePairId;
+      } else if (report.type === 'candidate-pair') {
+        const pair = report as PairReport;
+        if (pair.state !== 'succeeded') return;
+        // Prefer a pair the browser marks selected/nominated, but keep any
+        // succeeded pair rather than returning nothing.
+        if (!fallbackPair || pair.nominated || pair.selected) fallbackPair = pair;
+      }
+    });
+
+    const pair = (selectedId ? (stats.get(selectedId) as PairReport | undefined) : undefined) ?? fallbackPair;
+    if (!pair) return null;
+
+    const local = pair.localCandidateId
+      ? (stats.get(pair.localCandidateId) as CandidateReport | undefined)
+      : undefined;
+    const remote = pair.remoteCandidateId
+      ? (stats.get(pair.remoteCandidateId) as CandidateReport | undefined)
+      : undefined;
+    if (!local || !remote) return null;
+
+    const kind = (v: string | undefined): IceCandidateKind =>
+      v === 'relay' || v === 'srflx' || v === 'prflx' ? v : 'host';
+    const localKind = kind(local.candidateType);
+    const remoteKind = kind(remote.candidateType);
+
+    return {
+      local: localKind,
+      remote: remoteKind,
+      protocol: local.protocol ?? 'udp',
+      relayProtocol: local.relayProtocol,
+      isRelayed: localKind === 'relay' || remoteKind === 'relay',
+      rttMs:
+        typeof pair.currentRoundTripTime === 'number'
+          ? Math.round(pair.currentRoundTripTime * 1000)
+          : null,
+    };
+  }
+
+  /**
+   * What the screen-share encoder is actually producing.
+   *
+   * Scoped through the *sender's* own getStats() rather than filtering the
+   * connection-wide report: with a share running there are two outbound video
+   * streams, and picking the right one by byte volume (as useQualityMonitor has
+   * to do on the receive side) is a heuristic. The sender knows which SSRC is
+   * its own, so ask it.
+   */
+  async getOutboundScreenStats(): Promise<OutboundScreenStats | null> {
+    const sender = this.screenVideoSender;
+    if (!sender || typeof sender.getStats !== 'function') return null;
+
+    let report: RTCStatsReport;
+    try {
+      report = await sender.getStats();
+    } catch {
+      return null;
+    }
+
+    type OutboundReport = RTCStats & {
+      kind?: string;
+      frameWidth?: number;
+      frameHeight?: number;
+      framesPerSecond?: number;
+      targetBitrate?: number;
+      qualityLimitationReason?: string;
+      encoderImplementation?: string;
+      totalEncodeTime?: number;
+      framesEncoded?: number;
+    };
+
+    let found: OutboundReport | null = null;
+    report.forEach((r) => {
+      if (r.type === 'outbound-rtp' && (r as OutboundReport).kind === 'video') {
+        found = r as OutboundReport;
+      }
+    });
+    if (!found) return null;
+
+    const o: OutboundReport = found;
+    const reason = o.qualityLimitationReason;
+    return {
+      frameWidth: o.frameWidth ?? null,
+      frameHeight: o.frameHeight ?? null,
+      framesPerSecond: o.framesPerSecond ?? null,
+      targetBitrate: o.targetBitrate ?? null,
+      qualityLimitationReason:
+        reason === 'none' || reason === 'cpu' || reason === 'bandwidth' || reason === 'other'
+          ? reason
+          : null,
+      encoderImplementation: o.encoderImplementation ?? null,
+      totalEncodeTime: o.totalEncodeTime ?? null,
+      framesEncoded: o.framesEncoded ?? null,
+    };
+  }
+
   close(): void {
     if (this.disconnectTimer) {
       clearTimeout(this.disconnectTimer);
@@ -902,6 +1288,7 @@ class WebRTCService {
     this.screenVideoSender = null;
     this.screenAudioSender = null;
     this.cameraVideoSender = null;
+    this.micAudioSender = null;
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];

@@ -3,10 +3,14 @@ import {
   FakeMediaStream,
   FakeMediaStreamTrack,
   FakePeerConnection,
+  stubDisplayMedia,
   type FakeRtpSender,
 } from './testDoubles';
 import { webrtcService } from './webrtcService';
-import { QUALITY_PRESETS } from '../types';
+import { chooseOperatingPoint } from '../hooks/operatingPoint';
+
+/** A concrete operating point, standing in for whatever the link measured. */
+const POINT = chooseOperatingPoint(4_000_000, 'motion', 'medium');
 
 /**
  * The camera must never outbid the screen share for uplink.
@@ -83,7 +87,7 @@ describe('webrtcService uplink budget', () => {
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
 
     const camera = senderFor(pc, 'cam-v');
@@ -92,7 +96,7 @@ describe('webrtcService uplink budget', () => {
     // The requirement: the shared screen gets the budget, not the thumbnail.
     // Measured failure was the exact inverse — 1700 kbps vs 600 kbps.
     expect(camera.maxBitrate).toBeLessThan(screen.maxBitrate!);
-    expect(screen.maxBitrate).toBe(QUALITY_PRESETS.medium.video.bitrate);
+    expect(screen.maxBitrate).toBe(POINT.videoBps);
     // Reinforce the cap with allocator priority, so Chrome drains the camera
     // first when the estimate drops rather than splitting the loss evenly.
     expect(camera.networkPriority).toBe('low');
@@ -102,7 +106,7 @@ describe('webrtcService uplink budget', () => {
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
     const whileSharing = senderFor(pc, 'cam-v').maxBitrate!;
 
@@ -119,7 +123,7 @@ describe('webrtcService uplink budget', () => {
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
 
     // Holding 640x480 inside a 150 kbps ceiling spends the budget on noise.
@@ -155,7 +159,7 @@ describe('webrtcService screen share codec', () => {
 
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
 
     const offered = pc.transceiverFor('scr-v').codecPreferences;
@@ -176,11 +180,55 @@ describe('webrtcService screen share codec', () => {
 
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
 
     // Untouched, not reordered into some guess at a preference.
     expect(pc.transceiverFor('scr-v').codecPreferences).toBeNull();
+  });
+
+  it('offers VP9 profile 0 ahead of profile 2', async () => {
+    // The old filter promoted every VP9 entry while preserving the browser's
+    // own order, so a profile-2 (10-bit 4:2:0) entry listed first was what
+    // actually got offered — more CPU and more bits to carry 8-bit content.
+    vi.stubGlobal('RTCRtpSender', {
+      getCapabilities: () => ({
+        codecs: [
+          { mimeType: 'video/VP8' },
+          { mimeType: 'video/VP9', sdpFmtpLine: 'profile-id=2' },
+          { mimeType: 'video/VP9', sdpFmtpLine: 'profile-id=0' },
+        ],
+      }),
+    });
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      POINT,
+    );
+
+    const offered = pc.transceiverFor('scr-v').codecPreferences;
+    expect(offered?.[0]?.sdpFmtpLine).toBe('profile-id=0');
+    expect(offered?.[1]?.sdpFmtpLine).toBe('profile-id=2');
+  });
+
+  it('applies the bitrate ceiling even when localStorage is unusable', async () => {
+    // A `typeof localStorage !== 'undefined'` guard is not enough — the object
+    // can exist while getItem does not, and privacy settings can make it throw.
+    // This matters because codec selection runs inside the same try block as
+    // setParameters: a throw there silently leaves the share UNCAPPED, which is
+    // the exact failure the encoder ceiling exists to prevent.
+    vi.stubGlobal('localStorage', {});
+    stubCodecs(['video/VP8', 'video/VP9']);
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      POINT,
+    );
+
+    expect(senderFor(pc, 'scr-v').maxBitrate).toBe(POINT.videoBps);
+    expect(pc.transceiverFor('scr-v').codecPreferences?.[0]?.mimeType).toBe('video/VP9');
   });
 
   it('still applies the bitrate ceiling when codec capabilities are missing', async () => {
@@ -191,13 +239,168 @@ describe('webrtcService screen share codec', () => {
 
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
 
-    expect(senderFor(pc, 'scr-v').maxBitrate).toBe(QUALITY_PRESETS.medium.video.bitrate);
-    expect(senderFor(pc, 'cam-v').maxBitrate).toBeLessThan(
-      QUALITY_PRESETS.medium.video.bitrate,
-    );
+    expect(senderFor(pc, 'scr-v').maxBitrate).toBe(POINT.videoBps);
+    expect(senderFor(pc, 'cam-v').maxBitrate).toBeLessThan(POINT.videoBps);
+  });
+});
+
+/**
+ * Capture geometry.
+ *
+ * captureScreen had no coverage at all, which is how it shipped requesting
+ * `max: 3840/2160/60` for every preset regardless of what was chosen — on a 4K
+ * desktop the track then arrives at 3840x2160 and Chrome's quality scaler steps
+ * 2160 -> 1440 -> 1080 -> 720, so any pressure lands two steps below 1080p and
+ * every frame pays a 4K->1080 downscale before it reaches the encoder.
+ */
+describe('webrtcService capture geometry', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    pc = await freshService();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(globalThis.navigator, 'mediaDevices');
+  });
+
+  it('pins capture to the chosen operating point, not to 4K', async () => {
+    const { calls } = stubDisplayMedia(screenStream());
+
+    await webrtcService.captureScreen(chooseOperatingPoint(2_300_000, 'film'));
+
+    const video = calls[0].video as MediaTrackConstraints;
+    expect(video.width).toEqual({ ideal: 1920, max: 1920 });
+    expect(video.height).toEqual({ ideal: 1080, max: 1080 });
+    // Film is 24 fps at source; asking for 30 divides the budget over 25% more
+    // frames than carry any information.
+    expect(video.frameRate).toEqual({ ideal: 24, max: 24 });
+  });
+
+  it('still allows 4K60 when the ceiling and the budget both permit it', async () => {
+    // Proves the constraint is derived from the point rather than hardcoded.
+    const { calls } = stubDisplayMedia(screenStream());
+
+    await webrtcService.captureScreen(chooseOperatingPoint(28_000_000, 'games', 'extreme'));
+
+    const video = calls[0].video as MediaTrackConstraints;
+    expect(video.width).toEqual({ ideal: 3840, max: 3840 });
+    expect(video.frameRate).toEqual({ ideal: 60, max: 60 });
+  });
+
+  it('never offers this app\'s own tab as a share target', async () => {
+    const { calls } = stubDisplayMedia(screenStream());
+    await webrtcService.captureScreen(chooseOperatingPoint(2_000_000, 'film'));
+    // Cast: the DOM lib bundled here predates selfBrowserSurface/surfaceSwitching.
+    const options = calls[0] as DisplayMediaStreamOptions & { selfBrowserSurface?: string };
+    expect(options.selfBrowserSurface).toBe('exclude');
+  });
+
+  it('restores full resolution when the operating point grows again', async () => {
+    // The stuck-at-720p bug, end to end. updateScreenShareQuality re-applied
+    // ONLY frameRate, so a track once clamped small stayed small for the rest
+    // of the session no matter how far the ceiling was later raised.
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const small = chooseOperatingPoint(1_000_000, 'film');
+    expect(small.height).toBe(720); // precondition: the budget really did clamp it
+
+    const { stream: captured } = await webrtcService.captureScreen(small);
+    await webrtcService.addScreenShareTracks(captured, small);
+
+    const track = stream.getVideoTracks()[0];
+    await webrtcService.updateScreenShareQuality(chooseOperatingPoint(2_300_000, 'film'));
+
+    // Geometry AND frame rate, in one call — a second applyConstraints replaces
+    // the whole set, so a frameRate-only call would silently clear the geometry.
+    expect(track.lastConstraints).toEqual({
+      width: { ideal: 1920, max: 1920 },
+      height: { ideal: 1080, max: 1080 },
+      frameRate: { ideal: 24, max: 24 },
+    });
+  });
+
+  it('does not touch the capturer for a bitrate-only change', async () => {
+    // The bitrate moves far more often than the resolution does — a wobbling
+    // estimate every three seconds must not make the capturer renegotiate its
+    // pipeline for a picture that is the same size it already was.
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const point = chooseOperatingPoint(2_300_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(point);
+    await webrtcService.addScreenShareTracks(captured, point);
+
+    const track = stream.getVideoTracks()[0];
+    track.constraints.length = 0;
+
+    // Same geometry, slightly different budget.
+    const nudged = { ...point, videoBps: point.videoBps - 25_000 };
+    await webrtcService.updateScreenShareQuality(nudged);
+
+    expect(track.constraints).toHaveLength(0);
+    // The encoder ceiling still moved, though.
+    expect(senderFor(pc, 'scr-v').maxBitrate).toBe(nudged.videoBps);
+  });
+
+  it('re-asserts geometry after the user switches shared surface', async () => {
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const point = chooseOperatingPoint(2_300_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(point);
+    await webrtcService.addScreenShareTracks(captured, point);
+
+    const track = stream.getVideoTracks()[0];
+    track.constraints.length = 0;
+    // surfaceSwitching lets the user change what they share mid-stream; the new
+    // surface arrives with the browser's own settings and our pinning gone.
+    track.emit('configurationchange');
+    await Promise.resolve();
+
+    expect(track.lastConstraints).toMatchObject({ width: { max: 1920 } });
+    expect(track.contentHint).toBe('motion');
+  });
+});
+
+/**
+ * The microphone had no ceiling and no line in any budget — attachLocalStream
+ * recorded the video sender and dropped the audio one on the floor.
+ */
+describe('webrtcService mic budget', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    pc = await freshService();
+  });
+
+  it('caps the mic and keeps it below the screen share', async () => {
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+
+    const mic = senderFor(pc, 'cam-a');
+    expect(mic.maxBitrate).toBeGreaterThan(0);
+    expect(mic.maxBitrate).toBeLessThan(senderFor(pc, 'scr-v').maxBitrate!);
+    // Voice is the last thing that should break: a call where the picture
+    // softens is still a call.
+    expect(mic.networkPriority).toBe('high');
+  });
+
+  it('buys the camera back from frame rate rather than shrinking it further', async () => {
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+
+    const camera = senderFor(pc, 'cam-v');
+    // A corner thumbnail is a near-static talking head; temporal detail is the
+    // first thing nobody is looking at once there is a film next to it.
+    expect(camera.maxFramerate).toBeLessThanOrEqual(10);
+
+    await webrtcService.stopScreenShare();
+    expect(senderFor(pc, 'cam-v').maxFramerate).toBeUndefined();
   });
 });
 
@@ -244,7 +447,7 @@ describe('webrtcService camera sender identity', () => {
 
     await webrtcService.addScreenShareTracks(
       screenStream() as unknown as MediaStream,
-      'medium',
+      POINT,
     );
     return { camera, screen: senderFor(pc, 'scr-v') };
   }
