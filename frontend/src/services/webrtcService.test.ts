@@ -3,6 +3,7 @@ import {
   FakeMediaStream,
   FakeMediaStreamTrack,
   FakePeerConnection,
+  fakeStatsReport,
   stubDisplayMedia,
   type FakeRtpSender,
 } from './testDoubles';
@@ -475,5 +476,96 @@ describe('webrtcService camera sender identity', () => {
     expect(applied).toBe(true);
     expect(screen.track?.id).toBe('scr-v');
     expect(camera.track?.id).toBe('blur-v');
+  });
+});
+
+/*
+ * Observed on a real session (chrome://webrtc-internals, 2026-08-07), sharer
+ * side, with a camera up alongside the share:
+ *
+ *   outbound-rtp (kind=video, mid=4, frameHeight=1078, VP9 profile-id=0)  <- screen
+ *   outbound-rtp (kind=video, mid=1, frameHeight=240,  VP8)               <- camera
+ *
+ * The diagnostics line was blank for the whole session and useSenderHealth —
+ * the control loop's only input — saw nothing, so the operating point never
+ * adapted. Two outbound video streams is the normal case, not the edge case.
+ */
+describe('webrtcService outbound screen stats', () => {
+  let pc: FakePeerConnection;
+
+  const screenRtp = {
+    id: 'OT01V-screen',
+    type: 'outbound-rtp',
+    kind: 'video',
+    mediaSourceId: 'MS-screen',
+    frameWidth: 1920,
+    frameHeight: 1078,
+    framesPerSecond: 24,
+    targetBitrate: 1_900_000,
+    qualityLimitationReason: 'none',
+    encoderImplementation: 'libvpx',
+  };
+  const cameraRtp = {
+    id: 'OT01V-camera',
+    type: 'outbound-rtp',
+    kind: 'video',
+    mediaSourceId: 'MS-camera',
+    frameWidth: 320,
+    frameHeight: 240,
+    framesPerSecond: 8,
+    targetBitrate: 64_000,
+    qualityLimitationReason: 'none',
+  };
+  const sources = [
+    { id: 'MS-screen', type: 'media-source', trackIdentifier: 'scr-v' },
+    { id: 'MS-camera', type: 'media-source', trackIdentifier: 'cam-v' },
+  ];
+
+  beforeEach(async () => {
+    pc = await freshService();
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+  });
+
+  it('reports the screen, not the camera, when both are sending', async () => {
+    senderFor(pc, 'scr-v').stats = fakeStatsReport([screenRtp, cameraRtp, ...sources]);
+
+    const stats = await webrtcService.getOutboundScreenStats();
+
+    expect(stats?.frameHeight).toBe(1078);
+    expect(stats?.targetBitrate).toBe(1_900_000);
+  });
+
+  it('falls back to the connection report when the sender reference is stale', async () => {
+    // A stale sender is indistinguishable from a healthy one until you ask it
+    // for stats and get nothing back. Returning null there is what blanked the
+    // readout and starved the control loop.
+    senderFor(pc, 'scr-v').stats = fakeStatsReport([]);
+    pc.stats = fakeStatsReport([screenRtp, cameraRtp, ...sources]);
+
+    const stats = await webrtcService.getOutboundScreenStats();
+
+    expect(stats?.frameHeight).toBe(1078);
+    expect(stats?.qualityLimitationReason).toBe('none');
+  });
+
+  it('prefers the larger picture when the report omits the media-source link', async () => {
+    senderFor(pc, 'scr-v').stats = fakeStatsReport([
+      { ...screenRtp, mediaSourceId: undefined },
+      { ...cameraRtp, mediaSourceId: undefined },
+    ]);
+
+    const stats = await webrtcService.getOutboundScreenStats();
+
+    expect(stats?.frameHeight).toBe(1078);
+  });
+
+  it('reports nothing rather than guessing when there is no video at all', async () => {
+    senderFor(pc, 'scr-v').stats = fakeStatsReport([
+      { id: 'OT01A', type: 'outbound-rtp', kind: 'audio' },
+    ]);
+    pc.stats = fakeStatsReport([]);
+
+    expect(await webrtcService.getOutboundScreenStats()).toBeNull();
   });
 });

@@ -201,9 +201,16 @@ export function MediaControls({
                         {diagnostics.path.rttMs !== null && ` · ${diagnostics.path.rttMs} ms`}
                       </div>
                     )}
-                    {diagnostics?.outbound?.frameWidth != null && (
+                    {/* Per-field guards, not one gate on frameWidth: a report
+                        missing the geometry still carries a bitrate worth
+                        seeing, and an all-or-nothing gate made a partial
+                        reading indistinguishable from no connection at all. */}
+                    {diagnostics?.outbound && (
                       <div>
-                        sending: {diagnostics.outbound.frameWidth}×{diagnostics.outbound.frameHeight}
+                        sending:{' '}
+                        {diagnostics.outbound.frameWidth != null
+                          ? `${diagnostics.outbound.frameWidth}×${diagnostics.outbound.frameHeight}`
+                          : '—'}
                         {diagnostics.outbound.framesPerSecond != null &&
                           ` @ ${Math.round(diagnostics.outbound.framesPerSecond)}`}
                         {diagnostics.outbound.targetBitrate != null &&

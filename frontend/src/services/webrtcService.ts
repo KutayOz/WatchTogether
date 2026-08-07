@@ -127,6 +127,24 @@ function readSetting(key: string): string | null {
  */
 const OPUS_OPTIONS = { dtx: true, fec: true } as const;
 
+/**
+ * The subset of `outbound-rtp` this app reads. Module-scope rather than local
+ * to one method because two of them now share it, and a second hand-written
+ * copy is how the two drift apart.
+ */
+type OutboundReport = RTCStats & {
+  kind?: string;
+  mediaSourceId?: string;
+  frameWidth?: number;
+  frameHeight?: number;
+  framesPerSecond?: number;
+  targetBitrate?: number;
+  qualityLimitationReason?: string;
+  encoderImplementation?: string;
+  totalEncodeTime?: number;
+  framesEncoded?: number;
+};
+
 export type WebRTCEventHandlers = {
   onTrack?: (event: RTCTrackEvent) => void;
   onIceCandidate?: (candidate: RTCIceCandidate) => void;
@@ -788,18 +806,11 @@ class WebRTCService {
     const previous = this.currentPoint;
     this.currentPoint = point;
 
-    // Use the sender we kept at add time; fall back to a lookup only if that
-    // reference went stale (e.g. after a track replace). Matching by exact
-    // track.id alone — the old behavior — could miss and wrongly report
-    // "nothing live", dropping the caller into a disruptive recapture.
-    let videoSender = this.screenVideoSender;
-    if (!videoSender || !videoSender.track || videoSender.track.readyState === 'ended') {
-      const vt = this.screenStream.getVideoTracks()[0];
-      videoSender =
-        this.peerConnection
-          .getSenders()
-          .find((s) => s.track && vt && (s.track.id === vt.id || s.track === vt)) ?? null;
-    }
+    // Shared with getOutboundScreenStats: one resolver, so a stale reference
+    // cannot be handled in one place and ignored in the other. Wrongly
+    // reporting "nothing live" here would drop the caller into a disruptive
+    // recapture.
+    const videoSender = this.resolveScreenVideoSender();
     if (!videoSender) return false; // genuinely no live screen video sender
 
     // Encoder ceiling + degradation strategy. Same helper as the initial add, so
@@ -1215,43 +1226,97 @@ class WebRTCService {
   }
 
   /**
-   * What the screen-share encoder is actually producing.
+   * Locate the live screen-share video sender.
    *
-   * Scoped through the *sender's* own getStats() rather than filtering the
-   * connection-wide report: with a share running there are two outbound video
-   * streams, and picking the right one by byte volume (as useQualityMonitor has
-   * to do on the receive side) is a heuristic. The sender knows which SSRC is
-   * its own, so ask it.
+   * `screenVideoSender` is recorded once, at addTrack time. A track replace or
+   * a connection rebuild can leave it stale — pointing at a sender whose stats
+   * report comes back empty. updateScreenShareQuality already fell back to a
+   * lookup for exactly that reason; getOutboundScreenStats did not, and just
+   * reported "no encoder" instead. That asymmetry is why the diagnostics line
+   * went blank on a share that was demonstrably sending: null there also
+   * starves useSenderHealth, which is the control loop's ONLY input, so the
+   * whole thing quietly stopped adapting.
    */
-  async getOutboundScreenStats(): Promise<OutboundScreenStats | null> {
-    const sender = this.screenVideoSender;
-    if (!sender || typeof sender.getStats !== 'function') return null;
+  private resolveScreenVideoSender(): RTCRtpSender | null {
+    const recorded = this.screenVideoSender;
+    if (recorded?.track && recorded.track.readyState !== 'ended') return recorded;
+    if (!this.peerConnection || !this.screenStream) return recorded ?? null;
 
-    let report: RTCStatsReport;
-    try {
-      report = await sender.getStats();
-    } catch {
-      return null;
-    }
+    const vt = this.screenStream.getVideoTracks()[0];
+    if (!vt) return recorded ?? null;
 
-    type OutboundReport = RTCStats & {
-      kind?: string;
-      frameWidth?: number;
-      frameHeight?: number;
-      framesPerSecond?: number;
-      targetBitrate?: number;
-      qualityLimitationReason?: string;
-      encoderImplementation?: string;
-      totalEncodeTime?: number;
-      framesEncoded?: number;
-    };
+    const found =
+      this.peerConnection
+        .getSenders()
+        .find((s) => s.track && (s.track.id === vt.id || s.track === vt)) ?? null;
+    // Re-record so the next poll skips the search.
+    if (found) this.screenVideoSender = found;
+    return found ?? recorded ?? null;
+  }
 
-    let found: OutboundReport | null = null;
+  /**
+   * Pick the screen share's outbound-rtp out of a stats report.
+   *
+   * With a share running there are TWO outbound video streams — the screen and
+   * the camera thumbnail — so "the video one" is not a selector. Prefer the
+   * exact link (media-source.trackIdentifier), because it is the only
+   * non-heuristic way to tie an RTP stream back to the track feeding it, and
+   * fall back to the larger picture only when the report omits that link.
+   */
+  private pickOutboundVideo(
+    report: RTCStatsReport,
+    track: MediaStreamTrack | null,
+  ): OutboundReport | null {
+    const candidates: OutboundReport[] = [];
     report.forEach((r) => {
       if (r.type === 'outbound-rtp' && (r as OutboundReport).kind === 'video') {
-        found = r as OutboundReport;
+        candidates.push(r as OutboundReport);
       }
     });
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    if (track) {
+      for (const c of candidates) {
+        if (!c.mediaSourceId) continue;
+        const src = report.get(c.mediaSourceId) as { trackIdentifier?: string } | undefined;
+        if (src?.trackIdentifier === track.id) return c;
+      }
+    }
+
+    const area = (o: OutboundReport) => (o.frameWidth ?? 0) * (o.frameHeight ?? 0);
+    return candidates.reduce((a, b) => (area(b) > area(a) ? b : a));
+  }
+
+  /**
+   * What the screen-share encoder is actually producing.
+   *
+   * Asks the sender first — it knows its own SSRC — but falls through to the
+   * connection-wide report when that comes back empty, which is what a stale
+   * sender reference looks like from here.
+   */
+  async getOutboundScreenStats(): Promise<OutboundScreenStats | null> {
+    const sender = this.resolveScreenVideoSender();
+    const track = this.screenStream?.getVideoTracks()[0] ?? null;
+
+    let found: OutboundReport | null = null;
+
+    if (sender && typeof sender.getStats === 'function') {
+      try {
+        found = this.pickOutboundVideo(await sender.getStats(), track);
+      } catch {
+        found = null;
+      }
+    }
+
+    if (!found && this.peerConnection) {
+      try {
+        found = this.pickOutboundVideo(await this.peerConnection.getStats(), track);
+      } catch {
+        found = null;
+      }
+    }
+
     if (!found) return null;
 
     const o: OutboundReport = found;
