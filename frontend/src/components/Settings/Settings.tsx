@@ -23,6 +23,14 @@ import {
  *
  * The "Add" button is the only interactive entry into adding credentials;
  * everything else is observation + remove.
+ *
+ * Passwords are deliberately absent from this screen. They can be set at signup
+ * and replaced through a root-issued reset link, but there is no
+ * set/change/remove card here yet — so a password is invisible from this page,
+ * and the only sign of one is that removing your last passkey may be allowed
+ * when you would expect it not to be. The server enforces the real rule (at
+ * least one credential of any kind must remain, see db/signInMethods.ts) and
+ * returns its own message when it refuses.
  */
 export function Settings() {
   const [items, setItems] = useState<PasskeyListItem[] | null>(null);
@@ -116,7 +124,7 @@ export function Settings() {
               passkeys
             </SectionTitle>
             <p className="hand" style={{ fontSize: 18, marginTop: 8, color: 'rgba(26,20,23,0.7)' }}>
-              passwordless sign-in via Touch ID, Windows Hello, or a security key.
+              sign in with Touch ID, Windows Hello, or a security key — nothing to remember.
             </p>
 
             {success && (

@@ -55,6 +55,20 @@ type = "ratelimit"
 namespace_id = "1003"
 simple = { limit = 60, period = 60 }
 
+# Password sign-in, signup and reset. Tighter than RL_AUTH because a password
+# attempt is one request where a passkey ceremony is two, and because this is
+# the only endpoint in the app where guessing is a strategy at all. Its own
+# bucket rather than sharing RL_AUTH so somebody fumbling a password cannot
+# rate-limit themselves out of the passkey path as well.
+#
+# The precise gate is the per-account lockout in password_credentials; this is
+# the coarse net that bounds a distributed attack the lockout cannot see.
+[[unsafe.bindings]]
+name = "RL_PASSWORD"
+type = "ratelimit"
+namespace_id = "1004"
+simple = { limit = 15, period = 60 }
+
 # Nightly housekeeping: sweep expired deny-list entries and return invite
 # slots held by unused links. Replaces Mongo's TTL indexes, which D1 lacks.
 [triggers]

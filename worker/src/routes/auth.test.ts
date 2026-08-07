@@ -1,7 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import schema from "../../migrations/0001_init.sql?raw";
-import { applySchema } from "../db/testSchema";
+import { resetDatabase } from "../db/testSchema";
 import { AUTH_COOKIE } from "../lib/cookies";
 import { issueToken } from "../lib/jwt";
 import { TERMS_VERSION } from "../lib/terms";
@@ -38,12 +37,7 @@ const request = (path: string, init: RequestInit = {}, cookie?: string) =>
 
 beforeEach(async () => {
   currentIp++;
-  await db.batch(
-    ["admin_audit_log", "revoked_tokens", "invitation_links", "passkey_credentials", "users"].map(
-      (table) => db.prepare(`DROP TABLE IF EXISTS ${table}`),
-    ),
-  );
-  await applySchema(db, schema);
+  await resetDatabase(db);
 });
 
 interface SignedIn {

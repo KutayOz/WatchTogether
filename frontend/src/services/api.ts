@@ -4,6 +4,8 @@ import { apiError, readJson } from './http';
 import type {
   LoginResponse,
   PasskeyListItem,
+  PasswordCredential,
+  PasswordResetStatus,
   MeResponse,
   IceServerConfig,
   SessionValidation,
@@ -83,18 +85,17 @@ export const api = {
 
   // ────────────────── Passkeys ──────────────────
   //
-  // The only way in. Passwords and Google sign-in are gone: BCrypt at work
-  // factor 12 costs ~400ms against the Workers free plan's 10ms CPU budget, so
-  // passwords were not portable, and dropping Google removes an account-linking
-  // surface the invite model does not need.
+  // The recommended way in, and for a long time the only one. Google sign-in is
+  // gone for good — it was an account-linking surface the invite model does not
+  // need — but passwords came back; see the section below for how.
 
   /**
    * Start creating an account from an invite.
    *
    * Anonymous, unlike the .NET original where both registration endpoints were
    * [Authorize] — a passkey could only ever be *added* to an account that
-   * already existed via password. With passwords gone, an invitee holding
-   * nothing but a link has to be able to create the account itself.
+   * already existed via password. An invitee holding nothing but a link has to
+   * be able to create the account itself.
    */
   async passkeyBeginInviteRegistration(inviteToken: string, username: string): Promise<unknown> {
     const response = await publicFetch(`${API_URL}/api/auth/passkey/register/begin`, {
@@ -168,11 +169,89 @@ export const api = {
     if (!response.ok) throw await apiError(response, 'Failed to remove passkey');
   },
 
+  // ────────────────── Passwords ──────────────────
+  //
+  // Every method here takes a `clientKey`, never a password. The browser
+  // stretches the password with PBKDF2 before anything is sent — see
+  // hooks/usePasswordField.ts and @shared/password for why — so this module
+  // stays what it has always been: transport, holding no credential logic of
+  // its own, the same way it never touches @simplewebauthn/browser.
+  //
+  // If you find yourself adding a `password` parameter to one of these, the
+  // derivation has been skipped and the plaintext is about to go over the wire.
+
+  async passwordSignup(
+    inviteToken: string,
+    username: string,
+    credential: PasswordCredential,
+  ): Promise<LoginResponse> {
+    const response = await publicFetch(`${API_URL}/api/auth/password/signup`, {
+      method: 'POST',
+      body: JSON.stringify({ inviteToken, username, ...credential }),
+    });
+    if (!response.ok) throw await apiError(response, 'Registration failed');
+    return readJson(response, 'Registration failed');
+  },
+
+  /** Takes the full `name#1234` handle — a bare username is ambiguous. */
+  async passwordLogin(tag: string, credential: PasswordCredential): Promise<LoginResponse> {
+    const response = await publicFetch(`${API_URL}/api/auth/password/login`, {
+      method: 'POST',
+      body: JSON.stringify({ tag, ...credential }),
+    });
+    if (!response.ok) throw await apiError(response, 'Sign-in failed');
+    return readJson(response, 'Sign-in failed');
+  },
+
+  /**
+   * Check a reset link before asking for a new password.
+   *
+   * Returns the username on success because the client cannot derive a key
+   * without it — it is the salt.
+   */
+  async passwordResetStatus(token: string): Promise<PasswordResetStatus> {
+    const response = await publicFetch(
+      `${API_URL}/api/auth/password/reset/${encodeURIComponent(token)}`,
+    );
+    if (!response.ok) throw await apiError(response, 'Failed to check that reset link');
+    return readJson(response, 'Failed to check that reset link');
+  },
+
+  async passwordResetComplete(
+    token: string,
+    credential: PasswordCredential,
+  ): Promise<LoginResponse> {
+    const response = await publicFetch(`${API_URL}/api/auth/password/reset`, {
+      method: 'POST',
+      body: JSON.stringify({ token, ...credential }),
+    });
+    if (!response.ok) throw await apiError(response, 'Could not set that password');
+    return readJson(response, 'Could not set that password');
+  },
+
+  /**
+   * Root only. Mints a single-use link, shown once and never recoverable.
+   *
+   * The only recovery path there is: no email address exists anywhere in this
+   * system, so a forgotten password cannot be self-served. It also works on an
+   * account that has never had a password, which is how a passkey-only user
+   * gets one.
+   */
+  async adminResetPassword(userId: string): Promise<{ resetUrl: string; expiresAt: number }> {
+    const response = await authFetch(
+      `${API_URL}/api/admin/users/${encodeURIComponent(userId)}/password/reset`,
+      { method: 'POST' },
+    );
+    if (!response.ok) throw await apiError(response, 'Failed to create a reset link');
+    return readJson(response, 'Failed to create a reset link');
+  },
+
   // ────────────────── First-run bootstrap ──────────────────
   //
-  // With no email and no password, the very first account needs a way in that
-  // does not depend on an invite from someone who does not exist yet. Gated on
-  // both the database being empty and a deployment secret.
+  // The very first account needs a way in that does not depend on an invite
+  // from someone who does not exist yet. Gated on both the database being empty
+  // and a deployment secret. Passkey-only: claiming root is a one-time action
+  // at a keyboard, so the password path was not worth a second endpoint.
 
   async setupStatus(): Promise<{ isSetupComplete: boolean }> {
     const response = await publicFetch(`${API_URL}/api/auth/setup/status`);
@@ -307,10 +386,20 @@ export const api = {
   },
 
   // Admin
+  /**
+   * The Worker answers `{ users, truncated }`, not a bare array.
+   *
+   * This used to `return readJson(...)` straight through while declaring
+   * `AdminUser[]`, so the admin Users tab rendered "USERS ()" and an empty
+   * table on every load — the object satisfied the type assertion (readJson
+   * validates that a body parsed, not that it matches T) and `.map` was never
+   * reached because `.length` was undefined. Nothing surfaced an error.
+   */
   async getAdminUsers(): Promise<AdminUser[]> {
     const response = await authFetch(`${API_URL}/api/admin/users`);
     if (!response.ok) throw await apiError(response, 'Failed to get users');
-    return readJson(response, 'Failed to get users');
+    const body = await readJson<{ users: AdminUser[] }>(response, 'Failed to get users');
+    return body.users ?? [];
   },
 
   async getAdminUserTree(): Promise<UserTreeResponse> {

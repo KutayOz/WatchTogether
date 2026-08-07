@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode, type ButtonHTMLAttributes, type InputHTMLAttributes } from 'react';
+import { useEffect, useId, useState, type CSSProperties, type ReactNode, type ButtonHTMLAttributes, type InputHTMLAttributes } from 'react';
 import { Doodle, type AccentColor, type ToneKind } from './patterns';
 
 /* ──────────────────────────────────────────────────────────── */
@@ -403,6 +403,16 @@ interface NotebookFieldProps extends Omit<InputHTMLAttributes<HTMLInputElement>,
 }
 
 export function NotebookField({ label, value, onChange, placeholder, type = 'text', hint, rightAdornment, ...rest }: NotebookFieldProps) {
+  /**
+   * A real <label for>, not a decorative <span>.
+   *
+   * The label used to be an unassociated span, which looked identical and left
+   * every field in the app with no accessible name at all — nothing for a
+   * screen reader to announce, and nothing for getByLabel to find. Clicking the
+   * word did not focus the input either.
+   */
+  const inputId = useId();
+
   return (
     <div style={{ marginTop: 12, marginBottom: 4 }}>
       <div
@@ -414,7 +424,8 @@ export function NotebookField({ label, value, onChange, placeholder, type = 'tex
           paddingBottom: 4,
         }}
       >
-        <span
+        <label
+          htmlFor={inputId}
           style={{
             fontFamily: 'var(--font-hand)',
             fontWeight: 700,
@@ -425,8 +436,9 @@ export function NotebookField({ label, value, onChange, placeholder, type = 'tex
           }}
         >
           {label}
-        </span>
+        </label>
         <input
+          id={inputId}
           type={type}
           value={value}
           onChange={(e) => onChange(e.target.value)}

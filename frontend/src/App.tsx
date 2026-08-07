@@ -30,6 +30,7 @@ import { ScreentoneDefs } from './components/manga';
  */
 const Login = lazy(() => import('./components/Login/Login').then((m) => ({ default: m.Login })));
 const InviteSignup = lazy(() => import('./components/Auth/InviteSignup').then((m) => ({ default: m.InviteSignup })));
+const PasswordReset = lazy(() => import('./components/Auth/PasswordReset').then((m) => ({ default: m.PasswordReset })));
 const Lobby = lazy(() => import('./components/Lobby/Lobby').then((m) => ({ default: m.Lobby })));
 const SessionRoom = lazy(() => import('./components/Session/SessionRoom').then((m) => ({ default: m.SessionRoom })));
 const JoinSession = lazy(() => import('./components/Session/JoinSession').then((m) => ({ default: m.JoinSession })));
@@ -146,10 +147,16 @@ function TermsGate({ children }: { children: React.ReactNode }) {
 function AppRoutes() {
   return (
     <Routes>
-      {/* The only way to create an account. /register, /verify-email,
-          /check-email and /request-demo are gone with passwords and email —
-          any stale bookmark falls through to the catch-all below. */}
+      {/* The only way to create an account. /register, /verify-email and
+          /check-email are gone with email — passwords came back but the
+          verification machinery did not, since there is no address to verify.
+          Any stale bookmark falls through to the catch-all below. */}
       <Route path="/invite/:token" element={<InviteSignup />} />
+
+      {/* Password recovery, such as it is: root mints the link by hand and
+          hands it over out of band. Unguarded like /invite/:token — the whole
+          point is that the holder cannot get in without it. */}
+      <Route path="/reset/:token" element={<PasswordReset />} />
 
       {/* Login */}
       <Route

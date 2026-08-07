@@ -27,6 +27,10 @@ export interface InvitationLinkRow {
  * token already carries 256 bits of entropy, so there is no guessing attack
  * for a cost factor to slow down. It just cost ~400ms of CPU per validation,
  * which this platform does not have.
+ *
+ * Note the argument is about entropy, not about slow hashing being unavailable
+ * here — passwords do get stretched (lib/passwordHash.ts), because a password
+ * is guessable and a 256-bit token is not.
  */
 export async function createInvitationLink(
   db: D1Database,

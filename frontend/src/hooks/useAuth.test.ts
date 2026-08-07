@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { describeWebAuthnError } from './useAuth';
 
 /**
- * With passwords gone, a WebAuthn rejection IS the error UI — there is no
- * second sign-in method to fall back to and no "forgot" flow to redirect
- * into. So a blank message here is not cosmetic; it is a user with no way to
- * tell "you cancelled" from "this browser can't do this".
+ * A WebAuthn rejection is the whole of the error UI on the passkey path — the
+ * browser gives no second chance and no "forgot" flow to redirect into. So a
+ * blank message here is not cosmetic; it is a user with no way to tell "you
+ * cancelled" from "this browser can't do this".
+ *
+ * There is a password form on the same screen now, but it does not soften this:
+ * somebody reaching for a passkey has one, and being told nothing about why it
+ * failed is not answered by pointing at a password they may not have set.
  */
 describe('describeWebAuthnError', () => {
   const FALLBACK = 'Sign-in failed';

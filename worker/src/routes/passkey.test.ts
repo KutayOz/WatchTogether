@@ -1,7 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import schema from "../../migrations/0001_init.sql?raw";
-import { applySchema } from "../db/testSchema";
+import { resetDatabase } from "../db/testSchema";
 import { createTestAuthenticator } from "../lib/testWebAuthn";
 import { AUTH_COOKIE } from "../lib/cookies";
 import { createInvitationLink } from "../db/invitationLinks";
@@ -51,12 +50,7 @@ function sessionCookie(response: Response): string | null {
 
 beforeEach(async () => {
   currentIp++;
-  await db.batch(
-    ["admin_audit_log", "revoked_tokens", "invitation_links", "passkey_credentials", "users"].map(
-      (table) => db.prepare(`DROP TABLE IF EXISTS ${table}`),
-    ),
-  );
-  await applySchema(db, schema);
+  await resetDatabase(db);
 });
 
 /** Create an inviter and a live invite link. */
@@ -356,7 +350,9 @@ describe("credential management", () => {
       "DELETE",
     );
 
-    // Passwords are gone, so the last passkey is the only way back in.
+    // This user has no password, so the last passkey is the only way back in.
+    // routes/password.test.ts covers the other half: once a password exists,
+    // the same delete succeeds.
     expect(deleted.status).toBe(400);
   });
 });
@@ -384,9 +380,15 @@ describe("CPU budget", () => {
     const elapsed = Date.now() - started;
 
     expect(result.verified).toBe(true);
-    // Wall clock over-reports CPU (WebCrypto is async and does not bill against
-    // the CPU budget), so passing here is necessary but not sufficient — the
-    // authoritative number comes from production telemetry.
+    // Wall clock is not CPU, so passing here is necessary and not sufficient —
+    // the authoritative number comes from production telemetry.
+    //
+    // This used to claim WebCrypto "does not bill against the CPU budget",
+    // which is not true and was load-bearing by accident: it is the reason the
+    // original port concluded a real KDF was impossible here rather than merely
+    // expensive. Measured, PBKDF2 in workerd costs about what you would expect
+    // — 600,000 iterations is ~37ms — which is exactly why the password design
+    // moves that work to the browser. See lib/passwordHash.ts.
     console.log(`verifyRegistrationResponse wall clock: ${elapsed}ms`);
     expect(elapsed).toBeLessThan(50);
   });

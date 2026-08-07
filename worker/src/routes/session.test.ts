@@ -1,7 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import schema from "../../migrations/0001_init.sql?raw";
-import { applySchema } from "../db/testSchema";
+import { resetDatabase } from "../db/testSchema";
+import { TERMS_VERSION } from "../lib/terms";
 import { createTestAuthenticator } from "../lib/testWebAuthn";
 import { AUTH_COOKIE } from "../lib/cookies";
 import { buildInviteToken, parseInviteToken } from "../lib/sessionId";
@@ -43,12 +43,7 @@ function sessionCookie(response: Response): string | null {
 
 beforeEach(async () => {
   currentIp++;
-  await db.batch(
-    ["admin_audit_log", "revoked_tokens", "invitation_links", "passkey_credentials", "users"].map(
-      (table) => db.prepare(`DROP TABLE IF EXISTS ${table}`),
-    ),
-  );
-  await applySchema(db, schema);
+  await resetDatabase(db);
 });
 
 /** Register a user through the real ceremony and return their session cookie. */
@@ -309,7 +304,10 @@ describe("terms", () => {
     const response = await request("/api/terms/current");
     const body = await response.json<{ version: string; content: string }>();
 
-    expect(body.version).toBe("1.0");
+    // Against the constant, not a literal. This test is about the endpoint
+    // serving whatever version is in force, and a hardcoded "1.0" made every
+    // future bump of the terms text look like a broken route.
+    expect(body.version).toBe(TERMS_VERSION);
     expect(body.content).toContain("WatchTogether");
   });
 

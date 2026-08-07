@@ -4,30 +4,50 @@ import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { PasskeyIcon } from '../Auth/PasskeyIcon';
 import { UsernameField } from '../Auth/UsernameField';
+import { PasswordField } from '../Auth/PasswordField';
+import { isTagValid } from '../../utils/password';
 import {
   Sketchbook,
   SectionTitle,
   TagSticker,
   StickerButton,
+  NotebookField,
   Doodle,
   BurstSticker,
 } from '../manga';
 
 /**
- * Sign-in, passkey-only.
+ * Sign-in. Passkey first, password underneath.
  *
- * There is nothing to type. The authenticator holds a discoverable credential
- * for this site and the server identifies you from it, so the screen is one
- * button — no email, no password, no "forgot" flow, and no account-enumeration
- * surface, because nothing is ever submitted to be looked up.
+ * The passkey button stays the headline and stays at the top: it needs no
+ * handle typed, it cannot be phished, and it is still what a new invitee is
+ * steered toward. What changed is that it is no longer compulsory — a device
+ * that cannot make passkeys, or a person who would rather not, has a way in.
  *
- * The one exception is first run: with no email and no password, the very first
- * account cannot be invited by anybody, so an empty database plus a deployment
- * secret is the only way to mint root.
+ * The password half costs something honest and worth naming here: it needs the
+ * full `name#1234` handle, because a bare username is ambiguous; and it gives
+ * the app an account-enumeration surface the passkey-only design did not have,
+ * which is why the server answers "no such handle" and "wrong password" with
+ * one identical sentence, after doing identical work. There is also no "forgot"
+ * link, because there is no email address to send anything to — recovery is a
+ * link root issues by hand.
+ *
+ * First run is unchanged and still passkey-only: claiming root is a one-time
+ * action at a keyboard, gated on an empty database plus a deployment secret.
  */
 export function Login() {
   const navigate = useNavigate();
-  const { loginWithPasskey, setupRootWithPasskey, isLoading, error, setError } = useAuthContext();
+  const {
+    loginWithPasskey,
+    loginWithPassword,
+    setupRootWithPasskey,
+    isLoading,
+    error,
+    setError,
+  } = useAuthContext();
+
+  const [tag, setTag] = useState('');
+  const [password, setPassword] = useState('');
 
   // undefined while unknown — the setup panel must not flash on a normal load.
   const [isSetupComplete, setIsSetupComplete] = useState<boolean | undefined>(undefined);
@@ -52,6 +72,16 @@ export function Login() {
       navigate('/');
     } catch {
       // useAuth has already turned this into a readable message.
+    }
+  };
+
+  const handlePasswordSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await loginWithPassword(tag, password);
+      navigate('/');
+    } catch {
+      // Same — the server's own sentence is already on screen.
     }
   };
 
@@ -121,11 +151,79 @@ export function Login() {
               <PasskeyIcon size={18} />
               your face, fingerprint or device PIN — nothing to remember
             </div>
+
+            {/* Hand-drawn divider. The password form is deliberately below the
+                fold of the passkey button rather than beside it — both work,
+                but only one of them is the recommendation. */}
+            <div
+              className="hand"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                marginTop: 30,
+                fontSize: 20,
+                color: 'rgba(26,20,23,0.45)',
+              }}
+            >
+              <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
+              or
+              <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
+            </div>
+
+            <form onSubmit={handlePasswordSignIn} style={{ marginTop: 8 }}>
+              <NotebookField
+                label="handle:"
+                value={tag}
+                onChange={(v) => {
+                  setTag(v);
+                  setError(null);
+                }}
+                placeholder="alice#0042"
+                disabled={isLoading}
+                autoComplete="username"
+                // Spellcheck and autocapitalise both mangle a handle on mobile.
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+
+              <PasswordField
+                value={password}
+                onChange={(v) => {
+                  setPassword(v);
+                  setError(null);
+                }}
+                autoComplete="current-password"
+                disabled={isLoading}
+                // No rulebook on the way in: the password is either the one on
+                // file or it is not, and grading it here would only insult
+                // somebody whose account predates the current rules.
+                validate={false}
+                hint="the whole handle, number and all"
+              />
+
+              <div style={{ marginTop: 18 }}>
+                <StickerButton
+                  type="submit"
+                  color="purple"
+                  size="md"
+                  sfx="POP!"
+                  // Gated on the handle parsing, so "you need the number too"
+                  // is visible in the button rather than arriving as a 400.
+                  disabled={isLoading || !isTagValid(tag) || !password}
+                >
+                  {isLoading ? 'UNLOCKING…' : 'SIGN IN WITH A PASSWORD'}
+                </StickerButton>
+              </div>
+            </form>
           </div>
 
-          {/* No sign-up link on purpose: accounts exist only by invitation, so
-              a "create account" affordance would lead nowhere for everybody who
-              does not already hold a link. Invitees arrive at /invite/:token. */}
+          {/* No sign-up link, and no "forgot password" link, both on purpose.
+              Accounts exist only by invitation, so a "create account"
+              affordance would lead nowhere for anybody without a link; and
+              there is no email address on file, so the only way back from a
+              forgotten password is a link root issues by hand. */}
           <div
             style={{
               marginTop: 36,

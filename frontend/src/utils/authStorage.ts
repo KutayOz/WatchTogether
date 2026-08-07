@@ -9,13 +9,14 @@
 //   - /api/auth/me is the source of truth; this is an optimistic hint that gets
 //     overwritten on every boot.
 //
-// "Remember me" is gone along with passwords. It used to choose between
-// localStorage and sessionStorage to mirror a cookie whose Max-Age the login
-// request controlled. The Worker now issues one cookie lifetime for every
-// sign-in, so honouring a stored preference would actively desynchronise the
-// two: a sessionStorage cache dies with the tab while the cookie lives on, and
-// the app would render logged-out for a user whose session is perfectly valid.
-// One storage, matching one cookie.
+// "Remember me" is gone, and stays gone now that passwords are back. It used to
+// choose between localStorage and sessionStorage to mirror a cookie whose
+// Max-Age the login request controlled. The Worker issues one cookie lifetime
+// for every sign-in — passkey or password, they all end in the same
+// loginResponse — so honouring a stored preference would actively desynchronise
+// the two: a sessionStorage cache dies with the tab while the cookie lives on,
+// and the app would render logged-out for a user whose session is perfectly
+// valid. One storage, matching one cookie.
 //
 // Accessed as window.localStorage rather than the bare global: modern Node
 // ships its own experimental localStorage, which shadows the DOM one under a

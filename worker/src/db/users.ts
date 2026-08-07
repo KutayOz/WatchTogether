@@ -50,11 +50,12 @@ export interface CreateUserParams {
   id?: string;
   userHandle?: string;
   /**
-   * A statement to commit alongside the user — in practice the first passkey.
+   * Statements to commit alongside the user — in practice its first credential,
+   * a passkey or a password depending on which door the invitee came through.
    * D1's batch is one transaction, so this guarantees an account can never
    * exist without a way to sign in to it.
    */
-  credential?: D1PreparedStatement;
+  credentials?: D1PreparedStatement[];
 }
 
 /** D1 surfaces constraint failures as errors carrying SQLite's message. */
@@ -107,7 +108,7 @@ export async function createUser(
       );
 
     try {
-      await db.batch(params.credential ? [insertUser, params.credential] : [insertUser]);
+      await db.batch([insertUser, ...(params.credentials ?? [])]);
     } catch (error) {
       if (isUniqueViolation(error)) continue;
       throw error;
@@ -233,12 +234,16 @@ export async function releaseInviteSlot(db: D1Database, userId: string): Promise
 }
 
 /**
- * Soft-delete a user and hard-delete their passkeys.
+ * Soft-delete a user and hard-delete their credentials.
  *
  * Removing the credentials is not optional. The .NET soft delete left them in
  * place while the credential-uniqueness check ignored deleted users, so a
  * deleted account's authenticator was permanently unable to register again.
  * The username is released too, so the tag can be reissued.
+ *
+ * The `ON DELETE CASCADE` on both credential tables does not help here — the
+ * user row survives, it is only marked — which is precisely why every one of
+ * these is deleted by hand.
  */
 export async function softDeleteUser(
   db: D1Database,
@@ -248,6 +253,8 @@ export async function softDeleteUser(
   const now = Date.now();
   await db.batch([
     db.prepare("DELETE FROM passkey_credentials WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM password_credentials WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM password_reset_tokens WHERE user_id = ?").bind(userId),
     db
       .prepare(
         `UPDATE users

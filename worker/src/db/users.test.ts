@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import schema from "../../migrations/0001_init.sql?raw";
-import { applySchema } from "./testSchema";
+import { resetDatabase } from "./testSchema";
 import {
   anyUserExists,
   createRootUser,
@@ -14,16 +13,13 @@ import {
   USERNAME_SATURATION_LIMIT,
 } from "./users";
 import { randomToken } from "../lib/crypto";
+import { getPasswordCredential, upsertPasswordCredential } from "./passwordCredentials";
+import { createResetToken } from "./passwordResets";
 
 const db = env.DB;
 
 beforeEach(async () => {
-  await db.batch(
-    ["admin_audit_log", "revoked_tokens", "invitation_links", "passkey_credentials", "users"].map(
-      (table) => db.prepare(`DROP TABLE IF EXISTS ${table}`),
-    ),
-  );
-  await applySchema(db, schema);
+  await resetDatabase(db);
 });
 
 describe("createUser", () => {
@@ -194,6 +190,29 @@ describe("softDeleteUser", () => {
 
     expect(orphan).toBeNull();
     expect(await getUserById(db, victim.user.id)).toBeNull();
+  });
+
+  it("removes the password and any outstanding reset ticket", async () => {
+    // Neither is reached by the ON DELETE CASCADE on those tables, because the
+    // user row survives — it is only marked. A surviving password row would
+    // also leave the freed username's next holder inheriting a credential.
+    const actor = await createUser(db, { username: "admin3", usernameLower: "admin3" });
+    const victim = await createUser(db, { username: "victim2", usernameLower: "victim2" });
+    expect(actor.ok && victim.ok).toBe(true);
+    if (!actor.ok || !victim.ok) return;
+
+    await upsertPasswordCredential(db, victim.user.id, "$wtpw$v=1$pbkdf2-sha256$i=20000$c=1$c2FsdA$aGFzaA");
+    await createResetToken(db, victim.user.id, actor.user.id);
+
+    await softDeleteUser(db, victim.user.id, actor.user.id);
+
+    expect(await getPasswordCredential(db, victim.user.id)).toBeNull();
+    expect(
+      await db
+        .prepare("SELECT 1 AS n FROM password_reset_tokens WHERE user_id = ?")
+        .bind(victim.user.id)
+        .first(),
+    ).toBeNull();
   });
 
   it("frees the username for reuse", async () => {

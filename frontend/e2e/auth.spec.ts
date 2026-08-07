@@ -36,17 +36,48 @@ test.describe('Sign-in screen', () => {
   });
 
   /**
-   * A regression guard rather than a feature test. Passwords were removed
-   * because BCrypt at work factor 12 costs ~400 ms and a Worker gets 10 ms of
-   * CPU, so a password field reappearing here would not be a design regression
-   * — it would be a thing that cannot run on this infrastructure at all.
+   * A regression guard rather than a feature test.
+   *
+   * This used to also assert zero password fields, on the grounds that BCrypt
+   * at work factor 12 costs ~400ms against a 10ms CPU budget and so passwords
+   * could not run on this infrastructure at all. The measurement was right and
+   * the conclusion was too broad — the work moved to the browser instead, and
+   * passwords came back. See worker/src/lib/password.ts.
+   *
+   * The email half did not come back, and it is the half worth guarding. There
+   * is no address column anywhere in the schema, and identity is a handle. An
+   * email input appearing here would mean somebody had reintroduced an entire
+   * category of stored personal data by accident.
    */
-  test('offers nothing to type — no password field, no email field', async ({ page }) => {
+  test('offers no email field — identity is a handle, not an address', async ({ page }) => {
     await page.goto('/login');
     await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
 
-    expect(await page.locator('input[type="password"]').count()).toBe(0);
     expect(await page.locator('input[type="email"]').count()).toBe(0);
+    await expect(page.getByText(/forgot/i)).toHaveCount(0);
+  });
+
+  /**
+   * Both doors, in the order that says which one is recommended.
+   *
+   * Asserted by accessible name rather than by counting `input[type=password]`:
+   * the first-run panel contributes a setup-secret input of the same type, so a
+   * count is brittle in exactly the configuration where this matters most.
+   */
+  test('offers a passkey button and a password form, passkey first', async ({ page }) => {
+    await page.goto('/login');
+
+    const passkey = page.getByRole('button', { name: /sign in with a passkey/i });
+    const password = page.getByRole('button', { name: /sign in with a password/i });
+
+    await expect(passkey).toBeVisible();
+    await expect(page.getByLabel('handle:')).toBeVisible();
+    await expect(page.getByLabel('password:')).toBeVisible();
+
+    // Passkeys stay the headline; the password form sits under an "or" divider.
+    const passkeyBox = await passkey.boundingBox();
+    const passwordBox = await password.boundingBox();
+    expect(passkeyBox!.y).toBeLessThan(passwordBox!.y);
   });
 
   test('signs in with a passkey and lands in the lobby', async ({ page }) => {
@@ -86,10 +117,12 @@ test.describe('Sign-in screen', () => {
 });
 
 /**
- * The first account cannot be invited by anybody, so with no email and no
- * password an empty database plus a deployment secret is the only way in. The
- * panel that does it must be invisible from the moment root exists — it is the
- * one place on a public page that accepts a secret.
+ * The first account cannot be invited by anybody, so an empty database plus a
+ * deployment secret is the only way in. Still passkey-only, deliberately:
+ * claiming root happens once, at a keyboard, by the person who deployed it.
+ *
+ * The panel must be invisible from the moment root exists — it is the one place
+ * on a public page that accepts a secret.
  */
 test.describe('First-run bootstrap', () => {
   test.beforeEach(async ({ page }) => {

@@ -1,4 +1,4 @@
-import { Hono, type Context } from "hono";
+import { Hono } from "hono";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -9,18 +9,10 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import type { AppEnv } from "../middleware/auth";
 import { requireAuth } from "../middleware/auth";
 import { CHALLENGE_TTL_MS, type StoredChallenge } from "../do/AuthChallenge";
-import { buildAuthCookie } from "../lib/cookies";
-import { issueToken } from "../lib/jwt";
+import { loginResponse } from "../lib/loginResponse";
 import { fromBase64Url, randomToken, sha256Hex, toBase64Url } from "../lib/crypto";
 import { USERNAME_ERROR_MESSAGES, normalizeUsername } from "../lib/identity";
-import { hasAcceptedCurrentTerms } from "../lib/terms";
-import {
-  createRootUser,
-  createUser,
-  getUserById,
-  tagOf,
-  type UserRow,
-} from "../db/users";
+import { createRootUser, createUser, getUserById } from "../db/users";
 import {
   deleteCredential,
   getCredentialById,
@@ -80,32 +72,14 @@ async function consumeChallenge(
   return body.ok && body.challenge ? body.challenge : null;
 }
 
-/**
- * Issue a session and describe the signed-in user.
- *
- * The single place a session cookie is minted, so its lifetime cannot diverge
- * from the token's the way it did across two controllers in the .NET app.
- */
-async function loginResponse(c: Context<AppEnv>, user: UserRow) {
-  const { token, expiresAt } = await issueToken(c.env.JWT_SECRET, user);
-  c.header("Set-Cookie", buildAuthCookie(token, expiresAt));
-
-  return c.json({
-    username: user.username,
-    discriminator: user.discriminator,
-    tag: tagOf(user),
-    isRootUser: user.is_root === 1,
-    hasAcceptedTerms: hasAcceptedCurrentTerms(user),
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Registration — anonymous, invite-scoped
 //
 // Net-new. In the .NET app both registration endpoints were [Authorize]
 // (PasskeyController.cs:47,65), so a passkey could only ever be added to an
-// account that already existed via password. With passwords gone, an invitee
-// holding nothing but a link has to be able to create an account.
+// account that already existed via password. An invitee holding nothing but a
+// link has to be able to create an account, whichever credential they pick —
+// the password equivalent of this flow lives in routes/password.ts.
 // ---------------------------------------------------------------------------
 
 passkeyRoutes.post("/register/begin", async (c) => {
@@ -241,17 +215,19 @@ passkeyRoutes.post("/register/finish", async (c) => {
     id: stored.userId,
     userHandle: stored.userHandle,
     // Batched with the user insert, so an account cannot exist without a passkey.
-    credential: insertCredentialStatement(c.env.DB, {
-      credentialId: credential.id,
-      userId: stored.userId,
-      publicKey: toBase64Url(credential.publicKey),
-      counter: credential.counter,
-      transports: credential.transports,
-      aaguid,
-      backupEligible: credentialDeviceType === "multiDevice",
-      backedUp: credentialBackedUp,
-      label,
-    }),
+    credentials: [
+      insertCredentialStatement(c.env.DB, {
+        credentialId: credential.id,
+        userId: stored.userId,
+        publicKey: toBase64Url(credential.publicKey),
+        counter: credential.counter,
+        transports: credential.transports,
+        aaguid,
+        backupEligible: credentialDeviceType === "multiDevice",
+        backedUp: credentialBackedUp,
+        label,
+      }),
+    ],
   });
 
   if (!created.ok) {
@@ -403,8 +379,8 @@ passkeyRoutes.delete("/:credentialId", requireAuth, async (c) => {
 
   if (outcome === "not_found") return c.json({ message: "Passkey not found." }, 404);
   if (outcome === "last_credential") {
-    // With passwords gone there is no other way back in.
-    return c.json({ message: "You cannot remove your only passkey." }, 400);
+    // Counts passwords too, so this only fires when nothing else is left.
+    return c.json({ message: "You cannot remove your only way to sign in." }, 400);
   }
   return c.body(null, 204);
 });

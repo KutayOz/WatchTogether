@@ -12,6 +12,25 @@ interface AuthContextType {
   loginWithPasskey: () => Promise<User>;
   registerWithPasskey: (inviteToken: string, username: string) => Promise<User>;
   setupRootWithPasskey: (username: string, setupSecret: string) => Promise<User>;
+  /**
+   * The password equivalents. `tag` is the full `name#1234`: unlike the passkey
+   * path there is no discoverable credential to identify the account, and the
+   * username half doubles as the client-side salt.
+   *
+   * Passwords are stretched in the browser before any of these touch the
+   * network, so each takes a few hundred milliseconds and sets `isLoading`.
+   */
+  loginWithPassword: (tag: string, password: string) => Promise<User>;
+  registerWithPassword: (
+    inviteToken: string,
+    username: string,
+    password: string,
+  ) => Promise<User>;
+  completePasswordReset: (
+    token: string,
+    username: string,
+    password: string,
+  ) => Promise<User>;
   logout: () => void;
   updateTermsAccepted: () => void;
   refreshUser: () => Promise<void>;
