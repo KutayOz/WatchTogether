@@ -1,7 +1,6 @@
 import { createScheduledController, env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import schema from "../migrations/0001_init.sql?raw";
-import { applySchema } from "./db/testSchema";
+import { resetDatabase } from "./db/testSchema";
 import { createUser, getUserById } from "./db/users";
 import { createInvitationLink } from "./db/invitationLinks";
 import { revokeToken } from "./db/revokedTokens";
@@ -25,12 +24,7 @@ import worker from "./index";
 const db = env.DB;
 
 beforeEach(async () => {
-  await db.batch(
-    ["admin_audit_log", "revoked_tokens", "invitation_links", "passkey_credentials", "users"].map(
-      (table) => db.prepare(`DROP TABLE IF EXISTS ${table}`),
-    ),
-  );
-  await applySchema(db, schema);
+  await resetDatabase(db);
 });
 
 /**

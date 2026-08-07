@@ -15,9 +15,9 @@ WatchTogether is a two-person video calling app with screen sharing, synchronize
 YouTube playback and ML background blur. Media never touches a server — WebRTC
 connects the peers directly, and the backend exists only to introduce them.
 
-Sign-in is passkeys, and only passkeys. There is no password, no email address
-and no sign-up form: accounts exist by invitation, and you are identified by a
-tag like `alice#0042`.
+Sign-in is a passkey or a password — passkeys are the recommendation, not a
+requirement. There is no email address and no sign-up form: accounts exist by
+invitation, and you are identified by a tag like `alice#0042`.
 
 It runs entirely on Cloudflare's free tier. That is a design constraint rather
 than a happy accident, and it shows up throughout — see [Why it is shaped like
@@ -31,6 +31,8 @@ this](#why-it-is-shaped-like-this).
 - **Synced YouTube co-watching** — paste a link, both sides stay in step
 - **Background blur** — MediaPipe segmentation, lazy-loaded (~2 MB, only when switched on)
 - **Passkey sign-in** — usernameless and discoverable; nothing to type, nothing to leak
+- **Password sign-in** — for anyone who cannot or would rather not use a passkey,
+  stretched in the browser so the Worker never sees it
 - **Invite-only accounts** — single-use links, quota-limited per user
 - **Reconnect that actually rejoins** — refresh mid-call and the session recovers
 - **Admin panel** — user tree, invite slots, audit log
@@ -93,14 +95,14 @@ non-HTTPS origin browsers will run a passkey ceremony against.
 
 ### Claim the first account
 
-The first account cannot be invited by anybody, so with no email and no password
-an empty database plus a deployment secret is the only way in. Load `/login`
-with no users in the database and a bootstrap panel appears; the secret is the
-`SETUP_SECRET` from `.dev.vars`. The panel disappears permanently the moment
-root exists.
+The first account cannot be invited by anybody, so an empty database plus a
+deployment secret is the only way in. Load `/login` with no users in the
+database and a bootstrap panel appears; the secret is the `SETUP_SECRET` from
+`.dev.vars`. The panel disappears permanently the moment root exists. Claiming
+root is passkey-only — it happens once, at a keyboard.
 
 From there: lobby → generate an invite link → open it in another profile → that
-person registers a passkey and lands signed in.
+person picks a passkey or a password and lands signed in.
 
 ### Verify
 
@@ -173,12 +175,41 @@ Object requests to under 100.
 
 Four platform limits explain most of the unusual decisions.
 
-**10 ms of CPU per invocation.** BCrypt at work factor 12 costs ~400 ms, so
-passwords are not slow here — they are impossible. Hence passkeys, and hence
-invite tokens hashed with SHA-256 rather than BCrypt (they already carry 256
-bits of entropy, so there is nothing to brute-force). The limit is CPU time, not
-wall clock: awaiting D1 costs nothing against it, which is why a chain of
-queries is fine.
+**10 ms of CPU per invocation.** This is the limit that shaped the auth design,
+and for a while it shaped it wrongly, so it is worth setting out properly.
+
+The limit is CPU time, not wall clock: awaiting D1 costs nothing against it,
+which is why a chain of queries is fine. What it does rule out is deliberately
+expensive work — and password hashing is nothing but deliberately expensive
+work. BCrypt at work factor 12 costs ~400 ms, forty times the entire budget, and
+bcrypt, scrypt and argon2 do not exist on Workers regardless. PBKDF2 via
+`crypto.subtle` is the only primitive available, and OWASP asks for 600,000
+iterations of it, which measures at ~37 ms in workerd. Also over budget.
+
+The original port drew the obvious conclusion from that — passwords are
+impossible here — and removed them. The measurement was right and the conclusion
+was one step too far, because it assumed the stretching had to happen on the
+server. It does not. The browser has no 10 ms budget:
+
+- the browser runs PBKDF2-SHA256 at 600,000 iterations over a salt derived from
+  the username, and sends the derived key instead of the password
+- the Worker runs 20,000 more over a random per-row salt, and stores that
+
+An attacker holding the table pays both halves, ~620,000 iterations per guess.
+The Worker pays ~1.2 ms. The Worker never sees a plaintext password at all.
+
+Two things follow, and both are real costs rather than free wins. Password
+policy — length, blocklist — can only be enforced in the browser, because the
+server has nothing to inspect; that is tolerable because a bypassed rule weakens
+only the bypasser's own account. And the client's recipe is effectively frozen:
+at sign-in the browser must derive before the server has said anything, so it
+cannot know which recipe a stored row used. The server's iteration count is
+upgradable in place and rehashes on login; the client's is not.
+
+`worker/src/lib/password.ts` and `lib/passwordHash.ts` carry the details. Invite
+tokens, separately, are hashed with SHA-256 rather than anything slow because
+they already carry 256 bits of entropy — there is no guessing attack for a cost
+factor to slow down.
 
 **100,000 Durable Object requests a day.** The transport split above. Also why
 `run_worker_first = ["/api/*"]` — static assets never invoke the Worker at all,
@@ -203,9 +234,9 @@ re-registers.
 ## Tests
 
 ```bash
-cd worker    && npm test    # 189 — Durable Objects, D1, WebAuthn, in workerd
-cd frontend  && npm test    # 113 — services, hooks, storage, the shipped CSP
-cd frontend  && npm run e2e # 14  — Playwright, /api/* stubbed at the boundary
+cd worker    && npm test    # 281 — Durable Objects, D1, WebAuthn, PBKDF2, in workerd
+cd frontend  && npm test    # 202 — services, hooks, storage, the shipped CSP
+cd frontend  && npm run e2e # 34  — Playwright, /api/* stubbed at the boundary
 ```
 
 All three run on every pull request and again before every deploy
@@ -234,9 +265,19 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for secrets, runbook and the free-tier budget
 
 ## Security
 
-- **Passkeys only** — discoverable credentials, `residentKey: "required"`; no
-  password to phish and no account-enumeration surface, because nothing is ever
-  submitted to be looked up
+- **Passkeys** — discoverable credentials, `residentKey: "required"`; usernameless,
+  so nothing is submitted to be looked up and there is nothing to phish
+- **Passwords** — stretched in the browser at 600,000 PBKDF2 iterations before
+  they are sent, then hashed again server-side with a random per-row salt. This
+  is the one part of the app with an account-enumeration surface, so it is
+  closed by hand: unknown handle, handle with no password, and wrong password
+  all return one byte-identical 401, and the miss path burns an equivalent
+  verification against a dummy hash so it costs the same as a hit. Eight
+  consecutive failures lock the account for fifteen minutes — short on purpose,
+  since anyone who knows a handle could otherwise hold it locked
+- **No password recovery by email** — because there is no email. Root issues a
+  single-use 48-hour reset link by hand, and every issue and redemption is
+  audited
 - **JWT in a `__Host-` cookie** — HttpOnly, `Secure`, `Path=/`, no `Domain`;
   JavaScript cannot read it, and cookie lifetime is derived from the same `exp`
   it was signed with
@@ -256,7 +297,9 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for secrets, runbook and the free-tier budget
 The first version of this app was .NET 8 + SignalR + MongoDB Atlas on Fly.io.
 It was rewritten for Cloudflare in 2026, keeping the frontend and replacing the
 backend outright — passwords, email verification and Google sign-in went with
-it.
+it. Email verification and Google sign-in are still gone. Passwords came back,
+in a shape the platform can actually run; see [Why it is shaped like
+this](#why-it-is-shaped-like-this).
 
 That tree is preserved at the `archive/dotnet` tag, because comments across
 `worker/` and `frontend/` still cite the C# they were ported from:

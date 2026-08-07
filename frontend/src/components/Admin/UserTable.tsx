@@ -18,6 +18,31 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [resetLink, setResetLink] = useState<{ tag: string; url: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  /**
+   * Mint a password reset link.
+   *
+   * The whole of account recovery: no email address exists anywhere in this
+   * system, so nothing can be sent anywhere — root generates the link and
+   * passes it on however they already talk to the person. It also works on an
+   * account that has never had a password, which is how a passkey-only user
+   * gets one.
+   */
+  const handleResetPassword = async (u: AdminUser) => {
+    setIsSubmitting(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const { resetUrl } = await api.adminResetPassword(u.id);
+      setResetLink({ tag: u.tag, url: resetUrl });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create a reset link');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
   const handleDelete = async (id: string) => {
     setIsSubmitting(true);
@@ -124,12 +149,26 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
                   <span className="hand" style={{ fontSize: 16 }}>{formatDate(u.createdAt)}</span>
                 </Td>
                 <Td align="right">
-                  {/* Delete only. The Worker exposes no user-update endpoint,
-                      and root is undeletable server-side as well as here. */}
-                  {!u.isRootUser && !u.isDeleted && (
-                    <ActionBtn onClick={() => setDeleteConfirm(u.id)} color="orange">
-                      delete
-                    </ActionBtn>
+                  {/* Reset and delete. The Worker exposes no other user-update
+                      endpoint, and root is undeletable server-side as well as
+                      here — though root can still be issued a reset link, since
+                      losing the only admin password is exactly when you need
+                      one most. */}
+                  {!u.isDeleted && (
+                    <div style={{ display: 'inline-flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                      <ActionBtn
+                        onClick={() => handleResetPassword(u)}
+                        color="purple"
+                        disabled={isSubmitting}
+                      >
+                        reset password
+                      </ActionBtn>
+                      {!u.isRootUser && (
+                        <ActionBtn onClick={() => setDeleteConfirm(u.id)} color="orange">
+                          delete
+                        </ActionBtn>
+                      )}
+                    </div>
                   )}
                 </Td>
               </tr>
@@ -138,6 +177,52 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
         </table>
       </div>
 
+
+      {/* Reset link, shown exactly once — the server keeps only its hash. */}
+      {resetLink && (
+        <ModalShell title="RESET LINK" onClose={() => setResetLink(null)}>
+          <p className="hand" style={{ fontSize: 20, color: 'rgba(26,20,23,0.75)' }}>
+            hand this to <span style={{ color: 'var(--purple)' }}>{resetLink.tag}</span>. it works
+            once, expires in 48h, and any earlier link for them is now dead.
+          </p>
+
+          <div
+            style={{
+              marginTop: 14,
+              padding: '10px 12px',
+              border: '3px solid var(--ink)',
+              background: 'var(--cream)',
+              fontFamily: 'monospace',
+              fontSize: 12,
+              wordBreak: 'break-all',
+            }}
+          >
+            {resetLink.url}
+          </div>
+
+          <p className="hand" style={{ fontSize: 17, marginTop: 10, color: 'var(--orange-deep)' }}>
+            · copy it now — closing this is the last you will see of it.
+          </p>
+
+          <div className="row" style={{ gap: 12, marginTop: 20, flexWrap: 'wrap' }}>
+            <StickerButton
+              color="purple"
+              sfx="KLIK"
+              onClick={() => {
+                navigator.clipboard
+                  ?.writeText(resetLink.url)
+                  .then(() => setCopied(true))
+                  // Clipboard access can be refused outright; the link is on
+                  // screen and selectable either way, so this is not an error.
+                  .catch(() => setCopied(false));
+              }}
+            >
+              {copied ? 'COPIED!' : 'COPY LINK'}
+            </StickerButton>
+            <BackButton onClick={() => setResetLink(null)}>done</BackButton>
+          </div>
+        </ModalShell>
+      )}
 
       {/* Delete confirm */}
       {deleteConfirm && (
@@ -219,16 +304,19 @@ function ActionBtn({
   children,
   onClick,
   color,
+  disabled,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   color: 'purple' | 'orange';
+  disabled?: boolean;
 }) {
   const fg = color === 'purple' ? 'var(--purple-deep)' : 'var(--orange-deep)';
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       style={{
         background: 'transparent',
         border: '2px solid var(--ink)',

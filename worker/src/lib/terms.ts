@@ -13,7 +13,7 @@
  * against the version, and `hasAcceptedCurrentTerms` compares against it, so
  * raising it re-prompts everyone on their next request.
  */
-export const TERMS_VERSION = "1.0";
+export const TERMS_VERSION = "1.1";
 
 export const TERMS_CONTENT = `# Terms of Service
 
@@ -31,9 +31,14 @@ relay, which forwards encrypted traffic without retaining it.
 
 ## What is stored
 
-Your username, your passkey public keys, and who invited you. There are no
-passwords and no email addresses. Chat messages exist only for the duration of
-a session and are never written to disk.
+Your username, your passkey public keys, a hash of your password if you set
+one, and who invited you. There are no email addresses. Chat messages exist
+only for the duration of a session and are never written to disk.
+
+If you set a password, it is scrambled in your browser before it is sent, and
+scrambled again before it is stored. The service never receives or keeps the
+password itself. Because no email address is held, a forgotten password cannot
+be recovered automatically — an administrator has to issue you a reset link.
 
 ## Access
 

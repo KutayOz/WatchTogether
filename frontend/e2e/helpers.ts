@@ -184,6 +184,128 @@ export async function mockPasskeySignIn(
   });
 }
 
+/**
+ * Drive a password sign-in to a chosen outcome.
+ *
+ * Simpler than its passkey counterpart in one way and slower in another. There
+ * is no ceremony, so navigator.credentials does not have to be faked — only the
+ * server half is stubbed. But the page still runs the real 600,000-iteration
+ * PBKDF2 before it calls anything, because that happens in utils/password.ts
+ * and is not mocked here. Expect a few hundred milliseconds per sign-in, and
+ * more on a shared CI runner.
+ *
+ * If a spec using this starts flaking on a slow machine, raise its timeout.
+ * Lowering the iteration count would be mocking away the thing under test.
+ */
+export async function mockPasswordSignIn(
+  page: Page,
+  outcome: 'success' | 'wrong-password' | 'locked',
+  user: Partial<MeShape> = {},
+) {
+  await page.route('**/api/auth/password/login', async (route) => {
+    if (outcome === 'wrong-password') {
+      // One string for unknown handle, no password set, and wrong password —
+      // see routes/password.ts. Anything else is an enumeration oracle.
+      await route.fulfill({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'That handle and password do not match.' }),
+      });
+      return;
+    }
+
+    if (outcome === 'locked') {
+      await route.fulfill({
+        status: 429,
+        contentType: 'application/json',
+        headers: { 'Retry-After': '900' },
+        body: JSON.stringify({
+          message: 'Too many attempts. Try again in 15 minutes.',
+          retryAfterSeconds: 900,
+        }),
+      });
+      return;
+    }
+
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        username: 'alice',
+        discriminator: '0042',
+        tag: 'alice#0042',
+        isRootUser: false,
+        hasAcceptedTerms: true,
+        ...user,
+      }),
+    });
+  });
+}
+
+/** Stub the probe /reset/:token makes on mount, and the redemption after it. */
+export async function mockPasswordReset(
+  page: Page,
+  validity: 'valid' | 'used' | 'expired' | 'not_found',
+  username = 'alice',
+) {
+  await page.route('**/api/auth/password/reset/*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(
+        validity === 'valid'
+          ? { valid: true, username, tag: `${username}#0042` }
+          : { valid: false, reason: validity },
+      ),
+    });
+  });
+
+  // Distinct from the probe above: same prefix, no token segment, POST only.
+  await page.route('**/api/auth/password/reset', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        username,
+        discriminator: '0042',
+        tag: `${username}#0042`,
+        isRootUser: false,
+        hasAcceptedTerms: true,
+      }),
+    });
+  });
+}
+
+/** Stub the invite-link check /invite/:token makes on mount. */
+export async function mockInviteLink(page: Page, valid = true, inviterTag = 'bob#0007') {
+  await page.route('**/api/invitation/validate/*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(
+        valid ? { valid: true, inviterTag } : { valid: false, message: 'That invite is not valid.' },
+      ),
+    });
+  });
+}
+
+/** Stub invite-scoped password signup. */
+export async function mockPasswordSignup(page: Page, username = 'ada') {
+  await page.route('**/api/auth/password/signup', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        username,
+        discriminator: '0042',
+        tag: `${username}#0042`,
+        isRootUser: false,
+        hasAcceptedTerms: true,
+      }),
+    });
+  });
+}
+
 /** Track every JS chunk the page downloads. Useful for the code-split
  *  assertions — "did landing on /login pull in the session chunk?" */
 export function trackChunkRequests(page: Page) {

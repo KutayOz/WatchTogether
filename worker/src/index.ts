@@ -5,12 +5,14 @@ import { rateLimit } from "./middleware/rateLimit";
 import { withSecurityHeaders } from "./middleware/securityHeaders";
 import { authRoutes } from "./routes/auth";
 import { passkeyRoutes } from "./routes/passkey";
+import { passwordRoutes } from "./routes/password";
 import { sessionRoutes } from "./routes/session";
 import { invitationRoutes } from "./routes/invitation";
 import { termsRoutes } from "./routes/terms";
 import { adminRoutes } from "./routes/admin";
 import { sweepExpired } from "./db/revokedTokens";
 import { returnExpiredTickets } from "./db/invitationLinks";
+import { sweepExpiredResetTokens } from "./db/passwordResets";
 
 export { SessionRoom } from "./do/SessionRoom";
 export { AuthChallenge } from "./do/AuthChallenge";
@@ -37,12 +39,17 @@ app.use("/api/*", rateLimit("RL_GLOBAL"));
 app.use("/api/*", optionalAuth);
 
 app.use("/api/auth/passkey/*", rateLimit("RL_AUTH"));
+// Its own bucket, and registered before the routes below so it actually runs.
+// Without this /api/auth/* inherits only the 200/min global limit, which is far
+// too loose for the one endpoint in the app where guessing is viable.
+app.use("/api/auth/password/*", rateLimit("RL_PASSWORD"));
 app.use("/api/invitation/validate/*", rateLimit("RL_LOOKUP"));
 app.use("/api/session/*", rateLimit("RL_LOOKUP"));
 
 app.get("/api/health", (c) => c.json({ status: "healthy", timestamp: new Date().toISOString() }));
 
 app.route("/api/auth/passkey", passkeyRoutes);
+app.route("/api/auth/password", passwordRoutes);
 app.route("/api/auth", authRoutes);
 app.route("/api/session", sessionRoutes);
 app.route("/api/invitation", invitationRoutes);
@@ -63,12 +70,17 @@ export default {
    * Nightly housekeeping.
    *
    * D1 has no TTL indexes, so the expiry the Mongo schema got for free is done
-   * here: drop deny-list entries for tokens that have expired anyway, and
-   * return invite slots held by links nobody used.
+   * here: drop deny-list entries for tokens that have expired anyway, return
+   * invite slots held by links nobody used, and clear spent or stale password
+   * reset tickets.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     const revoked = await sweepExpired(env.DB);
     const tickets = await returnExpiredTickets(env.DB);
-    console.log(`[cron] swept ${revoked} revoked tokens, returned ${tickets} invite tickets`);
+    const resets = await sweepExpiredResetTokens(env.DB);
+    console.log(
+      `[cron] swept ${revoked} revoked tokens, returned ${tickets} invite tickets, ` +
+        `cleared ${resets} reset tickets`,
+    );
   },
 } satisfies ExportedHandler<Env>;

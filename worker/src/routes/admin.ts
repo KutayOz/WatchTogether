@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "../middleware/auth";
 import { requireRoot } from "../middleware/auth";
 import { appendAudit, listAudit } from "../db/audit";
+import { createResetToken } from "../db/passwordResets";
 import { getUserById, softDeleteUser, tagOf, type UserRow } from "../db/users";
 
 export const adminRoutes = new Hono<AppEnv>();
@@ -94,6 +95,40 @@ adminRoutes.get("/user-tree", requireRoot, async (c) => {
 adminRoutes.get("/audit-log", requireRoot, async (c) => {
   const limit = Number(c.req.query("limit") ?? 100);
   return c.json({ entries: await listAudit(c.env.DB, Number.isFinite(limit) ? limit : 100) });
+});
+
+/**
+ * Mint a password reset link for a user.
+ *
+ * The only recovery path there is. No email address exists anywhere in this
+ * schema, so a forgotten password cannot be self-served — root generates a
+ * single-use link here and hands it over out of band. Redeeming it also works
+ * on an account that has never had a password, which is how a passkey-only user
+ * gets one.
+ *
+ * The raw token exists only in this response; the database keeps its SHA-256.
+ * Reissuing invalidates any link still outstanding for that user.
+ */
+adminRoutes.post("/users/:id/password/reset", requireRoot, async (c) => {
+  const actor = c.get("user");
+  const targetId = c.req.param("id");
+
+  const target = await getUserById(c.env.DB, targetId);
+  if (!target) return c.json({ message: "User not found." }, 404);
+
+  const { token, expiresAt } = await createResetToken(c.env.DB, targetId, actor.id);
+
+  await appendAudit(c.env.DB, {
+    actorUserId: actor.id,
+    actorTag: tagOf(actor),
+    action: "PasswordResetLinkIssued",
+    targetType: "User",
+    targetId,
+    details: `Issued a password reset link for ${tagOf(target)}`,
+    ipAddress: c.req.header("CF-Connecting-IP") ?? undefined,
+  });
+
+  return c.json({ resetUrl: `${c.env.RP_ORIGIN}/reset/${token}`, expiresAt });
 });
 
 adminRoutes.delete("/users/:id", requireRoot, async (c) => {

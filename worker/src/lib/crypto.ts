@@ -1,9 +1,15 @@
 /**
  * Encoding and hashing helpers.
  *
- * Everything here is WebCrypto or pure arithmetic. Nothing is deliberately
- * slow — the Workers free plan allows 10ms of CPU per invocation, which is why
- * BCrypt (work factor 12, ~400ms) could not come across from the .NET backend.
+ * Everything here is WebCrypto or pure arithmetic, and nothing here is
+ * deliberately slow. The Workers free plan allows 10ms of CPU per invocation,
+ * which is why BCrypt (work factor 12, ~400ms) could not come across from the
+ * .NET backend.
+ *
+ * The one place in the codebase that *is* deliberately slow is
+ * ./passwordHash.ts, which spends ~1.2ms on PBKDF2. It can afford that only
+ * because the expensive half of the work happens in the browser — see
+ * ./password.ts. Do not add a slow primitive here.
  */
 
 export function toBase64Url(bytes: Uint8Array): string {

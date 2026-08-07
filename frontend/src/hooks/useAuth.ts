@@ -2,10 +2,11 @@ import { logger } from '../services/logger';
 import { useState, useCallback, useEffect } from 'react';
 import { api } from '../services/api';
 import { getCachedUser, setAuthData, clearAuthData, updateAuthItem } from '../utils/authStorage';
+import { buildPasswordCredential, saltUsernameFromTag } from '../utils/password';
 import type { LoginResponse, User } from '../types';
 
 /**
- * Auth state, passkey-only.
+ * Auth state for both ways in — passkeys and passwords.
  *
  * The JWT is in an HttpOnly cookie that JS cannot read, so what lives here is
  * display state — who the server says you are. Authentication itself is decided
@@ -58,25 +59,50 @@ export function useAuth() {
   }, []);
 
   /**
-   * Run a WebAuthn ceremony, mapping its failures to something a person can act on.
+   * Loading and error plumbing shared by every sign-in path.
    *
-   * @simplewebauthn/browser is imported dynamically so its ~15KB only loads for
-   * someone who actually starts a ceremony, not for every visitor.
+   * `describe` is a parameter because the two families of failure read nothing
+   * alike: a WebAuthn rejection needs translating out of DOMException names,
+   * while a password route's 401 already carries a sentence written for a
+   * person and must be passed through untouched.
    */
-  const runCeremony = useCallback(
-    async <T,>(fn: () => Promise<T>, fallbackMessage: string): Promise<T> => {
+  const runWith = useCallback(
+    async <T,>(
+      fn: () => Promise<T>,
+      fallbackMessage: string,
+      describe: (err: unknown, fallback: string) => string,
+    ): Promise<T> => {
       setIsLoading(true);
       setError(null);
       try {
         return await fn();
       } catch (err) {
-        setError(describeWebAuthnError(err, fallbackMessage));
+        setError(describe(err, fallbackMessage));
         throw err;
       } finally {
         setIsLoading(false);
       }
     },
     [],
+  );
+
+  /**
+   * Run a WebAuthn ceremony, mapping its failures to something a person can act on.
+   *
+   * @simplewebauthn/browser is imported dynamically so its ~15KB only loads for
+   * someone who actually starts a ceremony, not for every visitor.
+   */
+  const runCeremony = useCallback(
+    <T,>(fn: () => Promise<T>, fallbackMessage: string): Promise<T> =>
+      runWith(fn, fallbackMessage, describeWebAuthnError),
+    [runWith],
+  );
+
+  /** Same plumbing, for the paths where the server's own message is the message. */
+  const runRequest = useCallback(
+    <T,>(fn: () => Promise<T>, fallbackMessage: string): Promise<T> =>
+      runWith(fn, fallbackMessage, describeRequestError),
+    [runWith],
   );
 
   /**
@@ -128,6 +154,60 @@ export function useAuth() {
     [runCeremony, adopt],
   );
 
+  // ── Passwords ────────────────────────────────────────────────────────────
+  //
+  // Each of these stretches the password before touching the network, which
+  // takes a few hundred milliseconds — hence the shared busy state rather than
+  // anything screen-local. The plaintext stops here: `api` is only ever handed
+  // the derived credential.
+
+  /**
+   * Sign in with a handle and a password.
+   *
+   * The full `name#1234`, because a bare username is ambiguous — and because
+   * the username half is the client-side salt, so a mistyped handle does not
+   * produce a lookup miss, it produces a valid key for the wrong account. The
+   * server answers both the same way regardless.
+   */
+  const loginWithPassword = useCallback(
+    (tag: string, password: string) =>
+      runRequest(async () => {
+        const usernameLower = saltUsernameFromTag(tag);
+        if (!usernameLower) throw new Error('Enter your full handle, like alice#0042.');
+
+        const credential = await buildPasswordCredential(password, usernameLower);
+        return adopt(await api.passwordLogin(tag.trim(), credential));
+      }, 'Sign-in failed'),
+    [runRequest, adopt],
+  );
+
+  /** Create an account from an invite, with a password instead of a passkey. */
+  const registerWithPassword = useCallback(
+    (inviteToken: string, username: string, password: string) =>
+      runRequest(async () => {
+        const trimmed = username.trim();
+        const credential = await buildPasswordCredential(password, trimmed.toLowerCase());
+        return adopt(await api.passwordSignup(inviteToken, trimmed, credential));
+      }, 'Registration failed'),
+    [runRequest, adopt],
+  );
+
+  /**
+   * Redeem a root-issued reset link. Signs you in on success.
+   *
+   * `username` comes from the server's probe of the link rather than from
+   * anything typed, because it is the salt — deriving against a guess would
+   * silently store a key nothing can reproduce at sign-in.
+   */
+  const completePasswordReset = useCallback(
+    (token: string, username: string, password: string) =>
+      runRequest(async () => {
+        const credential = await buildPasswordCredential(password, username.toLowerCase());
+        return adopt(await api.passwordResetComplete(token, credential));
+      }, 'Could not set that password'),
+    [runRequest, adopt],
+  );
+
   const logout = useCallback(async () => {
     // Server first: clearing locally before the cookie dies would let a racing
     // /me from another tab redirect-loop while logout is still in flight.
@@ -158,6 +238,9 @@ export function useAuth() {
     loginWithPasskey,
     registerWithPasskey,
     setupRootWithPasskey,
+    loginWithPassword,
+    registerWithPassword,
+    completePasswordReset,
     logout,
     updateTermsAccepted,
     refreshUser,
@@ -194,4 +277,17 @@ export function describeWebAuthnError(err: unknown, fallback: string): string {
       // message, which is already written for a person.
       return err.message || fallback;
   }
+}
+
+/**
+ * The non-ceremony counterpart: pass the server's sentence straight through.
+ *
+ * Every message the password routes emit is already written to be read —
+ * "That handle and password do not match", "Too many attempts. Try again in 15
+ * minutes" — and rewording them here would only be able to make them vaguer.
+ * There are no DOMException names to translate on this path.
+ */
+export function describeRequestError(err: unknown, fallback: string): string {
+  if (!(err instanceof Error)) return fallback;
+  return err.message || fallback;
 }

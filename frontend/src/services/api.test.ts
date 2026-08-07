@@ -179,10 +179,17 @@ describe('api error handling — untouched behaviour', () => {
     await expect(api.createSession()).resolves.toEqual({ sessionId: 'abc' });
   });
 
-  it('still returns array bodies', async () => {
-    // getAdminUsers is the surviving endpoint that returns a bare array rather
-    // than an object — getMyInvitations went with the email-based invitations.
-    respondWith(200, JSON.stringify([{ id: '1' }]), 'application/json');
+  it('unwraps the admin user list', async () => {
+    // The Worker answers `{ users, truncated }` (routes/admin.ts). This test
+    // used to feed a bare array and assert it came back — a shape the server
+    // has never sent — so it passed while the admin Users tab rendered empty
+    // on every load. readJson only proves the body parsed, not that it matches
+    // the declared type, so nothing else caught it either.
+    respondWith(
+      200,
+      JSON.stringify({ users: [{ id: '1' }], truncated: false }),
+      'application/json',
+    );
     await expect(api.getAdminUsers()).resolves.toEqual([{ id: '1' }]);
   });
 
@@ -205,5 +212,69 @@ describe('api error handling — untouched behaviour', () => {
   it('swallows logout failures so a bad gateway cannot strand the user', async () => {
     respondWith(502, EDGE_HTML, 'text/html');
     await expect(api.logout()).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * The one property of the password endpoints this layer is responsible for.
+ *
+ * api.ts is transport: it has no `password` parameter to accidentally pass a
+ * plaintext to, exactly as it has no dependency on @simplewebauthn/browser. The
+ * stretching happens in utils/password.ts before anything gets here. A future
+ * refactor that "simplifies" these signatures by taking the password directly
+ * would send it over the wire, and this is what catches that.
+ */
+describe('passwords never reach the network in the clear', () => {
+  const bodyOf = (fetchMock: ReturnType<typeof vi.fn>): string =>
+    String((fetchMock.mock.calls[0]![1] as RequestInit).body);
+
+  const captureFetch = () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ username: 'alice', tag: 'alice#0042' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+
+  const credential = { clientKey: 'A'.repeat(43), clientKdfVersion: 1 };
+
+  it('sends only the derived key on sign-in', async () => {
+    const fetchMock = captureFetch();
+    await api.passwordLogin('alice#0042', credential);
+
+    const body = bodyOf(fetchMock);
+    expect(JSON.parse(body)).toEqual({
+      tag: 'alice#0042',
+      clientKey: credential.clientKey,
+      clientKdfVersion: 1,
+    });
+    expect(body).not.toContain('password');
+  });
+
+  it('sends only the derived key on signup', async () => {
+    const fetchMock = captureFetch();
+    await api.passwordSignup('invite-token', 'Alice', credential);
+
+    expect(JSON.parse(bodyOf(fetchMock))).toEqual({
+      inviteToken: 'invite-token',
+      username: 'Alice',
+      clientKey: credential.clientKey,
+      clientKdfVersion: 1,
+    });
+  });
+
+  it('sends only the derived key when redeeming a reset link', async () => {
+    const fetchMock = captureFetch();
+    await api.passwordResetComplete('reset-token', credential);
+
+    expect(JSON.parse(bodyOf(fetchMock))).toEqual({
+      token: 'reset-token',
+      clientKey: credential.clientKey,
+      clientKdfVersion: 1,
+    });
   });
 });

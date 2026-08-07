@@ -1,3 +1,5 @@
+import { countSignInMethods } from "./signInMethods";
+
 export interface CredentialRow {
   credential_id: string;
   user_id: string;
@@ -97,10 +99,13 @@ export async function updateCredentialCounter(
 }
 
 /**
- * Delete one credential, refusing to remove a user's last.
+ * Delete one credential, refusing to remove a user's last way in.
  *
- * With passwords gone there is no fallback: deleting the final passkey would
- * lock the account out permanently with no recovery path.
+ * The count spans both credential types, not just passkeys. It used to be
+ * `owned.length <= 1` on the grounds that with passwords gone there was no
+ * fallback — true when it was written, and wrong the moment a password became
+ * a peer credential. A user with a password and one passkey may drop the
+ * passkey; a user with only that passkey may not.
  */
 export async function deleteCredential(
   db: D1Database,
@@ -109,7 +114,7 @@ export async function deleteCredential(
 ): Promise<"deleted" | "not_found" | "last_credential"> {
   const owned = await listCredentials(db, userId);
   if (!owned.some((credential) => credential.credential_id === credentialId)) return "not_found";
-  if (owned.length <= 1) return "last_credential";
+  if ((await countSignInMethods(db, userId)).total <= 1) return "last_credential";
 
   await db
     .prepare("DELETE FROM passkey_credentials WHERE credential_id = ? AND user_id = ?")

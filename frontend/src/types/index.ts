@@ -36,6 +36,28 @@ export interface PasskeyListItem {
 
 export type MeResponse = LoginResponse;
 
+/**
+ * What the wire carries in place of a password.
+ *
+ * The plaintext never leaves the browser: `clientKey` is 32 stretched bytes,
+ * base64url. `clientKdfVersion` names the recipe that produced them so the
+ * server can record it alongside the hash. Built by hooks/usePasswordField.ts;
+ * no other module should be assembling one.
+ */
+export interface PasswordCredential {
+  clientKey: string;
+  clientKdfVersion: number;
+}
+
+/** Probe result for `/reset/:token`, before anything is typed into it. */
+export interface PasswordResetStatus {
+  valid: boolean;
+  /** Present when valid — the client salt, so the browser can derive a key. */
+  username?: string;
+  tag?: string;
+  reason?: 'not_found' | 'expired' | 'used';
+}
+
 // Registration
 export interface ValidateInvitationResponse {
   isValid: boolean;
