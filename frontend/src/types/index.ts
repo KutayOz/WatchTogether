@@ -315,8 +315,12 @@ export interface QualityPreset {
 export const QUALITY_PRESETS: Record<ScreenShareQuality, QualityPreset> = {
   auto: {
     label: 'Auto',
-    description: 'up to 1080p • follows your link',
-    video: { width: 1920, height: 1080, frameRate: 60, bitrate: 0 }, // 0 = budget decides
+    description: 'up to 4K • follows your link and their screen',
+    // 4K is the BOX, not the target. `auto` only reaches past 1080p when the
+    // receiver has reported a viewport that large AND the link has proven it
+    // can fund the picture; with no report, resolutionBox() holds it at 1080p,
+    // which is what `auto` meant before it could be told otherwise.
+    video: { width: 3840, height: 2160, frameRate: 60, bitrate: 0 }, // 0 = budget decides
     audio: { bitrate: 96000 },
   },
   low: {
@@ -414,6 +418,17 @@ export interface AuditEntry {
 // Network quality monitoring types
 export type QualityLevel = 'excellent' | 'good' | 'fair' | 'poor' | 'critical';
 
+/**
+ * A rectangle of real pixels, on whichever end is being described.
+ *
+ * Crosses the wire inside QualityFeedback, which is why it lives here rather
+ * than beside the chooser that consumes it.
+ */
+export interface Viewport {
+  width: number;
+  height: number;
+}
+
 export interface QualityFeedback {
   level: QualityLevel;
   score: number;
@@ -421,6 +436,18 @@ export interface QualityFeedback {
   jitterMs: number;
   rttMs: number;
   fps: number;
+  /**
+   * How large the shared picture is actually being drawn on the receiver, in
+   * device pixels. Optional: a peer on an older build sends nothing, and the
+   * sender falls back to assuming 1080p (see resolutionBox).
+   *
+   * Carried on the quality message rather than one of its own because it wants
+   * exactly the same lifecycle as the verdict beside it — sent only while a
+   * share is being watched, expiring on the same clock, cleared when the peer
+   * changes. A second message would mean a second copy of that lifecycle, and
+   * the two would drift.
+   */
+  viewport?: Viewport;
 }
 
 /**
@@ -438,7 +465,24 @@ export interface UplinkEstimate {
   /** Spendable budget: the estimate after headroom. Feeds chooseOperatingPoint. */
   budgetBps: number;
   recommendedQuality: ScreenShareQuality;
-  supportedQualities: Record<ScreenShareQuality, boolean>;
+  /**
+   * Whether each preset's CAP is inside what the link was measured to carry.
+   *
+   * Advisory, and it must never gate input. It was called `supportedQualities`
+   * and drove `disabled` on the preset buttons, which was wrong in both
+   * directions. Downward: a collapsed estimate greyed out all five fixed
+   * presets, so a stuck session lost the only manual escape from itself.
+   * Upward, and worse because it is the steady state on a fast link: the
+   * estimate cannot exceed what we send, `auto` caps what we send, so `high`
+   * (needing 9.6 Mbps of estimate) and above could never unlock no matter how
+   * fast the link was — the ceiling bounded the measurement that would have
+   * raised the ceiling.
+   *
+   * A preset is only an upper bound; chooseOperatingPoint never raises the
+   * encoder TO one. An unreachable cap is therefore harmless, which is why this
+   * is a label and not a lock.
+   */
+  withinEstimate: Record<ScreenShareQuality, boolean>;
   /**
    * Bits per second we are demonstrably putting on the wire, from the delta in
    * the candidate pair's `bytesSent`. A measured lower bound, not a ceiling.

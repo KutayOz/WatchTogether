@@ -1,4 +1,9 @@
-import { QUALITY_LADDER, type QualityLevel, type ScreenShareQuality } from '../types';
+import {
+  QUALITY_LADDER,
+  type QualityLevel,
+  type ScreenShareQuality,
+  type Viewport,
+} from '../types';
 import type { SenderHealth } from './useSenderHealth';
 
 /**
@@ -88,6 +93,65 @@ export function stepUp(
   return QUALITY_LADDER[i + 1];
 }
 
+/**
+ * How long a viewer report stays actionable.
+ *
+ * The viewer re-sends its verdict on a heartbeat as well as on change (see
+ * FEEDBACK_HEARTBEAT_MS in useQualityMonitor), so silence well past a few
+ * heartbeats means the reporter is gone — not that everything is fine. Three
+ * heartbeats plus slack, so two consecutive lost messages cannot flap it.
+ *
+ * Without an expiry the receiver's leg of this control loop is a one-way
+ * ratchet, which is the exact failure the sender's leg was just rebuilt to
+ * remove: a single 'poor' latched forever makes `shortage` permanently true in
+ * nextBudget, which walks the budget to its floor and then short-circuits the
+ * probe branch that is the only way back up. A peer whose link dipped once, or
+ * who closed their laptop, would pin the rest of the film at 640x360.
+ */
+export const VIEWER_REPORT_TTL_MS = 30_000;
+
+/** What the far end last told us about itself, with the time it said it. */
+export interface ViewerReport {
+  level: QualityLevel;
+  /** How big the picture is being drawn over there, or null if not reported. */
+  viewport: Viewport | null;
+  /** Arrival time, on the same clock the reducers are given through `now`. */
+  at: number;
+}
+
+/**
+ * The report, or null once it is too old to act on.
+ *
+ * Null is the same "no opinion" the rest of this pipeline uses (see
+ * estimateFromBitrate's capacityKnown, nextBudget's estimateBps) rather than a
+ * cheerful default: an expired report must neither hold quality down nor claim
+ * the link is healthy — and an expired VIEWPORT must not keep us sending 4K to
+ * a screen that stopped answering.
+ */
+export function freshViewerReport(
+  report: ViewerReport | null,
+  now: number,
+): ViewerReport | null {
+  if (!report) return null;
+  return now - report.at > VIEWER_REPORT_TTL_MS ? null : report;
+}
+
+/** The viewer's verdict, or null when there is no fresh one. */
+export function currentViewerLevel(
+  report: ViewerReport | null,
+  now: number,
+): QualityLevel | null {
+  return freshViewerReport(report, now)?.level ?? null;
+}
+
+/** The viewer's viewport, or null when there is no fresh one. */
+export function currentViewerViewport(
+  report: ViewerReport | null,
+  now: number,
+): Viewport | null {
+  return freshViewerReport(report, now)?.viewport ?? null;
+}
+
 /** A viewer report that means "this is working". */
 function viewerIsHappy(level: QualityLevel | null): boolean {
   // null = the viewer has not reported. Absence of complaint is not evidence of
@@ -95,8 +159,14 @@ function viewerIsHappy(level: QualityLevel | null): boolean {
   return level === null || level === 'excellent' || level === 'good';
 }
 
-/** A viewer report that means "this is not working". */
-function viewerIsUnhappy(level: QualityLevel | null): boolean {
+/**
+ * A viewer report that means "this is not working".
+ *
+ * Exported because nextBudget needs the same test through its `viewerUnhappy`
+ * flag. It was a duplicated `=== 'poor' || === 'critical'` literal in
+ * SessionRoom, which is how the two consumers of one signal drift apart.
+ */
+export function viewerIsUnhappy(level: QualityLevel | null): boolean {
   return level === 'poor' || level === 'critical';
 }
 

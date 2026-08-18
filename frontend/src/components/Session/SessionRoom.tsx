@@ -16,14 +16,19 @@ import {
   nextBudget,
   type BudgetState,
   sameOperatingPoint,
+  sameViewport,
   type OperatingPoint,
 } from '../../hooks/operatingPoint';
 import { HEADROOM_SELECT } from '../../hooks/useUplinkEstimate';
 import {
+  currentViewerLevel,
+  currentViewerViewport,
   initialLadderState,
   nextLadderState,
+  viewerIsUnhappy,
   withUserChoice,
   type LadderState,
+  type ViewerReport,
 } from '../../hooks/qualityLadder';
 import { useQualityMonitor } from '../../hooks/useQualityMonitor';
 import { useTalkingWhileMuted } from '../../hooks/useTalkingWhileMuted';
@@ -56,8 +61,8 @@ import type {
   MediaState,
   ScreenShareQuality,
   QualityFeedback,
-  QualityLevel,
   ContentMode,
+  Viewport,
 } from '../../types';
 import { QUALITY_PRESETS, isContentMode, isScreenShareQuality } from '../../types';
 
@@ -209,9 +214,18 @@ export function SessionRoom() {
   // True once the user manually picks a quality this session — suppresses the
   // automatic speed-test clamp so we never override a deliberate choice.
   const userOverrodeQualityRef = useRef(false);
-  // Latest viewer verdict, fed into the ladder policy. A ref because it arrives
-  // on the data channel between renders and must not itself trigger one.
-  const viewerLevelRef = useRef<QualityLevel | null>(null);
+  // Latest viewer verdict, fed into both the budget and the ladder. A ref
+  // because it arrives on the data channel between renders and must not itself
+  // trigger one. Stamped, and read through currentViewerLevel, so a peer that
+  // stops reporting cannot hold quality down for the rest of the session.
+  const viewerReportRef = useRef<ViewerReport | null>(null);
+  // Our own size as a VIEWER, measured by ScreenShareView and sent to whoever
+  // is sharing. A ref for the same reason: a ResizeObserver firing must not
+  // re-render the whole room.
+  const myViewportRef = useRef<Viewport | null>(null);
+  const handleViewportChange = useCallback((viewport: Viewport | null) => {
+    myViewportRef.current = viewport;
+  }, []);
 
   /**
    * Budget assumed before the estimator has an opinion.
@@ -469,6 +483,10 @@ export function SessionRoom() {
       setPeerName(null);
       peerNameRef.current = null;
       setPeerMediaState(null);
+      // A verdict describes one peer's link. Carrying it into whoever joins
+      // next would judge a stranger's connection by the last one's troubles.
+      viewerReportRef.current = null;
+      setPeerQualityFeedback(null);
       setCurrentScreenSharer(null);
       webrtc.setRemoteScreenShareStreamId(null);
       webrtc.clearRemoteStreams();
@@ -648,7 +666,13 @@ export function SessionRoom() {
       // our own encoder's health. Recorded here, acted on in the ladder effect
       // below, so both signals go through one policy rather than two racing
       // ad-hoc branches that could only ever move quality downward.
-      viewerLevelRef.current = feedback.level;
+      viewerReportRef.current = {
+        level: feedback.level,
+        // Absent from an older peer's build, which is why resolutionBox has a
+        // conservative answer for null rather than requiring one.
+        viewport: feedback.viewport ?? null,
+        at: Date.now(),
+      };
     },
   });
 
@@ -659,7 +683,13 @@ export function SessionRoom() {
   const handleQualityFeedback = useCallback(async (feedback: QualityFeedback) => {
     if (sessionIdRef.current && transportRef.current) {
       try {
-        await transportRef.current.sendQualityFeedback(sessionIdRef.current, feedback);
+        // Our size rides along with our verdict. Decorated here rather than
+        // inside useQualityMonitor so that hook stays free of the DOM: it
+        // measures the connection, not the layout.
+        await transportRef.current.sendQualityFeedback(sessionIdRef.current, {
+          ...feedback,
+          ...(myViewportRef.current ? { viewport: myViewportRef.current } : {}),
+        });
       } catch (err) {
         logger.error('[Quality] Failed to send feedback:', err);
       }
@@ -688,6 +718,18 @@ export function SessionRoom() {
   );
   const budgetBps = budget.bps;
 
+  /*
+   * The peer's viewport, as of the last poll, or null when they have not
+   * reported one recently.
+   *
+   * State rather than a ref because it changes the operating point, and the
+   * memo below has to see it. Refreshed from viewerReportRef on the budget
+   * effect's own three-second cadence, which is also how it gets to EXPIRE —
+   * an old report going stale has to move this, and only a tick can notice
+   * that nothing arrived.
+   */
+  const [viewerViewport, setViewerViewport] = useState<Viewport | null>(null);
+
   /**
    * The operating point actually applied to the encoder.
    *
@@ -697,8 +739,8 @@ export function SessionRoom() {
    * used to run 720p and leave a third of its uplink unused.
    */
   const operatingPoint = useMemo(
-    () => chooseOperatingPoint(budgetBps, contentMode, ladder.applied),
-    [budgetBps, contentMode, ladder.applied],
+    () => chooseOperatingPoint(budgetBps, contentMode, ladder.applied, viewerViewport),
+    [budgetBps, contentMode, ladder.applied, viewerViewport],
   );
 
   /*
@@ -727,15 +769,24 @@ export function SessionRoom() {
    * means "no opinion" rather than "no bandwidth".
    */
   useEffect(() => {
+    const now = Date.now();
+    // Same freshness rule as the verdict: a viewport nobody has confirmed in
+    // thirty seconds must stop authorising a picture that large.
+    const viewport = currentViewerViewport(viewerReportRef.current, now);
+    setViewerViewport((prev) => (sameViewport(prev, viewport) ? prev : viewport));
     setBudget((prev) =>
       nextBudget(prev, {
-        now: Date.now(),
+        now,
+        viewport,
         estimateBps: uplink?.capacityKnown ? uplink.uplinkBps : null,
         health: senderHealth.health,
         // The only path by which the receiver's verdict reaches anything at all
-        // on `auto`, where the preset ladder is inert (`auto` is not a rung).
-        viewerUnhappy:
-          viewerLevelRef.current === 'poor' || viewerLevelRef.current === 'critical',
+        // on `auto`, where the preset ladder is inert (`auto` is not a rung) —
+        // and the only one at all when the path is TCP-relayed, since that is
+        // exactly when the uplink estimate stops being a capacity measurement.
+        // Read through currentViewerLevel so a report that stopped arriving
+        // expires instead of pinning `shortage` true forever.
+        viewerUnhappy: viewerIsUnhappy(currentViewerLevel(viewerReportRef.current, now)),
         headroom: HEADROOM_SELECT,
         mode: contentMode,
         ceiling: ladder.applied,
@@ -744,9 +795,14 @@ export function SessionRoom() {
   }, [uplink, senderHealth.health, senderHealth.streak, contentMode, ladder.applied]);
 
   // A new share is a new load; carrying the old budget across would judge it by
-  // the previous one's behaviour.
+  // the previous one's behaviour. The viewer's verdict goes with it, for the
+  // same reason and more sharply: feedback is only sent while a share is being
+  // watched, so a report that outlives one is by definition about the last one.
   useEffect(() => {
-    if (!webrtc.isScreenSharing) setBudget(initialBudgetState(COLD_START_BUDGET_BPS, Date.now()));
+    if (!webrtc.isScreenSharing) {
+      setBudget(initialBudgetState(COLD_START_BUDGET_BPS, Date.now()));
+      viewerReportRef.current = null;
+    }
   }, [webrtc.isScreenSharing]);
 
   // Long-lived signalling callbacks (screen-share approval, in particular) are
@@ -782,12 +838,13 @@ export function SessionRoom() {
    */
   useEffect(() => {
     if (!webrtc.isScreenSharing) return;
+    const now = Date.now();
     setLadder((prev) => {
       const next = nextLadderState(prev, {
-        now: Date.now(),
+        now,
         isSharing: true,
         senderHealth: senderHealth.health,
-        viewerLevel: viewerLevelRef.current,
+        viewerLevel: currentViewerLevel(viewerReportRef.current, now),
       });
       if (next.applied !== prev.applied) {
         // Deliberately NOT persisted. Only an explicit human pick is written to
@@ -1564,6 +1621,7 @@ export function SessionRoom() {
               externalScreenAudioVolume={screenAudioVolume}
               peerCursor={peerCursor}
               onLocalCursor={handleLocalCursor}
+              onViewportChange={handleViewportChange}
             />
             )}
           </div>

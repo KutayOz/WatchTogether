@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { budgetCeilingBps } from './operatingPoint';
 import {
   OVER_ESTIMATE_MARGIN,
   estimateFromBitrate,
@@ -34,7 +35,7 @@ describe('estimateFromBitrate', () => {
     // 1 Mbps against low's 1.6 Mbps.
     const estimate = estimateFromBitrate(1_000_000);
 
-    expect(estimate.supportedQualities.low).toBe(false);
+    expect(estimate.withinEstimate.low).toBe(false);
     // 'auto' rather than 'low': the encoder adapting downward is honest, where
     // recommending a preset the link cannot sustain is not.
     expect(estimate.recommendedQuality).toBe('auto');
@@ -45,15 +46,15 @@ describe('estimateFromBitrate', () => {
     const estimate = estimateFromBitrate(6_000_000);
 
     expect(estimate.recommendedQuality).toBe('medium');
-    expect(estimate.supportedQualities.medium).toBe(true);
-    expect(estimate.supportedQualities.high).toBe(false);
+    expect(estimate.withinEstimate.medium).toBe(true);
+    expect(estimate.withinEstimate.high).toBe(false);
   });
 
   it('unlocks everything on a fast link', () => {
     const estimate = estimateFromBitrate(50_000_000);
 
     expect(estimate.recommendedQuality).toBe('extreme');
-    for (const quality of LADDER) expect(estimate.supportedQualities[quality]).toBe(true);
+    for (const quality of LADDER) expect(estimate.withinEstimate[quality]).toBe(true);
   });
 
   /**
@@ -63,7 +64,7 @@ describe('estimateFromBitrate', () => {
    */
   it('always keeps auto available', () => {
     for (const bps of [0, 100_000, 1_000_000, 100_000_000]) {
-      expect(estimateFromBitrate(bps).supportedQualities.auto).toBe(true);
+      expect(estimateFromBitrate(bps).withinEstimate.auto).toBe(true);
     }
   });
 
@@ -77,7 +78,7 @@ describe('estimateFromBitrate', () => {
     // planning to use 100% of what the estimator saw.
     const estimate = estimateFromBitrate(cost('medium'));
 
-    expect(estimate.supportedQualities.medium).toBe(false);
+    expect(estimate.withinEstimate.medium).toBe(false);
   });
 
   /**
@@ -91,9 +92,9 @@ describe('estimateFromBitrate', () => {
     for (let bps = 1_000_000; bps <= 60_000_000; bps += 1_000_000) {
       const current = estimateFromBitrate(bps);
       for (const quality of LADDER) {
-        if (previous.supportedQualities[quality]) {
+        if (previous.withinEstimate[quality]) {
           expect(
-            current.supportedQualities[quality],
+            current.withinEstimate[quality],
             `${quality} was supported at a lower bitrate but not at ${bps}`,
           ).toBe(true);
         }
@@ -274,8 +275,8 @@ describe('advice from an untrusted number', () => {
     // out all five fixed presets (MediaControls: disabled={!isSupported}), so
     // the collapse removed the only manual escape from itself.
     const bogus = estimateFromBitrate(30_000, false);
-    for (const key of Object.keys(bogus.supportedQualities) as ScreenShareQuality[]) {
-      expect(bogus.supportedQualities[key]).toBe(true);
+    for (const key of Object.keys(bogus.withinEstimate) as ScreenShareQuality[]) {
+      expect(bogus.withinEstimate[key]).toBe(true);
     }
     expect(bogus.recommendedQuality).toBe('auto');
     expect(bogus.capacityKnown).toBe(false);
@@ -283,7 +284,24 @@ describe('advice from an untrusted number', () => {
 
   it('still says a slow link is slow when it actually measured one', () => {
     const measured = estimateFromBitrate(30_000, true);
-    expect(measured.supportedQualities.low).toBe(false);
-    expect(measured.supportedQualities.auto).toBe(true);
+    expect(measured.withinEstimate.low).toBe(false);
+    expect(measured.withinEstimate.auto).toBe(true);
+  });
+});
+
+describe('withinEstimate is advice, not a lock', () => {
+  it('cannot clear the top presets from anything auto is able to send', () => {
+    // The arithmetic that made the old `disabled={!isSupported}` a trap at the
+    // top end. `availableOutgoingBitrate` cannot exceed what we send, `auto`
+    // bounds what we send, so the estimate on `auto` tops out at its own cap —
+    // and `high` needs 9.6 Mbps of estimate to clear. The ceiling bounded the
+    // measurement that would have raised the ceiling, so a 60 Mbps uplink saw
+    // High, Ultra and Extreme greyed out and had no way to reach them.
+    const mostAutoCanSend = budgetCeilingBps('auto', 24, null);
+    const estimate = estimateFromBitrate(mostAutoCanSend);
+
+    expect(estimate.withinEstimate.high).toBe(false);
+    expect(estimate.withinEstimate.ultra).toBe(false);
+    expect(estimate.withinEstimate.extreme).toBe(false);
   });
 });

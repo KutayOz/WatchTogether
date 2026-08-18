@@ -226,6 +226,51 @@ invite, join it from another profile, and confirm video both ways, chat
   probes upward at 1.5x and reverts exactly on failure. Firefox still publishes
   neither statistic, and there the hooks deliberately have no opinion.
 
+- **The receiver's leg of that loop was a ratchet of its own.** Found while
+  checking whether the pipeline is symmetric. Quality feedback was sent only on
+  level *change*, and the sender stored it as a bare level that was never
+  cleared — not on peer change, not between shares. One `'poor'` therefore made
+  `shortage` permanently true in `nextBudget`, which walks the budget to its
+  floor and then short-circuits the probe branch that is the only way back up:
+  the same deadlock as above, arriving through the other door. The viewer's
+  complaint was also inert whenever a trusted estimate sat above what we spend,
+  since `min(bps, target)` is a no-op there — so the one shortage GCC cannot see
+  (a receiver freezing on a decoder it cannot feed, nothing lost in flight)
+  could be reported forever with nothing moving.
+
+  What guards it now: the receiver re-sends its verdict every 9 s
+  (`FEEDBACK_HEARTBEAT_MS`) so silence is distinguishable from steady state, the
+  sender expires a report after 30 s (`VIEWER_REPORT_TTL_MS`) and clears it on
+  peer change and share stop, and a viewer complaint takes the multiplicative
+  path when the estimate is not the binding constraint.
+
+- **`auto` could not reach a fast link, and the escape hatch was locked.** The
+  mirror image of the collapse, at the top end. `auto` was boxed at 1080p on a
+  6 Mbps cap — which could not have funded 4K anyway, since 4K24 needs 6.97 Mbps
+  just to reach `TARGET_BPP`. Worse, the preset menu set `disabled` from
+  `presetBitrate(key) <= estimate * 0.85`, and `availableOutgoingBitrate` cannot
+  exceed what we send: on `auto` the estimate topped out at `auto`'s own cap, so
+  `high` (needing 9.6 Mbps of estimate), `ultra` and `extreme` could never
+  unlock however fast the link was. The ceiling bounded the measurement that
+  would have raised the ceiling, and the only selectable presets were *worse*
+  than the one already applied.
+
+  What guards it now: presets are never disabled — a preset is only an upper
+  bound and `chooseOperatingPoint` never raises the encoder to one, so an
+  unreachable cap is a label (`withinEstimate`), not a lock. `auto` reaches 4K,
+  bounded by three things at once: the budget, the preset, and the receiver's
+  own viewport, which now rides on the quality heartbeat. `AUTO_MAX_BITRATE` is
+  10 Mbps and `MAX_USEFUL_BPP` (0.1) stops a small window absorbing a large
+  budget. Measured against the shipped modules: 1080p/4.98 Mbps with no viewport
+  report, 4K/9.9 Mbps at 0.050 bpp with a 4K one, 720p/2.2 Mbps into a 1280x720
+  window, and floor-to-cap in 108 s on probes alone.
+
+- **None of the top-end work has been watched on a real link.** It is verified
+  by unit tests and by evaluating the real modules in a browser, not by two
+  people on 4K screens. The viewport measurement in particular — element box
+  times `devicePixelRatio`, via `ResizeObserver` — has never been read off a
+  real receiver.
+
 - **Why UDP relay lost is still unanswered.** `getIceDiagnostics()` /
   `formatIceDiagnostics()` in `frontend/src/services/webrtcService.ts` dump the
   candidate and pair tables via `logger.warn` whenever a session ends up

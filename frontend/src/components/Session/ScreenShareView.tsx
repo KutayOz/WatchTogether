@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { MediaControls } from '../Controls/MediaControls';
 import { QualityIndicator } from '../Quality/QualityIndicator';
 import { StickerButton, BurstSticker, Doodle, SFX } from '../manga';
-import type { QualityLevel } from '../../types';
+import type { QualityLevel, Viewport } from '../../types';
 
 interface ScreenShareViewProps {
   screenStream: MediaStream | null;
@@ -38,6 +38,11 @@ interface ScreenShareViewProps {
   /** Fired on every mousemove over the shared content (normalized 0..1).
    *  Parent throttles upstream (~10Hz over the wire). */
   onLocalCursor?: (x: number, y: number) => void;
+  /** How large the shared picture is actually being drawn here, in device
+   *  pixels, or null before layout. Reported upstream so the SENDER can stop
+   *  paying for pixels this screen has nowhere to put. Must be stable across
+   *  renders — it drives a ResizeObserver. */
+  onViewportChange?: (viewport: Viewport | null) => void;
 }
 
 export function ScreenShareView({
@@ -67,6 +72,7 @@ export function ScreenShareView({
   externalScreenAudioVolume,
   peerCursor,
   onLocalCursor,
+  onViewportChange,
 }: ScreenShareViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -183,6 +189,41 @@ export function ScreenShareView({
     const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     setIsTouchDevice(hasTouch);
   }, []);
+
+  /*
+   * Tell the sender how big we are actually drawing their screen.
+   *
+   * The element box rather than the drawn rectangle, even though objectFit is
+   * 'contain' and letterboxes: every resolution the sender will offer is 16:9
+   * and it bounds width AND height, so a 1920x900 window correctly resolves to
+   * 1600x900 without us having to know the source aspect ratio here.
+   *
+   * devicePixelRatio because a 960 CSS-pixel element on a Retina display has
+   * 1920 real pixels to fill, and real pixels are what the question is about.
+   *
+   * A ResizeObserver rather than a resize listener so this also catches
+   * fullscreen, sidebar toggles and layout changes — the moments when the
+   * answer changes most.
+   */
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !onViewportChange) return;
+
+    const report = () => {
+      const rect = el.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.round(rect.width * dpr);
+      const height = Math.round(rect.height * dpr);
+      // Before layout the box is 0x0. Null — no opinion — rather than a zero
+      // that would collapse the sender's resolution box to nothing.
+      onViewportChange(width > 0 && height > 0 ? { width, height } : null);
+    };
+
+    report();
+    const observer = new ResizeObserver(report);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [onViewportChange]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

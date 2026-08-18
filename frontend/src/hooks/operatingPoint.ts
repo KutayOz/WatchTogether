@@ -3,6 +3,7 @@ import {
   QUALITY_PRESETS,
   type ContentMode,
   type ScreenShareQuality,
+  type Viewport,
 } from '../types';
 // Type-only, so this stays a compile-time reference: useSenderHealth imports
 // webrtcService, which imports OperatingPoint from this file.
@@ -53,8 +54,29 @@ export const TARGET_BPP = 0.035;
  * overshoots the path, the pacer builds a standing queue, the delay-based
  * controller sees the queue as congestion, and the picture goes soft and laggy
  * simultaneously. A finite ceiling is strictly better even when it is generous.
+ *
+ * Derived, not guessed: the largest picture `auto` will send is 4K, and 4K at
+ * 24 fps needs 6.97 Mbps merely to REACH target bpp. The old 6 Mbps therefore
+ * could not fund 4K at all — raising `auto` past 1080p without raising this
+ * would have changed nothing. Ten gives 4K24 a comfortable 0.050 bpp, and at 60
+ * fps it lands the chooser on 1440p, which is the honest answer at that frame
+ * rate anyway.
  */
-export const AUTO_MAX_BITRATE = 6_000_000;
+export const AUTO_MAX_BITRATE = 10_000_000;
+
+/**
+ * Bits per pixel per frame past which more bits stop buying visible quality.
+ *
+ * Roughly three times TARGET_BPP. This exists because the budget measures what
+ * the LINK can carry, not what the PICTURE can use, and the two came apart as
+ * soon as the receiver's viewport started bounding resolution: someone watching
+ * in a 1280x720 window on a fast link would otherwise be sent 720p at 0.45 bpp
+ * — bits with nowhere to land, taken from a connection they are also using for
+ * everything else.
+ *
+ * It is a ceiling on waste, not a target. Nothing is ever raised TO it.
+ */
+export const MAX_USEFUL_BPP = 0.1;
 
 /**
  * Resolutions we are willing to send, largest first.
@@ -123,6 +145,60 @@ export function minBudgetBps(fps: number): number {
   return minVideoBps(fps) + MIN_AUDIO_BPS;
 }
 
+/**
+ * The box to assume for `auto` when the receiver has not said how big it is.
+ *
+ * 1080p, which is exactly what `auto` meant before it could be told otherwise.
+ * Sending more than this to a display we know nothing about spends bits that
+ * may have nowhere to land, and `auto` is the setting whose whole meaning is
+ * "you decide" — so with no information it decides conservatively.
+ */
+const UNKNOWN_VIEWPORT: Viewport = { width: 1920, height: 1080 };
+
+/**
+ * The largest picture we are willing to send: the preset's box, bounded by what
+ * the far end can actually display.
+ *
+ * The asymmetry between `auto` and a fixed preset is deliberate. `auto` means
+ * "you decide", so an absent viewport report falls back to the conservative
+ * assumption above. A fixed preset means "I decided" — the same principle
+ * withUserChoice already encodes, that an explicit choice is a statement of
+ * intent — so a report that never arrived must not quietly overrule it.
+ */
+export function resolutionBox(
+  ceiling: ScreenShareQuality,
+  viewport: Viewport | null,
+): Viewport {
+  const preset = QUALITY_PRESETS[ceiling] ?? QUALITY_PRESETS.auto;
+  const bound = viewport ?? (ceiling === 'auto' ? UNKNOWN_VIEWPORT : null);
+  if (!bound) return { width: preset.video.width, height: preset.video.height };
+  return {
+    width: Math.min(preset.video.width, bound.width),
+    height: Math.min(preset.video.height, bound.height),
+  };
+}
+
+/**
+ * The most a given box can usefully spend at a given frame rate.
+ *
+ * Rounded DOWN to the quantisation step, where minVideoBps rounds up. A floor
+ * rounds up so it stays achievable; a ceiling rounds down so it stays a
+ * ceiling. Rounding this one up let the chosen point land at 0.1006 bpp — past
+ * the very bound it exists to impose.
+ *
+ * Never below the floor: the chooser will send SMALLEST even when the box is
+ * tinier than that, and what it sends has to remain fundable — otherwise a
+ * viewport smaller than 640x360 would push the bitrate under the floor the rest
+ * of this file exists to defend. On that path the floor wins and the bpp bound
+ * gives way, which is the right order of precedence: unwatchable is worse than
+ * wasteful.
+ */
+export function usefulVideoBps(box: Viewport, fps: number): number {
+  const exact = MAX_USEFUL_BPP * box.width * box.height * fps;
+  const quantised = Math.floor(exact / BITRATE_STEP) * BITRATE_STEP;
+  return Math.max(minVideoBps(fps), quantised);
+}
+
 export interface OperatingPoint {
   width: number;
   height: number;
@@ -157,11 +233,16 @@ function audioReserve(budgetBps: number, ceilingAudioBps: number): number {
  *                   spends what it is given rather than discounting again.
  * @param mode       Content mode; owns frame rate.
  * @param ceiling    The quality preset the user selected, as an upper bound.
+ * @param viewport   What the receiver can actually display, or null when it has
+ *                   not said. A third upper bound alongside the budget and the
+ *                   preset: pixels the far end cannot show are pixels nobody
+ *                   sees, and the bits they cost are better spent on bpp.
  */
 export function chooseOperatingPoint(
   budgetBps: number,
   mode: ContentMode,
   ceiling: ScreenShareQuality = 'auto',
+  viewport: Viewport | null = null,
 ): OperatingPoint {
   const preset = QUALITY_PRESETS[ceiling] ?? QUALITY_PRESETS.auto;
 
@@ -190,9 +271,15 @@ export function chooseOperatingPoint(
 
   const audioBps = audioReserve(budget, preset.audio.bitrate);
 
+  // The largest picture we will send, and with it the most that can usefully be
+  // spent on one. Three bounds meet here: the link's (budget), the user's
+  // (preset), and the receiver's (viewport).
+  const box = resolutionBox(ceiling, viewport);
+
   // `bitrate: 0` means "budget decides" — clamp to the safety ceiling, never to
   // nothing. This is the line that removes the uncapped-encoder failure mode.
-  const videoCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
+  const presetCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
+  const videoCeiling = Math.min(presetCeiling, usefulVideoBps(box, fps));
   const raw = Math.max(0, Math.min(budget - audioBps, videoCeiling));
 
   // Quantised, so a bandwidth estimate that wanders by a few kbps every three
@@ -206,7 +293,7 @@ export function chooseOperatingPoint(
   const videoBps = Math.min(videoCeiling, Math.max(quantised, minVideoBps(fps)));
 
   const fitsCeiling = (r: { width: number; height: number }) =>
-    r.width <= preset.video.width && r.height <= preset.video.height;
+    r.width <= box.width && r.height <= box.height;
 
   // The largest resolution that still clears TARGET_BPP at this bitrate and
   // frame rate. Walking largest-first and taking the first hit gives exactly
@@ -271,10 +358,23 @@ export const MAX_BUDGET_PROBE_BACKOFF_MS = 120_000;
  */
 export const BACKOFF_FACTOR = 0.85;
 
-/** Total bits per second a quality ceiling permits, video and audio together. */
-export function budgetCeilingBps(quality: ScreenShareQuality): number {
+/**
+ * Total bits per second a quality ceiling permits, video and audio together.
+ *
+ * Takes the same three bounds chooseOperatingPoint does, so the budget stops
+ * climbing exactly where the picture stops improving. Without the viewport term
+ * a small window on a fast link would keep probing upward forever against an
+ * encoder configuration that could not change: harmless in the end, since the
+ * clamp catches it, but it would burn every probe cycle learning nothing.
+ */
+export function budgetCeilingBps(
+  quality: ScreenShareQuality,
+  fps: number,
+  viewport: Viewport | null = null,
+): number {
   const preset = QUALITY_PRESETS[quality] ?? QUALITY_PRESETS.auto;
-  const video = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
+  const presetCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
+  const video = Math.min(presetCeiling, usefulVideoBps(resolutionBox(quality, viewport), fps));
   return video + preset.audio.bitrate;
 }
 
@@ -304,6 +404,8 @@ export interface BudgetSignals {
   mode: ContentMode;
   /** The user's ceiling, and through it the cap. */
   ceiling: ScreenShareQuality;
+  /** What the receiver can display, or null. Bounds the cap alongside `ceiling`. */
+  viewport: Viewport | null;
 }
 
 export function initialBudgetState(bps: number, now: number): BudgetState {
@@ -342,7 +444,7 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   const floor = minBudgetBps(fps);
   // max(floor, ...) because the floor wins: a picture we refuse to go below
   // costs what it costs, even under a ceiling that would rather it did not.
-  const cap = Math.max(floor, budgetCeilingBps(sig.ceiling));
+  const cap = Math.max(floor, budgetCeilingBps(sig.ceiling, fps, sig.viewport));
   const clamp = (bps: number) => Math.min(cap, Math.max(floor, bps));
 
   const shortage = sig.health === 'under-served' || sig.viewerUnhappy;
@@ -378,8 +480,22 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
 
   // Genuine shortage. Follow a trusted estimate down; without one, back off
   // multiplicatively rather than standing still while the picture breaks.
+  //
+  // The viewer's report gets the multiplicative path even when a trusted
+  // estimate exists, because the two measure different things: the estimate is
+  // the path's CAPACITY, the report is what actually ARRIVED. A capacity
+  // estimate sitting above what we already spend makes `min(bps, target)` a
+  // no-op, so without this branch a far end that is freezing on a decoder it
+  // cannot feed — the one shortage GCC genuinely cannot see, since nothing is
+  // being lost in flight — could complain forever with nothing moving. Lowering
+  // the budget is a real answer there: it lowers the resolution too.
   if (shortage) {
-    const lowered = target === null ? state.bps * BACKOFF_FACTOR : Math.min(state.bps, target);
+    const byEstimate = target === null ? state.bps : Math.min(state.bps, target);
+    const estimateSaysNothing = byEstimate >= state.bps;
+    const lowered =
+      target === null || (sig.viewerUnhappy && estimateSaysNothing)
+        ? state.bps * BACKOFF_FACTOR
+        : byEstimate;
     const bps = clamp(lowered);
     if (bps === state.bps) return state;
     return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
@@ -404,6 +520,12 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   }
 
   return state;
+}
+
+/** True when two viewports are the same box, nulls included. */
+export function sameViewport(a: Viewport | null, b: Viewport | null): boolean {
+  if (!a || !b) return a === b;
+  return a.width === b.width && a.height === b.height;
 }
 
 /** True when two points would produce an identical encoder configuration. */
