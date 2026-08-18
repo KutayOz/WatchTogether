@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { estimateFromBitrate, shouldClamp } from './useUplinkEstimate';
+import {
+  OVER_ESTIMATE_MARGIN,
+  estimateFromBitrate,
+  isCapacityMeasurable,
+  readUplinkSample,
+  reconcileEstimate,
+  shouldClamp,
+  throughputBps,
+  type UplinkSample,
+} from './useUplinkEstimate';
 import { QUALITY_LADDER, QUALITY_PRESETS, type ScreenShareQuality } from '../types';
 
 /**
@@ -134,5 +143,147 @@ describe('shouldClamp', () => {
     // Firefox does not publish the statistic. Guessing would silently cap
     // quality for every user of a browser that simply declines to answer.
     expect(shouldClamp('extreme', null)).toBe(false);
+  });
+});
+
+/**
+ * Reading the link, and knowing when not to believe what it says.
+ *
+ * The session that motivated all of this ran over a TURN/TCP relay at 231 ms.
+ * `availableOutgoingBitrate` there sat at ~30 kbps — within one BITRATE_STEP of
+ * exactly what we were sending — on a link whose two ends had 200 Mbps and
+ * 30 Mbps. The estimator was measuring our own ask, not the path.
+ */
+describe('reading the candidate pair', () => {
+  function report(entries: Array<Record<string, unknown> & { id: string; type: string }>) {
+    return new Map(entries.map((e) => [e.id, e])) as unknown as RTCStatsReport;
+  }
+
+  it('prefers the nominated pair and reads how it reaches the relay', () => {
+    const sample = readUplinkSample(
+      report([
+        { id: 'L', type: 'local-candidate', relayProtocol: 'tcp' },
+        {
+          id: 'other',
+          type: 'candidate-pair',
+          state: 'succeeded',
+          availableOutgoingBitrate: 9_000_000,
+        },
+        {
+          id: 'live',
+          type: 'candidate-pair',
+          state: 'succeeded',
+          nominated: true,
+          availableOutgoingBitrate: 30_000,
+          bytesSent: 500_000,
+          localCandidateId: 'L',
+        },
+      ]),
+      1000,
+    );
+
+    expect(sample).toMatchObject({ pairId: 'live', bps: 30_000, relayProtocol: 'tcp' });
+  });
+
+  it('has no opinion when the browser publishes none', () => {
+    // Firefox. Null must mean "do not clamp", never "clamp to the lowest".
+    expect(
+      readUplinkSample(report([{ id: 'p', type: 'candidate-pair', state: 'succeeded' }]), 0),
+    ).toBeNull();
+  });
+
+  it('does not trust a TCP or TLS relay to measure capacity', () => {
+    const at = (relayProtocol?: string): UplinkSample => ({
+      pairId: 'p',
+      bps: 30_000,
+      bytesSent: 0,
+      relayProtocol,
+      atMs: 0,
+    });
+
+    expect(isCapacityMeasurable(at('tcp'))).toBe(false);
+    expect(isCapacityMeasurable(at('tls'))).toBe(false);
+    expect(isCapacityMeasurable(at('udp'))).toBe(true);
+    expect(isCapacityMeasurable(at(undefined))).toBe(true); // direct P2P
+  });
+});
+
+describe('throughputBps', () => {
+  const at = (pairId: string, bytesSent: number, atMs: number): UplinkSample => ({
+    pairId,
+    bps: 1_000_000,
+    bytesSent,
+    atMs,
+  });
+
+  it('needs two samples before it can say anything', () => {
+    expect(throughputBps(null, at('p', 100, 0))).toBeNull();
+  });
+
+  it('measures the delta as bits per second', () => {
+    // 125 000 bytes in 1 s = 1 Mbps.
+    expect(throughputBps(at('p', 0, 0), at('p', 125_000, 1000))).toBe(1_000_000);
+  });
+
+  it('refuses to difference across a candidate-pair change', () => {
+    // bytesSent restarts per pair. Without this guard an ICE switch invents an
+    // enormous throughput spike out of a counter reset.
+    expect(throughputBps(at('old', 5_000_000, 0), at('new', 1_000, 1000))).toBeNull();
+  });
+});
+
+describe('reconcileEstimate', () => {
+  it('replaces a TCP-relay estimate with what we actually sent', () => {
+    // The reported failure, verbatim: estimate pinned at 30 kbps while we were
+    // demonstrably pushing ~100 kbps of bytes through the relay.
+    expect(reconcileEstimate(30_000, 100_000, false)).toEqual({
+      bps: 100_000,
+      capacityKnown: false,
+    });
+  });
+
+  it('believes the estimate when nothing contradicts it', () => {
+    expect(reconcileEstimate(3_000_000, 2_500_000, true)).toEqual({
+      bps: 3_000_000,
+      capacityKnown: true,
+    });
+  });
+
+  it('disbelieves an estimate the wire has already beaten', () => {
+    // Only one of "you cannot send 1 Mbps" and "we just sent 2 Mbps" is true.
+    const observed = 1_000_000 * OVER_ESTIMATE_MARGIN + 1;
+    expect(reconcileEstimate(1_000_000, observed, true)).toEqual({
+      bps: observed,
+      capacityKnown: false,
+    });
+  });
+
+  it('tolerates framing overhead without calling the estimate wrong', () => {
+    // bytesSent counts STUN, RTCP and TURN framing alongside media.
+    expect(reconcileEstimate(1_000_000, 1_050_000, true).capacityKnown).toBe(true);
+  });
+
+  it('holds no opinion when it has neither number', () => {
+    expect(reconcileEstimate(null, null, true).bps).toBeNull();
+  });
+});
+
+describe('advice from an untrusted number', () => {
+  it('never disables a preset it cannot honestly rule out', () => {
+    // The regression that stranded the user. A 30 kbps TCP-relay reading greyed
+    // out all five fixed presets (MediaControls: disabled={!isSupported}), so
+    // the collapse removed the only manual escape from itself.
+    const bogus = estimateFromBitrate(30_000, false);
+    for (const key of Object.keys(bogus.supportedQualities) as ScreenShareQuality[]) {
+      expect(bogus.supportedQualities[key]).toBe(true);
+    }
+    expect(bogus.recommendedQuality).toBe('auto');
+    expect(bogus.capacityKnown).toBe(false);
+  });
+
+  it('still says a slow link is slow when it actually measured one', () => {
+    const measured = estimateFromBitrate(30_000, true);
+    expect(measured.supportedQualities.low).toBe(false);
+    expect(measured.supportedQualities.auto).toBe(true);
   });
 });

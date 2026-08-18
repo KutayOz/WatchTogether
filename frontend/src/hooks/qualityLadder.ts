@@ -155,7 +155,12 @@ export function nextLadderState(state: LadderState, sig: LadderSignals): LadderS
   }
 
   // Healthy. Accumulate evidence, then probe upward.
-  const healthy = sig.senderHealth === 'satisfied' && viewerIsHappy(sig.viewerLevel);
+  // 'self-limited' counts as healthy: the encoder is getting everything it was
+  // given and wants more. Leaving it out would make a new union member silently
+  // mean "not healthy", which is the failure this member exists to end.
+  const healthy =
+    (sig.senderHealth === 'satisfied' || sig.senderHealth === 'self-limited') &&
+    viewerIsHappy(sig.viewerLevel);
   if (!healthy) return { ...state, consecutiveGood: 0 };
 
   const consecutiveGood = state.consecutiveGood + 1;

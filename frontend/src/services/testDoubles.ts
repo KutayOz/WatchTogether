@@ -321,6 +321,10 @@ export class FakePeerConnection {
     return [...this.senders];
   }
 
+  /** ICE state, so the diagnostics dump has something honest to report. */
+  iceGatheringState: RTCIceGatheringState = 'complete';
+  iceConnectionState: RTCIceConnectionState = 'connected';
+
   /** Connection-wide stats. Set by the test; empty by default. */
   stats: RTCStatsReport = new Map() as unknown as RTCStatsReport;
 

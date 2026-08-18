@@ -10,6 +10,7 @@ import {
   formatTransportPath,
   type TransportDiagnostics,
 } from '../../hooks/useTransportDiagnostics';
+import type { OperatingPoint } from '../../hooks/operatingPoint';
 
 interface MediaControlsProps {
   isMuted: boolean;
@@ -38,6 +39,14 @@ interface MediaControlsProps {
   uplink?: UplinkEstimate | null;
   /** Live transport path + encoder readout. Null entries render nothing. */
   diagnostics?: TransportDiagnostics | null;
+  /**
+   * What the encoder was ASKED for, so the overlay can show it beside what the
+   * encoder achieved. Without the pair, `sending: 344x182 @ 1` reads as a
+   * deliberate choice rather than the encoder giving up on our ask.
+   */
+  appliedPoint?: OperatingPoint | null;
+  /** True when the budget is pinned at its floor — the link cannot fund more. */
+  atBudgetFloor?: boolean;
   contentMode?: ContentMode;
   onContentModeChange?: (mode: ContentMode) => void;
 }
@@ -67,6 +76,8 @@ export function MediaControls({
   onScreenAudioVolumeChange,
   uplink,
   diagnostics,
+  appliedPoint,
+  atBudgetFloor = false,
   contentMode = 'film',
   onContentModeChange,
 }: MediaControlsProps) {
@@ -188,7 +199,20 @@ export function MediaControls({
                       lineHeight: 1.5,
                     }}
                   >
-                    {uplink && <div>↑ uplink: {uplink.uplinkMbps} Mbps</div>}
+                    {/* "≥" and not "=" when the number is a measured lower
+                        bound rather than a capacity estimate — on a TCP relay
+                        `availableOutgoingBitrate` describes TCP, not the path.
+                        Showing 0.0 Mbps there, as this line used to, is how a
+                        200 Mbps link got reported as having no bandwidth. */}
+                    {uplink && (
+                      <div>
+                        ↑ uplink: {uplink.capacityKnown ? '' : '≥ '}
+                        {uplink.uplinkMbps} Mbps
+                        {!uplink.capacityKnown && (
+                          <span style={{ opacity: 0.7 }}> · no capacity estimate on this path</span>
+                        )}
+                      </div>
+                    )}
                     {diagnostics?.path && (
                       <div
                         style={{
@@ -216,6 +240,20 @@ export function MediaControls({
                         {diagnostics.outbound.targetBitrate != null &&
                           ` · ${(diagnostics.outbound.targetBitrate / 1_000_000).toFixed(2)} Mbps`}
                         {diagnostics.bpp != null && ` · ${diagnostics.bpp.toFixed(3)} bpp`}
+                      </div>
+                    )}
+                    {/* What we asked for, beside what came back. The reported
+                        session showed `344×182 @ 1 · 0.479 bpp` — a bpp figure
+                        13× above target, because a collapsed frame rate
+                        INFLATES bits-per-pixel. Only the gap against the ask
+                        makes that readable as a failure. */}
+                    {appliedPoint && (
+                      <div>
+                        asked: {appliedPoint.width}×{appliedPoint.height} @ {appliedPoint.fps}
+                        {` · ${(appliedPoint.videoBps / 1_000_000).toFixed(2)} Mbps`}
+                        {atBudgetFloor && (
+                          <span style={{ color: 'var(--orange-deep)' }}> · at floor</span>
+                        )}
                       </div>
                     )}
                     {/* Only worth surfacing when it is actually limiting something. */}

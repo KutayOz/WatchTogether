@@ -30,6 +30,12 @@ export interface TransportDiagnostics {
    * >= 0.035 looks good on VP9 motion content, 0.025-0.035 is acceptable,
    * below 0.02 is visibly soft.
    *
+   * Only meaningful AT THE INTENDED FRAME RATE. bpp divides by the frame rate
+   * actually achieved, so an encoder that has collapsed to 1 fps reports a bpp
+   * far ABOVE target while showing a slideshow — the reported failure read
+   * `344x182 @ 1 · 0.479 bpp`, thirteen times target. Read it beside the
+   * operating point that was asked for, never alone.
+   *
    * null when any input is missing — never a partial estimate.
    */
   bpp: number | null;

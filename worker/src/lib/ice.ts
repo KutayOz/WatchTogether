@@ -60,6 +60,16 @@ export function normalizeEntries(body: CloudflareIceResponse): IceServer[] {
 }
 
 /**
+ * The URLs we are about to hand a client, as one line.
+ *
+ * Pure and exported so the "no credentials" property is a test rather than a
+ * reviewer's memory — this string goes to the Worker log.
+ */
+export function summarizeIceServers(servers: IceServer[]): string {
+  return servers.map((s) => s.urls).join(" ");
+}
+
+/**
  * Mint short-lived TURN credentials.
  *
  * Degrades to STUN-only on any failure rather than erroring: a session with no
@@ -107,7 +117,13 @@ export async function getIceServers(env: Env): Promise<IceServer[]> {
       return STUN_SERVERS;
     }
 
-    return [...STUN_SERVERS, ...minted];
+    const servers = [...STUN_SERVERS, ...minted];
+    // So a support case is answerable from the Worker log alone. The question
+    // that mattered in the reported TURN/TCP session was "was a UDP relay URL
+    // even offered?" — and only this side knows what Cloudflare minted.
+    // URLs only; the credentials that ride alongside them never get logged.
+    console.info(`[ice] offering ${summarizeIceServers(servers)}`);
+    return servers;
   } catch (error) {
     console.warn("[ice] Cloudflare TURN mint error", error);
     return STUN_SERVERS;

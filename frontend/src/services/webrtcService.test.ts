@@ -7,7 +7,7 @@ import {
   stubDisplayMedia,
   type FakeRtpSender,
 } from './testDoubles';
-import { webrtcService } from './webrtcService';
+import { formatIceDiagnostics, webrtcService } from './webrtcService';
 import { chooseOperatingPoint } from '../hooks/operatingPoint';
 
 /** A concrete operating point, standing in for whatever the link measured. */
@@ -567,5 +567,148 @@ describe('webrtcService outbound screen stats', () => {
     pc.stats = fakeStatsReport([]);
 
     expect(await webrtcService.getOutboundScreenStats()).toBeNull();
+  });
+});
+
+/**
+ * Why a session ended up relayed over TCP.
+ *
+ * The reported failure showed `path: relayed (turn/tcp) · 231 ms` and nothing
+ * else. Three different causes produce that identical line — UDP to the TURN
+ * server being dropped, no relay/udp candidate ever gathered, or a succeeded
+ * UDP pair losing nomination — and they want three different fixes. This is the
+ * readout that tells them apart.
+ */
+describe('webrtcService ice diagnostics', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    pc = await freshService();
+  });
+
+  /** A gathered UDP relay whose STUN requests go unanswered, plus a live TCP one. */
+  function tcpRelayFallbackStats() {
+    return fakeStatsReport([
+      { id: 'T', type: 'transport', selectedCandidatePairId: 'P-tcp' },
+      {
+        id: 'L-udp',
+        type: 'local-candidate',
+        candidateType: 'relay',
+        protocol: 'udp',
+        relayProtocol: 'udp',
+        url: 'turn:turn.example.net:3478?transport=udp',
+        networkType: 'wifi',
+        address: '203.0.113.7',
+        ip: '203.0.113.7',
+      },
+      {
+        id: 'L-tcp',
+        type: 'local-candidate',
+        candidateType: 'relay',
+        protocol: 'udp',
+        relayProtocol: 'tcp',
+        url: 'turn:turn.example.net:3478?transport=tcp',
+        networkType: 'wifi',
+        address: '203.0.113.7',
+      },
+      { id: 'R', type: 'remote-candidate', candidateType: 'relay', protocol: 'udp' },
+      {
+        id: 'P-udp',
+        type: 'candidate-pair',
+        state: 'in-progress',
+        localCandidateId: 'L-udp',
+        remoteCandidateId: 'R',
+        requestsSent: 9,
+        responsesReceived: 0,
+      },
+      {
+        id: 'P-tcp',
+        type: 'candidate-pair',
+        state: 'succeeded',
+        nominated: true,
+        localCandidateId: 'L-tcp',
+        remoteCandidateId: 'R',
+        requestsSent: 4,
+        responsesReceived: 4,
+        currentRoundTripTime: 0.231,
+        availableOutgoingBitrate: 30_000,
+        bytesSent: 120_000,
+      },
+    ]);
+  }
+
+  it('separates a blocked UDP relay from one that was never gathered', async () => {
+    pc.stats = tcpRelayFallbackStats();
+
+    const d = await webrtcService.getIceDiagnostics();
+
+    // The discriminator: the UDP relay EXISTS, so gathering worked. Its pair
+    // sent requests and got nothing back — the path is blocked, not missing.
+    const udp = d!.local.find((c) => c.relayProtocol === 'udp');
+    expect(udp).toBeDefined();
+    const udpPair = d!.pairs.find((p) => p.localCandidateId === 'L-udp');
+    expect(udpPair).toMatchObject({ requestsSent: 9, responsesReceived: 0 });
+
+    // And the one that actually carries media is marked, both ways.
+    const tcpPair = d!.pairs.find((p) => p.localCandidateId === 'L-tcp');
+    expect(tcpPair).toMatchObject({ selected: true, nominated: true, rttMs: 231 });
+  });
+
+  it('reports which servers were offered, not just which candidates appeared', async () => {
+    // "No relay/udp candidate" means something different depending on whether a
+    // UDP TURN URL was ever in the config. Only the retained config knows.
+    webrtcService.close();
+    vi.stubGlobal(
+      'RTCPeerConnection',
+      class {
+        constructor() {
+          pc = new FakePeerConnection();
+          return pc as unknown as RTCPeerConnection;
+        }
+      },
+    );
+    await webrtcService.initialize({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'turn:turn.example.net:3478?transport=udp', username: 'u', credential: 'secret' },
+      ],
+    });
+    pc.stats = tcpRelayFallbackStats();
+
+    const d = await webrtcService.getIceDiagnostics();
+    expect(d!.offeredUrls).toEqual([
+      'stun:stun.l.google.com:19302',
+      'turn:turn.example.net:3478?transport=udp',
+    ]);
+  });
+
+  it('never puts an address or a credential in the formatted dump', async () => {
+    // This string exists to be pasted into a bug report.
+    webrtcService.close();
+    vi.stubGlobal(
+      'RTCPeerConnection',
+      class {
+        constructor() {
+          pc = new FakePeerConnection();
+          return pc as unknown as RTCPeerConnection;
+        }
+      },
+    );
+    await webrtcService.initialize({
+      iceServers: [
+        { urls: 'turn:turn.example.net:3478', username: 'user-42', credential: 'sup3rsecret' },
+      ],
+    });
+    pc.stats = tcpRelayFallbackStats();
+
+    const text = formatIceDiagnostics((await webrtcService.getIceDiagnostics())!);
+
+    expect(text).not.toContain('203.0.113.7');
+    expect(text).not.toContain('sup3rsecret');
+    expect(text).not.toContain('user-42');
+    // But it must still be useful.
+    expect(text).toContain('relay/udp');
+    expect(text).toContain('SELECTED');
+    expect(text).toContain('req=9 resp=0');
   });
 });

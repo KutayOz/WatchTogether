@@ -190,3 +190,30 @@ describe('stepUp / stepDown', () => {
     expect(stepDown('auto')).toBeNull();
   });
 });
+
+describe('nextLadderState and a self-limited encoder', () => {
+  it('treats a self-limited encoder as room to grow', () => {
+    // A new SenderHealth member must not silently mean "not healthy" — that is
+    // the failure mode 'self-limited' was added to end.
+    let state: LadderState = {
+      ceiling: 'extreme',
+      applied: 'low',
+      lastAutoChangeAt: 0,
+      probeBackoffMs: 30_000,
+      consecutiveGood: 0,
+      probing: false,
+    };
+
+    for (let i = 1; i <= 4; i++) {
+      state = nextLadderState(state, {
+        now: 60_000 + i,
+        isSharing: true,
+        senderHealth: 'self-limited',
+        viewerLevel: 'good',
+      });
+    }
+
+    expect(state.applied).toBe('medium');
+    expect(state.probing).toBe(true);
+  });
+});

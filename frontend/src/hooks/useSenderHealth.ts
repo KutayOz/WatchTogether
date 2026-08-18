@@ -38,6 +38,19 @@ export type SenderHealth =
   /** Hitting its ceiling with no limitation — there may be headroom above. */
   | 'satisfied'
   /**
+   * Got everything we asked for, and the picture is STILL being degraded.
+   *
+   * `targetBitrate` is `min(our maxBitrate, the estimator's allocation)`, so
+   * `targetBitrate` sitting at our ceiling proves the estimator is offering at
+   * least that much. Reason 'bandwidth' alongside it therefore does not mean
+   * the link is short — it means OUR CEILING is what the encoder is bumping
+   * against. That is a reason to raise, and the classifier used to throw it
+   * away: the reported collapse sat here (targetBitrate 30k against a 25k
+   * ceiling, ratio 1.2) and got 'unknown', which froze the budget and reset the
+   * ladder's good-poll count on every single poll. A deadlock, not a slide.
+   */
+  | 'self-limited'
+  /**
    * Encoder cannot keep up. MUST NOT be answered by lowering the bitrate:
    * fewer bits do not buy CPU, they just make the picture worse for nothing.
    * The right answers are a smaller resolution or a cheaper codec.
@@ -77,6 +90,11 @@ export function classifySenderHealth(
   }
   if (stats.qualityLimitationReason === 'none' && ratio >= SATISFIED_RATIO) {
     return 'satisfied';
+  }
+  // Served in full, yet still limited by something other than CPU. The ceiling
+  // we set is the binding constraint — see 'self-limited' above.
+  if (ratio >= SATISFIED_RATIO) {
+    return 'self-limited';
   }
   return 'unknown';
 }

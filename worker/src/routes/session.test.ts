@@ -262,25 +262,47 @@ describe("invitation links", () => {
 });
 
 describe("rate limiting", () => {
-  it("429s a burst of auth requests from one IP", async () => {
-    const responses: number[] = [];
-    // RL_AUTH allows 20/min; 30 from one IP must hit the wall.
-    for (let i = 0; i < 30; i++) {
-      const response = await post("/api/auth/passkey/auth/begin", {});
-      responses.push(response.status);
+  /**
+   * Send requests until one comes back 429, rather than assuming a fixed index.
+   *
+   * RL_AUTH is `limit = 20, period = 60`, and that window runs on the clock —
+   * it is not anchored to the first request of the burst. So a burst that
+   * straddles a boundary has its budget refilled halfway through, and "the 31st
+   * request is a 429" holds only when the test happens not to cross one. That
+   * is a coin flip on how long the suite took to reach this line, and it is how
+   * CI went red on a branch that had not touched auth at all.
+   *
+   * Bounded at 60: with a 20-request budget, even one refill mid-burst leaves a
+   * 429 inside 41 attempts. It returns as soon as it sees one, so the ordinary
+   * path costs 21 requests — fewer than the 31 this replaces.
+   */
+  async function burstUntilLimited(
+    path: string,
+  ): Promise<{ limited: Response | null; allowed: number }> {
+    let allowed = 0;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const response = await post(path, {});
+      if (response.status === 429) return { limited: response, allowed };
+      allowed++;
     }
+    return { limited: null, allowed };
+  }
 
-    expect(responses).toContain(429);
-    expect(responses.filter((status) => status === 200).length).toBeLessThanOrEqual(20);
+  it("429s a burst of auth requests from one IP", async () => {
+    const { limited, allowed } = await burstUntilLimited("/api/auth/passkey/auth/begin");
+
+    expect(limited).not.toBeNull();
+    // The wall is where RL_AUTH says it is. Not pinned at exactly 20, because a
+    // single window rollover mid-burst legitimately hands out a second budget.
+    expect(allowed).toBeLessThanOrEqual(40);
   });
 
   it("returns the body shape the frontend already parses", async () => {
-    for (let i = 0; i < 30; i++) await post("/api/auth/passkey/auth/begin", {});
+    const { limited } = await burstUntilLimited("/api/auth/passkey/auth/begin");
 
-    const limited = await post("/api/auth/passkey/auth/begin", {});
-    expect(limited.status).toBe(429);
-    expect(limited.headers.get("Retry-After")).toBe("60");
-    expect(await limited.json()).toMatchObject({
+    expect(limited).not.toBeNull();
+    expect(limited!.headers.get("Retry-After")).toBe("60");
+    expect(await limited!.json()).toMatchObject({
       message: expect.stringContaining("Too many"),
       retryAfterSeconds: 60,
     });
