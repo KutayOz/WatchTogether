@@ -11,7 +11,10 @@ import { useTransportDiagnostics } from '../../hooks/useTransportDiagnostics';
 import { useSenderHealth } from '../../hooks/useSenderHealth';
 import {
   chooseOperatingPoint,
+  initialBudgetState,
+  minVideoBps,
   nextBudget,
+  type BudgetState,
   sameOperatingPoint,
   type OperatingPoint,
 } from '../../hooks/operatingPoint';
@@ -680,7 +683,10 @@ export function SessionRoom() {
   const diagnostics = useTransportDiagnostics(isCallActive);
 
   /** What the link has earned, held across polls so it cannot decay. */
-  const [budgetBps, setBudgetBps] = useState(COLD_START_BUDGET_BPS);
+  const [budget, setBudget] = useState<BudgetState>(() =>
+    initialBudgetState(COLD_START_BUDGET_BPS, Date.now()),
+  );
+  const budgetBps = budget.bps;
 
   /**
    * The operating point actually applied to the encoder.
@@ -695,26 +701,52 @@ export function SessionRoom() {
     [budgetBps, contentMode, ladder.applied],
   );
 
+  /*
+   * True when the chooser is already at its floor — the link cannot fund a
+   * bigger picture, so nothing the controller does will improve it. Derived
+   * from the applied point rather than the budget so it stays correct however
+   * the budget is represented.
+   */
+  const atBudgetFloor = operatingPoint.videoBps <= minVideoBps(operatingPoint.fps);
+
   // Sender health is the control input for BOTH the budget and the ladder.
   // Judged against the ceiling we actually set, so "is it getting its ask" is a
   // real question rather than a restatement of what we chose to send.
   const senderHealth = useSenderHealth(webrtc.isScreenSharing, operatingPoint.videoBps);
 
-  // Move the budget on each estimate, but only downward on real evidence — see
-  // nextBudget for why spending a fixed fraction of the estimate every tick
-  // walks the stream to the floor all by itself.
+  /*
+   * Advance the budget on every sender-health observation.
+   *
+   * `senderHealth.streak` is in the dependency list on purpose: it changes on
+   * every poll, which is what lets the time-gated upward probe fire once per
+   * poll rather than only when the verdict itself changes. The ladder effect
+   * below depends on it for exactly the same reason.
+   *
+   * `capacityKnown` gates the estimate: a TCP-relay reading is a measured lower
+   * bound, not a capacity measurement, and nextBudget's contract is that null
+   * means "no opinion" rather than "no bandwidth".
+   */
   useEffect(() => {
-    setBudgetBps(
-      (prev) =>
-        nextBudget(prev, uplink?.uplinkBps ?? null, senderHealth.health === 'under-served', HEADROOM_SELECT) ??
-        prev,
+    setBudget((prev) =>
+      nextBudget(prev, {
+        now: Date.now(),
+        estimateBps: uplink?.capacityKnown ? uplink.uplinkBps : null,
+        health: senderHealth.health,
+        // The only path by which the receiver's verdict reaches anything at all
+        // on `auto`, where the preset ladder is inert (`auto` is not a rung).
+        viewerUnhappy:
+          viewerLevelRef.current === 'poor' || viewerLevelRef.current === 'critical',
+        headroom: HEADROOM_SELECT,
+        mode: contentMode,
+        ceiling: ladder.applied,
+      }),
     );
-  }, [uplink, senderHealth.health]);
+  }, [uplink, senderHealth.health, senderHealth.streak, contentMode, ladder.applied]);
 
   // A new share is a new load; carrying the old budget across would judge it by
   // the previous one's behaviour.
   useEffect(() => {
-    if (!webrtc.isScreenSharing) setBudgetBps(COLD_START_BUDGET_BPS);
+    if (!webrtc.isScreenSharing) setBudget(initialBudgetState(COLD_START_BUDGET_BPS, Date.now()));
   }, [webrtc.isScreenSharing]);
 
   // Long-lived signalling callbacks (screen-share approval, in particular) are
@@ -777,6 +809,24 @@ export function SessionRoom() {
       type: 'warning',
     });
   }, [senderHealth.health]);
+
+  /*
+   * A link genuinely below the floor. Say so.
+   *
+   * The floor guarantees we never ask the encoder for an unrunnable picture,
+   * but it cannot conjure bandwidth: if the encoder is still under-served at
+   * 640x360, the link really cannot carry a screen share. That is worth one
+   * honest sentence — the behaviour it replaces was to silently send a
+   * slideshow and let the user wonder what was broken.
+   */
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) return;
+    if (senderHealth.health !== 'under-served' || !atBudgetFloor) return;
+    setToast({
+      message: 'This connection is too slow for a screen share right now',
+      type: 'warning',
+    });
+  }, [senderHealth.health, atBudgetFloor, webrtc.isScreenSharing]);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -1534,6 +1584,8 @@ export function SessionRoom() {
               onQualityChange={handleQualityChange}
               uplink={uplink}
               diagnostics={diagnostics}
+              appliedPoint={webrtc.isScreenSharing ? operatingPoint : null}
+              atBudgetFloor={atBudgetFloor}
               contentMode={contentMode}
               onContentModeChange={handleContentModeChange}
               isSharer={isLocalSharing}

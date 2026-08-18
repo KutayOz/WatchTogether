@@ -5,6 +5,9 @@ import type {
   TransportPath,
   IceCandidateKind,
   OutboundScreenStats,
+  IceDiagnostics,
+  IceCandidateInfo,
+  IceCandidatePairInfo,
 } from '../types';
 import type { OperatingPoint } from '../hooks/operatingPoint';
 import { applyOpusOptions, SDP_WARN_LENGTH } from './opusFmtp';
@@ -92,6 +95,57 @@ function displayConstraintsFor(point: OperatingPoint): MediaTrackConstraints {
 }
 
 /**
+ * Render an ICE diagnostic as a fixed-width table.
+ *
+ * Pure and exported for the same reason every other judgement in this codebase
+ * is (estimateFromBitrate, classifySenderHealth, chooseOperatingPoint): the
+ * output is meant to be read by a human in a bug report, so its shape is worth
+ * a test rather than an eyeball.
+ */
+export function formatIceDiagnostics(d: IceDiagnostics): string {
+  const byId = new Map<string, IceCandidateInfo>();
+  for (const c of [...d.local, ...d.remote]) byId.set(c.id, c);
+
+  const label = (id: string | undefined): string => {
+    const c = id ? byId.get(id) : undefined;
+    if (!c) return '?';
+    const via = c.relayProtocol ? `/${c.relayProtocol}` : '';
+    return `${c.candidateType}/${c.protocol}${via}`;
+  };
+
+  const pairLine = (p: IceCandidatePairInfo): string => {
+    const marks = [p.selected ? 'SELECTED' : null, p.nominated ? 'nominated' : null]
+      .filter(Boolean)
+      .join(' ');
+    const stun = `req=${p.requestsSent ?? '-'} resp=${p.responsesReceived ?? '-'}`;
+    const rtt = p.rttMs === null ? '' : ` rtt=${p.rttMs}ms`;
+    const abr =
+      p.availableOutgoingBitrate === null
+        ? ''
+        : ` abr=${(p.availableOutgoingBitrate / 1_000_000).toFixed(2)}Mbps`;
+    return `  ${label(p.localCandidateId)} -> ${label(p.remoteCandidateId)}  ${p.state.padEnd(10)} ${stun}${rtt}${abr} ${marks}`.trimEnd();
+  };
+
+  const candLine = (c: IceCandidateInfo): string => {
+    const via = c.relayProtocol ? ` via ${c.relayProtocol}` : '';
+    const net = c.networkType ? ` (${c.networkType})` : '';
+    return `  ${c.candidateType}/${c.protocol}${via}${net}${c.url ? `  ${c.url}` : ''}`;
+  };
+
+  return [
+    `ICE ${d.connectionState} / gathering ${d.gatheringState}`,
+    'offered:',
+    ...d.offeredUrls.map((u) => `  ${u}`),
+    'local candidates:',
+    ...d.local.map(candLine),
+    'remote candidates:',
+    ...d.remote.map(candLine),
+    'pairs:',
+    ...d.pairs.map(pairLine),
+  ].join('\n');
+}
+
+/**
  * Read a persisted setting without ever throwing.
  *
  * `typeof localStorage !== 'undefined'` is not enough of a guard: the object
@@ -176,6 +230,12 @@ class WebRTCService {
   // without the caller having to remember what it asked for.
   private currentPoint: OperatingPoint | null = null;
   private handlers: WebRTCEventHandlers = {};
+  // The config we were initialized with. Kept so the ICE diagnostic can report
+  // which servers were OFFERED, which is a different question from which
+  // candidates were gathered — and the difference is the diagnosis.
+  private iceConfig: IceServerConfig | null = null;
+  // One warning per connection, not one per poll.
+  private warnedAboutTcpRelay = false;
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private hasRemoteDescription = false;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -186,6 +246,10 @@ class WebRTCService {
   private static readonly DISCONNECT_TIMEOUT_MS = 5000; // 5 seconds before ICE restart
 
   async initialize(iceConfig: IceServerConfig): Promise<void> {
+    // Retained so getIceDiagnostics can answer "was a UDP TURN URL even
+    // offered?" without a second call to the API. URLs only ever leave here.
+    this.iceConfig = iceConfig;
+    this.warnedAboutTcpRelay = false;
     const config: RTCConfiguration = {
       iceServers: iceConfig.iceServers.map(server => ({
         urls: server.urls,
@@ -1212,7 +1276,7 @@ class WebRTCService {
     const localKind = kind(local.candidateType);
     const remoteKind = kind(remote.candidateType);
 
-    return {
+    const path: TransportPath = {
       local: localKind,
       remote: remoteKind,
       protocol: local.protocol ?? 'udp',
@@ -1222,6 +1286,122 @@ class WebRTCService {
         typeof pair.currentRoundTripTime === 'number'
           ? Math.round(pair.currentRoundTripTime * 1000)
           : null,
+    };
+
+    /*
+     * A TCP-relayed session is the worst media path we can end up on and it is
+     * invisible unless somebody opens the quality popover, so dump the full ICE
+     * picture once when we detect one.
+     *
+     * logger.warn and not logger.debug: debug is compiled out of production
+     * builds (see logger.ts), i.e. exactly the deployment where this happens.
+     * A TCP relay is rare and operationally decisive, which is the bar warn
+     * exists for.
+     */
+    if (
+      !this.warnedAboutTcpRelay &&
+      (path.relayProtocol === 'tcp' || path.relayProtocol === 'tls')
+    ) {
+      this.warnedAboutTcpRelay = true;
+      void this.getIceDiagnostics().then((d) => {
+        if (d) {
+          logger.warn(
+            `[ICE] media is relayed over ${path.relayProtocol} — bandwidth estimates on this path are not capacity measurements\n${formatIceDiagnostics(d)}`,
+          );
+        }
+      });
+    }
+
+    return path;
+  }
+
+  /**
+   * The whole ICE picture, for answering why a session landed on its path.
+   *
+   * Read-only, one getStats() walk, no candidate addresses and no credentials —
+   * see the IceDiagnostics doc comment for the three failure modes this exists
+   * to tell apart, and why `getTransportPath()` cannot.
+   */
+  async getIceDiagnostics(): Promise<IceDiagnostics | null> {
+    const stats = await this.getStats();
+    if (!stats) return null;
+
+    type PairReport = RTCStats & {
+      state?: string;
+      nominated?: boolean;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+      requestsSent?: number;
+      responsesReceived?: number;
+      currentRoundTripTime?: number;
+      availableOutgoingBitrate?: number;
+      bytesSent?: number;
+    };
+    type CandidateReport = RTCStats & {
+      candidateType?: string;
+      protocol?: string;
+      relayProtocol?: string;
+      url?: string;
+      networkType?: string;
+    };
+
+    const local: IceCandidateInfo[] = [];
+    const remote: IceCandidateInfo[] = [];
+    const pairs: IceCandidatePairInfo[] = [];
+    let selectedId: string | undefined;
+
+    const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+    const kind = (v: string | undefined): IceCandidateKind =>
+      v === 'relay' || v === 'srflx' || v === 'prflx' ? v : 'host';
+    const describe = (c: CandidateReport): IceCandidateInfo => ({
+      id: c.id,
+      candidateType: kind(c.candidateType),
+      protocol: c.protocol ?? 'udp',
+      relayProtocol: c.relayProtocol,
+      url: c.url,
+      networkType: c.networkType,
+    });
+
+    stats.forEach((report) => {
+      if (report.type === 'transport') {
+        const t = report as RTCStats & { selectedCandidatePairId?: string };
+        if (t.selectedCandidatePairId) selectedId = t.selectedCandidatePairId;
+      } else if (report.type === 'local-candidate') {
+        local.push(describe(report as CandidateReport));
+      } else if (report.type === 'remote-candidate') {
+        remote.push(describe(report as CandidateReport));
+      }
+    });
+
+    stats.forEach((report) => {
+      if (report.type !== 'candidate-pair') return;
+      const p = report as PairReport;
+      pairs.push({
+        state: p.state ?? 'unknown',
+        nominated: p.nominated === true,
+        selected: p.id === selectedId,
+        localCandidateId: p.localCandidateId,
+        remoteCandidateId: p.remoteCandidateId,
+        requestsSent: num(p.requestsSent),
+        responsesReceived: num(p.responsesReceived),
+        rttMs:
+          typeof p.currentRoundTripTime === 'number'
+            ? Math.round(p.currentRoundTripTime * 1000)
+            : null,
+        availableOutgoingBitrate: num(p.availableOutgoingBitrate),
+        bytesSent: num(p.bytesSent),
+      });
+    });
+
+    return {
+      // From the retained config, not from stats: this answers "was a UDP TURN
+      // URL even offered?" even when gathering produced no relay candidate.
+      offeredUrls: this.iceConfig?.iceServers.map((s) => s.urls) ?? [],
+      local,
+      remote,
+      pairs,
+      gatheringState: this.peerConnection?.iceGatheringState ?? 'unknown',
+      connectionState: this.peerConnection?.iceConnectionState ?? 'unknown',
     };
   }
 

@@ -146,6 +146,59 @@ export interface TransportPath {
 }
 
 /**
+ * The full ICE picture, for answering *why* a session landed on the path it did.
+ *
+ * `TransportPath` says "you are relayed over TCP". It cannot say why, and the
+ * three reasons want three different fixes:
+ *
+ *  - a relay/udp local candidate exists, but its pair has `requestsSent > 0`
+ *    and `responsesReceived === 0` → UDP to the TURN server is being dropped,
+ *    by the carrier or by the local network. Nothing client-side fixes it.
+ *  - no relay/udp local candidate at all → gathering never produced one, which
+ *    points at the minted iceServers list (see `offeredUrls`).
+ *  - a succeeded UDP pair that lost to a nominated TCP pair → nomination
+ *    ordering, and ours to fix.
+ *
+ * Today all three look identical from the outside, which is why the reported
+ * 231 ms TURN/TCP session could not be diagnosed from the overlay alone.
+ *
+ * Deliberately carries NO candidate addresses and NO TURN credentials: this is
+ * meant to be pasted into a bug report.
+ */
+export interface IceCandidateInfo {
+  id: string;
+  candidateType: IceCandidateKind;
+  protocol: string;
+  relayProtocol?: string;
+  /** Which configured server produced it — the STUN/TURN URL, never the creds. */
+  url?: string;
+  networkType?: string;
+}
+
+export interface IceCandidatePairInfo {
+  state: string;
+  nominated: boolean;
+  selected: boolean;
+  localCandidateId?: string;
+  remoteCandidateId?: string;
+  requestsSent: number | null;
+  responsesReceived: number | null;
+  rttMs: number | null;
+  availableOutgoingBitrate: number | null;
+  bytesSent: number | null;
+}
+
+export interface IceDiagnostics {
+  /** The iceServers we were configured with. URLs only. */
+  offeredUrls: string[];
+  local: IceCandidateInfo[];
+  remote: IceCandidateInfo[];
+  pairs: IceCandidatePairInfo[];
+  gatheringState: string;
+  connectionState: string;
+}
+
+/**
  * What the screen-share encoder is actually doing, as opposed to what it was
  * asked to do. `targetBitrate` sitting far below the configured ceiling with
  * `qualityLimitationReason === 'bandwidth'` is the signal that the link cannot
@@ -386,4 +439,23 @@ export interface UplinkEstimate {
   budgetBps: number;
   recommendedQuality: ScreenShareQuality;
   supportedQualities: Record<ScreenShareQuality, boolean>;
+  /**
+   * Bits per second we are demonstrably putting on the wire, from the delta in
+   * the candidate pair's `bytesSent`. A measured lower bound, not a ceiling.
+   */
+  observedBps: number | null;
+  /**
+   * Whether `uplinkBps` came from a measurement we trust as CAPACITY.
+   *
+   * False means it is an observation-only lower bound — we know the link
+   * carries at least this much, and nothing about how much more. That happens
+   * on a TCP-relayed path, where `availableOutgoingBitrate` is a number about
+   * TCP rather than about the path, and whenever bytes we actually sent
+   * contradict the estimator outright.
+   *
+   * A false here must never produce negative advice: the reported failure had
+   * a bogus 30 kbps estimate grey out all five fixed presets, removing the one
+   * manual escape the user had from the collapse.
+   */
+  capacityKnown: boolean;
 }

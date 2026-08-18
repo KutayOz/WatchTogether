@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeEntries } from "./ice";
+import { normalizeEntries, summarizeIceServers } from "./ice";
 
 /**
  * These shapes are not hypothetical. The first deployment against a live
@@ -57,5 +57,21 @@ describe("Cloudflare ICE response shapes", () => {
     ["entry with an empty urls array", { iceServers: { urls: [] } }],
   ])("returns nothing for %s, so the caller can log and fall back", (_label, body) => {
     expect(normalizeEntries(body)).toEqual([]);
+  });
+});
+
+describe("summarizeIceServers", () => {
+  it("lists every URL and no credential", () => {
+    const line = summarizeIceServers([
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "turn:turn.example.net:3478?transport=udp", username: "u-1", credential: "s3cret" },
+      { urls: "turns:turn.example.net:5349?transport=tcp", username: "u-1", credential: "s3cret" },
+    ]);
+
+    expect(line).toContain("stun:stun.l.google.com:19302");
+    expect(line).toContain("transport=udp");
+    expect(line).toContain("transport=tcp");
+    expect(line).not.toContain("u-1");
+    expect(line).not.toContain("s3cret");
   });
 });

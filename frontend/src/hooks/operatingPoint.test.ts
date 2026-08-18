@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
   AUTO_MAX_BITRATE,
+  PROBE_INTERVAL_MS,
+  PROBE_VERDICT_WINDOW_MS,
   TARGET_BPP,
+  budgetCeilingBps,
   chooseOperatingPoint,
+  initialBudgetState,
+  minBudgetBps,
+  minVideoBps,
   nextBudget,
+  type BudgetSignals,
 } from './operatingPoint';
 
 /**
@@ -99,8 +106,39 @@ describe('chooseOperatingPoint', () => {
     // A genuinely unusable link. The contract is that it still returns
     // something sane instead of throwing or picking 4K at 0.001 bpp.
     const point = chooseOperatingPoint(120_000, 'film');
-    expect(point.width).toBeLessThanOrEqual(854);
-    expect(point.videoBps).toBeGreaterThanOrEqual(0);
+    expect(point).toMatchObject({ width: 640, height: 360, fps: 24, videoBps: 200_000 });
+    expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
+  });
+
+  it('never asks the encoder for a picture it cannot run', () => {
+    // The bug this floor exists for. A relayed TURN/TCP session whose estimate
+    // had collapsed to its own ask drove the budget to ~25 kbps; this function
+    // asked for 854x480 at 24 fps on 25 kbps (0.0025 bpp) and Chrome answered
+    // with 344x182 at 1 fps — smaller than any rung we offer.
+    for (const budget of [0, 25_000, 89_000, 120_000, 264_000]) {
+      for (const mode of ['film', 'motion', 'games'] as const) {
+        const point = chooseOperatingPoint(budget, mode);
+        expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
+        expect(point.videoBps).toBeGreaterThanOrEqual(minVideoBps(point.fps));
+      }
+    }
+  });
+
+  it('floors the budget before audio takes its cut', () => {
+    // A flat 64 kbps reserve is 64% of a collapsed 100 kbps budget. Flooring
+    // first is what stops audio starving the video encoder.
+    const point = chooseOperatingPoint(100_000, 'film');
+    expect(point.audioBps / (point.videoBps + point.audioBps)).toBeLessThanOrEqual(0.25);
+  });
+
+  it('puts the floor exactly at the smallest rung hitting target bpp', () => {
+    // minBudgetBps is not a chosen number — it is the budget at which the
+    // smallest rung we allow reaches TARGET_BPP. Verify that, per mode.
+    for (const [mode, fps] of [['film', 24], ['motion', 30], ['games', 60]] as const) {
+      const point = chooseOperatingPoint(minBudgetBps(fps), mode);
+      expect(point).toMatchObject({ width: 640, height: 360, fps });
+      expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
+    }
   });
 
   it('reserves less for audio on a small budget than a large one', () => {
@@ -112,52 +150,192 @@ describe('chooseOperatingPoint', () => {
 });
 
 /**
- * The subtle half of the feedback trap.
+ * The two feedback traps, which pull in opposite directions.
  *
- * availableOutgoingBitrate is bounded by what we are already sending, so a
- * budget of `estimate * 0.85` recomputed every tick makes the next estimate
- * ~85% of this one, and the next ~85% of that. No single step is wrong and the
- * stream walks to the floor anyway.
+ * availableOutgoingBitrate is bounded by what we are already sending. Spend
+ * `estimate * 0.85` every tick and the next estimate is ~85% of this one: no
+ * single step is wrong and the stream walks to the floor. But a budget that
+ * only ever FOLLOWS that estimate can never rise either, because the estimate
+ * cannot rise until we send more. The reported session sat at 30 kbps between
+ * a 200 Mbps link and a 30 Mbps one with nothing able to propose sending more.
  */
 describe('nextBudget', () => {
   const H = 0.85;
+  const FLOOR = minBudgetBps(24); // film
+  const CAP = budgetCeilingBps('auto');
+
+  /** Signals with everything quiet, so each test states only what it varies. */
+  function sig(over: Partial<BudgetSignals> = {}): BudgetSignals {
+    return {
+      now: 0,
+      estimateBps: null,
+      health: 'unknown',
+      viewerUnhappy: false,
+      headroom: H,
+      mode: 'film',
+      ceiling: 'auto',
+      ...over,
+    };
+  }
 
   it('does not decay when the link is meeting the ask', () => {
     // We spend 2.55 Mbps of a 3 Mbps estimate; the estimator then reports 2.6
     // because that is roughly what we are sending. The budget must not follow.
-    let budget = nextBudget(null, 3_000_000, false, H);
-    expect(budget).toBe(2_550_000);
-
-    for (let i = 0; i < 20; i++) {
-      budget = nextBudget(budget, 2_600_000, false, H);
+    let state = initialBudgetState(2_550_000, 0);
+    for (let i = 1; i <= 20; i++) {
+      state = nextBudget(state, sig({ now: i * 3000, estimateBps: 2_600_000 }));
     }
-    expect(budget).toBe(2_550_000);
+    expect(state.bps).toBe(2_550_000);
   });
 
-  it('follows the estimate down when the encoder is genuinely under-served', () => {
-    // Asking for its ceiling and not getting it — that is the link shrinking,
-    // not our own restraint reflected back.
-    const budget = nextBudget(2_550_000, 1_200_000, true, H);
-    expect(budget).toBe(1_020_000);
+  it('follows a trusted estimate down when the encoder is genuinely under-served', () => {
+    const state = nextBudget(
+      initialBudgetState(2_550_000, 0),
+      sig({ now: 3000, estimateBps: 1_200_000, health: 'under-served' }),
+    );
+    expect(state.bps).toBe(1_020_000);
   });
 
   it('climbs when the link proves it has more', () => {
-    expect(nextBudget(1_000_000, 4_000_000, false, H)).toBe(3_400_000);
+    const state = nextBudget(
+      initialBudgetState(1_000_000, 0),
+      sig({ now: 3000, estimateBps: 4_000_000 }),
+    );
+    expect(state.bps).toBe(3_400_000);
   });
 
   it('holds steady when the browser publishes no estimate', () => {
-    // Firefox. No opinion is never a reason to move anything.
-    expect(nextBudget(2_000_000, null, false, H)).toBe(2_000_000);
-    expect(nextBudget(2_000_000, null, true, H)).toBe(2_000_000);
+    // Firefox. No opinion is never, by itself, a reason to move anything.
+    const held = nextBudget(initialBudgetState(2_000_000, 0), sig({ now: 3000 }));
+    expect(held.bps).toBe(2_000_000);
+  });
+
+  it('backs off without an estimate when the encoder says it is short', () => {
+    // No number to follow down, but "under-served" is itself evidence. Standing
+    // still while the picture breaks is not a neutral choice.
+    const state = nextBudget(
+      initialBudgetState(2_000_000, 0),
+      sig({ now: 3000, health: 'under-served' }),
+    );
+    expect(state.bps).toBe(1_700_000);
   });
 
   it('never ratchets below the true capacity across a noisy run', () => {
-    // A link that is genuinely 3 Mbps, with an estimator that wobbles and
-    // occasional healthy ticks. The floor must hold.
-    let budget = nextBudget(null, 3_000_000, false, H);
-    for (const sample of [2_900_000, 2_600_000, 3_100_000, 2_700_000, 2_950_000]) {
-      budget = nextBudget(budget, sample, false, H);
+    let state = initialBudgetState(2_550_000, 0);
+    const samples = [2_900_000, 2_600_000, 3_100_000, 2_700_000, 2_950_000];
+    samples.forEach((estimateBps, i) => {
+      state = nextBudget(state, sig({ now: (i + 1) * 3000, estimateBps }));
+    });
+    expect(state.bps).toBeGreaterThanOrEqual(2_550_000);
+  });
+
+  it('never goes below the floor, however bogus the estimate', () => {
+    // 50 polls of a 30 kbps reading with the encoder reporting shortage. The
+    // old code had no floor at all and quantised its way to 25 kbps.
+    let state = initialBudgetState(2_000_000, 0);
+    for (let i = 1; i <= 50; i++) {
+      state = nextBudget(
+        state,
+        sig({ now: i * 3000, estimateBps: 30_000, health: 'under-served' }),
+      );
     }
-    expect(budget).toBeGreaterThanOrEqual(2_550_000);
+    expect(state.bps).toBe(FLOOR);
+  });
+
+  it('raises the budget when the encoder says our own ceiling is the constraint', () => {
+    // 'self-limited' is the verdict the reported collapse actually sat in, and
+    // the classifier used to answer 'unknown' — which froze this function.
+    let state = initialBudgetState(FLOOR, 0);
+    state = nextBudget(state, sig({ now: 20_000, health: 'self-limited' }));
+    expect(state.bps).toBeGreaterThan(FLOOR);
+    expect(state.probing).toBe(true);
+  });
+
+  it('a hundred failed probes leave the budget where they found it', () => {
+    // The ratchet property, stated directly. A probe that fails must revert to
+    // baseBps EXACTLY — reverting by a factor is how repeated failure decays.
+    let state = initialBudgetState(1_000_000, 0);
+    let now = 0;
+    for (let i = 0; i < 100; i++) {
+      now += 200_000; // always past the backoff, however far it has doubled
+      state = nextBudget(state, sig({ now, health: 'satisfied' }));
+      now += 3000;
+      state = nextBudget(state, sig({ now, health: 'under-served' }));
+    }
+    expect(state.bps).toBe(1_000_000);
+  });
+
+  it('doubles the wait after a failed probe and resets it after a proven one', () => {
+    let state = initialBudgetState(1_000_000, 0);
+    state = nextBudget(state, sig({ now: 20_000, health: 'satisfied' }));
+    expect(state.probing).toBe(true);
+
+    const failed = nextBudget(state, sig({ now: 23_000, health: 'under-served' }));
+    expect(failed.probeBackoffMs).toBe(PROBE_INTERVAL_MS * 2);
+    expect(failed.bps).toBe(1_000_000);
+
+    // A probe left alone past the verdict window is banked, and the doubling
+    // undone — otherwise one early failure slows every later recovery forever.
+    let again = nextBudget(failed, sig({ now: 250_000, health: 'satisfied' }));
+    again = nextBudget(again, sig({ now: 250_000 + PROBE_VERDICT_WINDOW_MS + 1, health: 'satisfied' }));
+    expect(again.probeBackoffMs).toBe(PROBE_INTERVAL_MS);
+    expect(again.probing).toBe(false);
+    expect(again.baseBps).toBe(again.bps);
+  });
+
+  it('at the cap, a probe is a no-op and does not mark the budget as probing', () => {
+    // Otherwise the loop stalls at the top the way it used to stall at the floor.
+    const state = nextBudget(
+      initialBudgetState(CAP, 0),
+      sig({ now: 60_000, health: 'satisfied' }),
+    );
+    expect(state.bps).toBe(CAP);
+    expect(state.probing).toBe(false);
+  });
+
+  it('holds on cpu-bound and abandons the probe in flight', () => {
+    // Fewer bits do not buy CPU — but the raise we just made could have caused it.
+    let state = initialBudgetState(1_000_000, 0);
+    state = nextBudget(state, sig({ now: 20_000, health: 'satisfied' }));
+    expect(state.bps).toBeGreaterThan(1_000_000);
+
+    state = nextBudget(state, sig({ now: 23_000, health: 'cpu-bound' }));
+    expect(state.bps).toBe(1_000_000);
+    expect(state.probing).toBe(false);
+  });
+
+  it('lets the viewer lower the budget on auto, where the ladder is inert', () => {
+    // `auto` is not a rung on QUALITY_LADDER, so nextLadderState cannot act on
+    // viewer feedback at all. This reducer is its only route in.
+    const state = nextBudget(
+      initialBudgetState(2_000_000, 0),
+      sig({ now: 3000, viewerUnhappy: true }),
+    );
+    expect(state.bps).toBeLessThan(2_000_000);
+  });
+
+  it('recovers from the reported collapse within about two minutes', () => {
+    /*
+     * The regression test for the whole change. Replays the session:
+     *
+     *   path: relayed (turn/tcp) · 231 ms
+     *   sending: 344x182 @ 1 · 0.03 Mbps
+     *   limited by: bandwidth
+     *
+     * The estimate is pinned at 30 kbps and untrusted (TCP relay), so it
+     * arrives here as null. The encoder reports 'self-limited': it is getting
+     * everything we ask for and is still degraded, because OUR ceiling is what
+     * binds. Nothing in the old design could act on that.
+     */
+    let state = initialBudgetState(FLOOR, 0);
+    let polls = 0;
+    for (let now = 3000; now <= 40 * 3000; now += 3000) {
+      polls++;
+      state = nextBudget(state, sig({ now, estimateBps: null, health: 'self-limited' }));
+      if (state.bps >= 2_000_000) break;
+    }
+
+    expect(state.bps).toBeGreaterThanOrEqual(2_000_000);
+    expect(polls).toBeLessThanOrEqual(40); // 40 polls x 3 s = two minutes
   });
 });

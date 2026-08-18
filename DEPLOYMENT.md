@@ -205,9 +205,29 @@ invite, join it from another profile, and confirm video both ways, chat
 - **Background blur is verified only as far as the CSP.** WebAssembly compiles
   under the live policy and both MediaPipe origins load; that it segments a
   real camera feed correctly in production is untested.
-- **Quality adaptation has not been watched on a real link.** It now reads
-  `availableOutgoingBitrate` off the peer connection
-  (`frontend/src/hooks/useUplinkEstimate.ts`); the arithmetic is unit-tested,
-  but no one has yet sat on a slow connection and confirmed the clamp fires at
-  a sensible moment. Firefox does not publish that statistic, and there the
-  hook deliberately has no opinion — quality stays wherever the user put it.
+- **Quality adaptation has now been watched on a real link, and it failed.** A
+  session between a 200 Mbps uplink and a 30 Mbps 5G phone, relayed over
+  TURN/TCP at 231 ms, sent `344x182 @ 1 fps · 0.03 Mbps`. Three defects
+  compounded into a deadlock:
+
+  1. `availableOutgoingBitrate` on a TCP relay is a number about TCP, not about
+     the path — it collapsed to within one `BITRATE_STEP` of our own ask.
+  2. Nothing floored the budget, so the encoder was asked for 854x480 at
+     0.0025 bpp and Chrome improvised a size smaller than any rung we offer.
+  3. `classifySenderHealth` returned `'unknown'` for the collapsed state
+     (ratio 1.2, reason `'bandwidth'`), which means "hold" to both the budget
+     and the ladder. Nothing could move, in either direction.
+
+  What guards it now: a floor of 640x360 at `TARGET_BPP`
+  (`operatingPoint.ts`), `capacityKnown` on the estimate so a TCP-relay reading
+  can say a preset fits but never that one does not
+  (`useUplinkEstimate.ts`), a `'self-limited'` verdict for "our own ceiling is
+  the constraint" (`useSenderHealth.ts`), and a `nextBudget` reducer that
+  probes upward at 1.5x and reverts exactly on failure. Firefox still publishes
+  neither statistic, and there the hooks deliberately have no opinion.
+
+- **Why UDP relay lost is still unanswered.** `getIceDiagnostics()` /
+  `formatIceDiagnostics()` in `frontend/src/services/webrtcService.ts` dump the
+  candidate and pair tables via `logger.warn` whenever a session ends up
+  relayed over TCP. Whether the fix is client-side, a Cloudflare TURN config
+  change, or nothing we control depends on what that dump shows.
