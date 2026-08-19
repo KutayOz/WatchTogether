@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { calculateQualityScore, scoreToLevel, type QualityMetrics } from './useQualityMonitor';
+import {
+  calculateQualityScore,
+  jitterBufferMs,
+  scoreToLevel,
+  type InboundScreenStats,
+  type QualityMetrics,
+} from './useQualityMonitor';
 
 /**
  * The score exists to drive one decision: the auto-downgrade in SessionRoom,
@@ -83,5 +89,69 @@ describe('calculateQualityScore', () => {
       packetsReceived: 900,
     });
     expect(early).toBe(late);
+  });
+});
+
+describe('the frame rate a share is judged against', () => {
+  /** Everything else perfect, so only the fps term can move the score. */
+  const at = (fps: number): QualityMetrics => ({
+    packetsLost: 0,
+    packetsReceived: 1000,
+    jitterMs: 5,
+    rttMs: 40,
+    fps,
+    freezeSeconds: 0,
+    intervalSeconds: 3,
+  });
+
+  it('scores a 24 fps film share against 24, not against 30', () => {
+    // The default content mode is `film`, which is 24 fps at source and is
+    // pinned as a hard max in both the capture constraints and the encoder.
+    // Judged against the 30 fps default, a flawless share sat 6% short of
+    // nominal for its whole run — not a bad verdict on its own, but a narrowed
+    // margin on a signal that is wired to an action.
+    expect(calculateQualityScore(at(24), 24)).toBe(100);
+    expect(calculateQualityScore(at(24))).toBeLessThan(100);
+  });
+
+  it('still forgives the slack an encoder legitimately needs', () => {
+    // FPS_SLACK is 0.85: 21 of 24 is not a degraded stream.
+    expect(calculateQualityScore(at(21), 24)).toBe(100);
+  });
+
+  it('still reaches critical on a stream that has actually stopped', () => {
+    expect(scoreToLevel(calculateQualityScore(at(2), 24))).toBe('critical');
+  });
+});
+
+describe('jitterBufferMs', () => {
+  const inbound = (over: Partial<InboundScreenStats> = {}): InboundScreenStats => ({
+    frameWidth: 1920,
+    frameHeight: 1080,
+    framesPerSecond: 24,
+    freezeCount: 0,
+    totalFreezesDuration: 0,
+    framesReceived: 720,
+    framesDecoded: 720,
+    framesDropped: 0,
+    jitterBufferDelay: 90,
+    jitterBufferEmittedCount: 300,
+    pliCount: 0,
+    nackCount: 0,
+    decoderImplementation: 'libvpx-vp9',
+    ...over,
+  });
+
+  it('reads the two counters as the ratio they are', () => {
+    // jitterBufferDelay is seconds summed over every frame emitted, so on its
+    // own it climbs forever. Dividing by the emitted count is the whole trick,
+    // and getting it wrong is the classic way to misread this statistic.
+    expect(jitterBufferMs(inbound())).toBe(300);
+  });
+
+  it('has no opinion before anything has been emitted', () => {
+    expect(jitterBufferMs(inbound({ jitterBufferEmittedCount: 0 }))).toBeNull();
+    expect(jitterBufferMs(inbound({ jitterBufferDelay: null }))).toBeNull();
+    expect(jitterBufferMs(null)).toBeNull();
   });
 });

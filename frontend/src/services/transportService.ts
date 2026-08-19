@@ -1,7 +1,7 @@
 import { dataChannelService } from './dataChannelService';
 import { wsService, type JoinResult, type WsEventHandlers } from './wsService';
 import { VIDEO_SYNC_ACTIONS, type VideoSyncAction } from '@shared/dataChannelProtocol';
-import type { MediaState, QualityFeedback } from '../types';
+import type { MediaState, QualityFeedback, ShareStatus } from '../types';
 
 /**
  * The single transport surface the app talks to.
@@ -27,6 +27,14 @@ export type TransportEventHandlers = WsEventHandlers & {
   /** Peer cursor over the shared surface, normalised 0..1. */
   onPeerCursor?: (displayName: string, x: number, y: number) => void;
   onReceiveQualityFeedback?: (displayName: string, feedback: QualityFeedback) => void;
+  /**
+   * The sharer told us what their encoder is doing.
+   *
+   * Flows the opposite way to quality feedback, and exists because the person
+   * who SEES a screen share fail is not the person whose statistics explain it.
+   * Every diagnostic in this app lived on the sender.
+   */
+  onReceiveShareStatus?: (displayName: string, status: ShareStatus) => void;
 };
 
 class TransportService {
@@ -56,6 +64,8 @@ class TransportService {
             return this.handlers.onPeerVideoSync?.(name, message.d.action, message.d.payload);
           case 'quality':
             return this.handlers.onReceiveQualityFeedback?.(name, message.d.feedback);
+          case 'share':
+            return this.handlers.onReceiveShareStatus?.(name, message.d.status);
         }
       },
     });
@@ -170,6 +180,16 @@ class TransportService {
 
   async sendQualityFeedback(_sessionId: string, feedback: QualityFeedback): Promise<void> {
     dataChannelService.send({ t: 'quality', d: { feedback } });
+  }
+
+  /**
+   * Tell the viewer what we are asking our encoder for, and how that is going.
+   *
+   * Best-effort like every other presence frame: a peer on an older build
+   * decodes nothing and keeps the behaviour it had before this existed.
+   */
+  async sendShareStatus(_sessionId: string, status: ShareStatus): Promise<void> {
+    dataChannelService.send({ t: 'share', d: { status } });
   }
 }
 

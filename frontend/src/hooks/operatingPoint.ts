@@ -74,9 +74,34 @@ export const AUTO_MAX_BITRATE = 10_000_000;
  * — bits with nowhere to land, taken from a connection they are also using for
  * everything else.
  *
- * It is a ceiling on waste, not a target. Nothing is ever raised TO it.
+ * It is a ceiling on waste, not a target. Nothing is ever raised TO it — see
+ * PROBE_CEILING_BPP, which is what actually bounds the climb. That sentence was
+ * false for a while: `budgetCeilingBps` was built from this number and
+ * `nextBudget` raised the budget TO its cap, so within about thirty seconds
+ * every share on a link with headroom settled at 1080p24 / 4.98 Mbps — 0.100
+ * bpp, three times TARGET_BPP. The invariant stated here was contradicted by
+ * the reducer two hundred lines below it.
  */
 export const MAX_USEFUL_BPP = 0.1;
+
+/**
+ * The bpp an upward move is allowed to reach for.
+ *
+ * MAX_USEFUL_BPP is where more bits stop buying anything at all; this is where
+ * they stop being worth ASKING for on speculation. About 1.4x TARGET_BPP: enough
+ * headroom that a scene with more motion than the last one does not immediately
+ * look soft, far short of the 3x the climb used to take.
+ *
+ * The distinction matters because the two numbers answer different questions. A
+ * trusted estimate saying "the link has this much" is measurement, and
+ * MAX_USEFUL_BPP still clamps it. A probe is a guess, and a guess that spends
+ * three times what the picture needs costs the viewer twice: it oversubscribes
+ * a home uplink, and it asks a software encoder for a bitrate that can push it
+ * over its cliff — the state nothing in this system could recover from.
+ *
+ * 1080p24 lands at 2.49 Mbps here, against 4.98 before.
+ */
+export const PROBE_CEILING_BPP = 0.05;
 
 /**
  * Resolutions we are willing to send, largest first.
@@ -103,6 +128,17 @@ const BITRATE_STEP = 25_000;
 
 /** The floor. Below this we stop shrinking and accept a soft picture. */
 const SMALLEST = RESOLUTIONS[RESOLUTIONS.length - 1];
+
+/**
+ * The two ends of the rung list.
+ *
+ * Exported so `encodeCapacity` can express its ceiling in the same pixels this
+ * file chooses from, rather than repeating 640x360 and 3840x2160 as literals —
+ * a duplicated literal is how the floor here and the floor there drift apart,
+ * which is the reason MIN_AUDIO_BPS was extracted a few lines below.
+ */
+export const FLOOR_RESOLUTION = SMALLEST;
+export const LARGEST_RESOLUTION = RESOLUTIONS[0];
 
 /**
  * The lowest audio tier, named because the video floor is derived from it.
@@ -168,13 +204,53 @@ const UNKNOWN_VIEWPORT: Viewport = { width: 1920, height: 1080 };
 export function resolutionBox(
   ceiling: ScreenShareQuality,
   viewport: Viewport | null,
+  fps = 0,
+  maxPixelsPerSecond: number | null = null,
 ): Viewport {
   const preset = QUALITY_PRESETS[ceiling] ?? QUALITY_PRESETS.auto;
   const bound = viewport ?? (ceiling === 'auto' ? UNKNOWN_VIEWPORT : null);
-  if (!bound) return { width: preset.video.width, height: preset.video.height };
+  const box = bound
+    ? {
+        width: Math.min(preset.video.width, bound.width),
+        height: Math.min(preset.video.height, bound.height),
+      }
+    : { width: preset.video.width, height: preset.video.height };
+  return withinEncodeCapacity(box, fps, maxPixelsPerSecond);
+}
+
+/**
+ * The box, shrunk to what the sender's own encoder has been shown to sustain.
+ *
+ * The fourth bound, and the only one that is about the machine rather than the
+ * link, the user, or the far end. It exists because `cpu-bound` was a state the
+ * whole control loop answered by holding: the budget could not move, the ladder
+ * could not move, and the viewer's report — the one signal that knew the picture
+ * was freezing — reached neither. Something had to be able to come down, and
+ * pixels are the thing a CPU limit is actually about. `SenderHealth`'s contract
+ * that a CPU limit "MUST NOT be answered by lowering the bitrate" is preserved
+ * exactly: the bitrate is untouched, so bpp RISES as this shrinks the picture.
+ *
+ * null means no opinion, the same as everywhere else in this pipeline.
+ */
+function withinEncodeCapacity(
+  box: Viewport,
+  fps: number,
+  maxPixelsPerSecond: number | null,
+): Viewport {
+  if (maxPixelsPerSecond === null || fps <= 0) return box;
+  const allowed = maxPixelsPerSecond / fps;
+  const pixels = box.width * box.height;
+  if (pixels <= allowed) return box;
+  // Area goes with the square of a linear factor, so the sides go with the
+  // square root. Aspect is preserved because the rungs are all 16:9 and this
+  // box is what they get tested against.
+  const scale = Math.sqrt(allowed / pixels);
   return {
-    width: Math.min(preset.video.width, bound.width),
-    height: Math.min(preset.video.height, bound.height),
+    // The floor still wins. A bound that excluded every rung we are willing to
+    // send would leave the chooser nothing to pick, and the precedence is
+    // already settled two functions down: unwatchable is worse than wasteful.
+    width: Math.max(SMALLEST.width, Math.floor(box.width * scale)),
+    height: Math.max(SMALLEST.height, Math.floor(box.height * scale)),
   };
 }
 
@@ -193,8 +269,8 @@ export function resolutionBox(
  * gives way, which is the right order of precedence: unwatchable is worse than
  * wasteful.
  */
-export function usefulVideoBps(box: Viewport, fps: number): number {
-  const exact = MAX_USEFUL_BPP * box.width * box.height * fps;
+export function usefulVideoBps(box: Viewport, fps: number, bpp = MAX_USEFUL_BPP): number {
+  const exact = bpp * box.width * box.height * fps;
   const quantised = Math.floor(exact / BITRATE_STEP) * BITRATE_STEP;
   return Math.max(minVideoBps(fps), quantised);
 }
@@ -237,12 +313,17 @@ function audioReserve(budgetBps: number, ceilingAudioBps: number): number {
  *                   not said. A third upper bound alongside the budget and the
  *                   preset: pixels the far end cannot show are pixels nobody
  *                   sees, and the bits they cost are better spent on bpp.
+ * @param capacityPixelsPerSecond
+ *                   What this machine's encoder has been shown to sustain, or
+ *                   null for no opinion. The fourth bound, and the only one
+ *                   about the sender itself — see withinEncodeCapacity.
  */
 export function chooseOperatingPoint(
   budgetBps: number,
   mode: ContentMode,
   ceiling: ScreenShareQuality = 'auto',
   viewport: Viewport | null = null,
+  capacityPixelsPerSecond: number | null = null,
 ): OperatingPoint {
   const preset = QUALITY_PRESETS[ceiling] ?? QUALITY_PRESETS.auto;
 
@@ -272,9 +353,9 @@ export function chooseOperatingPoint(
   const audioBps = audioReserve(budget, preset.audio.bitrate);
 
   // The largest picture we will send, and with it the most that can usefully be
-  // spent on one. Three bounds meet here: the link's (budget), the user's
-  // (preset), and the receiver's (viewport).
-  const box = resolutionBox(ceiling, viewport);
+  // spent on one. Four bounds meet here: the link's (budget), the user's
+  // (preset), the receiver's (viewport), and this machine's (capacity).
+  const box = resolutionBox(ceiling, viewport, fps, capacityPixelsPerSecond);
 
   // `bitrate: 0` means "budget decides" — clamp to the safety ceiling, never to
   // nothing. This is the line that removes the uncapped-encoder failure mode.
@@ -371,10 +452,13 @@ export function budgetCeilingBps(
   quality: ScreenShareQuality,
   fps: number,
   viewport: Viewport | null = null,
+  capacityPixelsPerSecond: number | null = null,
+  bpp = MAX_USEFUL_BPP,
 ): number {
   const preset = QUALITY_PRESETS[quality] ?? QUALITY_PRESETS.auto;
   const presetCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
-  const video = Math.min(presetCeiling, usefulVideoBps(resolutionBox(quality, viewport), fps));
+  const box = resolutionBox(quality, viewport, fps, capacityPixelsPerSecond);
+  const video = Math.min(presetCeiling, usefulVideoBps(box, fps, bpp));
   return video + preset.audio.bitrate;
 }
 
@@ -406,6 +490,14 @@ export interface BudgetSignals {
   ceiling: ScreenShareQuality;
   /** What the receiver can display, or null. Bounds the cap alongside `ceiling`. */
   viewport: Viewport | null;
+  /**
+   * What this machine's encoder can sustain, in pixels per second, or null.
+   *
+   * Here for the same reason `viewport` is: the cap has to see every bound the
+   * chooser sees, or the budget spends its probe cycles climbing toward a
+   * picture something else will never let it use.
+   */
+  capacityPixelsPerSecond: number | null;
 }
 
 export function initialBudgetState(bps: number, now: number): BudgetState {
@@ -444,8 +536,37 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   const floor = minBudgetBps(fps);
   // max(floor, ...) because the floor wins: a picture we refuse to go below
   // costs what it costs, even under a ceiling that would rather it did not.
-  const cap = Math.max(floor, budgetCeilingBps(sig.ceiling, fps, sig.viewport));
+  const cap = Math.max(
+    floor,
+    budgetCeilingBps(sig.ceiling, fps, sig.viewport, sig.capacityPixelsPerSecond),
+  );
   const clamp = (bps: number) => Math.min(cap, Math.max(floor, bps));
+
+  /*
+   * Where an upward move may reach, as opposed to where the budget may sit.
+   *
+   * `cap` is MAX_USEFUL_BPP — the point past which more bits buy nothing — and
+   * for a long time it was also the target, because both upward branches
+   * clamped to it. Every share on a link with headroom therefore climbed to
+   * 0.100 bpp within half a minute, three times what TARGET_BPP calls good, and
+   * asked a software encoder for a bitrate that could put it over its cliff.
+   * Raising stops at PROBE_CEILING_BPP now; `cap` goes back to being the clamp
+   * its own comment says it is.
+   */
+  const raiseCap = Math.max(
+    floor,
+    Math.min(
+      cap,
+      budgetCeilingBps(
+        sig.ceiling,
+        fps,
+        sig.viewport,
+        sig.capacityPixelsPerSecond,
+        PROBE_CEILING_BPP,
+      ),
+    ),
+  );
+  const raise = (bps: number) => Math.min(raiseCap, Math.max(floor, bps));
 
   const shortage = sig.health === 'under-served' || sig.viewerUnhappy;
   const target = sig.estimateBps === null ? null : sig.estimateBps * sig.headroom;
@@ -504,18 +625,21 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   // New information rather than a gamble: a trusted estimate above what we are
   // spending is the link telling us directly that it has more.
   if (target !== null && target > state.bps) {
-    const bps = clamp(target);
-    if (bps !== state.bps) return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
+    const bps = raise(target);
+    // Strictly greater, not merely different: this branch exists to raise, and
+    // `raise` can return less than we are already spending when the ceiling sits
+    // below the current budget. Coming down is the shortage branch's job.
+    if (bps > state.bps) return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
   }
 
   // Room to grow, with nothing measured to justify it. Probe.
   const wantsMore = sig.health === 'satisfied' || sig.health === 'self-limited';
   if (wantsMore && sig.now - state.lastChangeAt > state.probeBackoffMs) {
-    const bps = clamp(state.bps * PROBE_FACTOR);
-    // Already at the cap. Returning here rather than marking `probing` is what
-    // stops the loop stalling at the top the way it used to stall at the floor:
-    // a probe that cannot move the budget has nothing to judge.
-    if (bps === state.bps) return state;
+    const bps = raise(state.bps * PROBE_FACTOR);
+    // Already at the ceiling. Returning here rather than marking `probing` is
+    // what stops the loop stalling at the top the way it used to stall at the
+    // floor: a probe that cannot move the budget has nothing to judge.
+    if (bps <= state.bps) return state;
     return { ...state, bps, baseBps: state.bps, probing: true, lastChangeAt: sig.now };
   }
 

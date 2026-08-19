@@ -184,8 +184,11 @@ export function nextLadderState(state: LadderState, sig: LadderSignals): LadderS
 
   // CPU pressure is not a bandwidth problem and must not be answered like one.
   // Lowering the bitrate does not buy the encoder any CPU; it just spends fewer
-  // bits on an already-struggling picture. Hold, and let the caller respond by
-  // dropping resolution or reverting the codec.
+  // bits on an already-struggling picture. A whole preset step is the wrong
+  // granularity for it in any case. So hold — and the caller does now respond,
+  // through `encodeCapacity` (fewer pixels, same bitrate) and
+  // `shouldDowngradeCodec` (a codec the machine can actually run). For a long
+  // time neither existed and this comment was the whole treatment.
   if (sig.senderHealth === 'cpu-bound') {
     return { ...state, consecutiveGood: 0 };
   }

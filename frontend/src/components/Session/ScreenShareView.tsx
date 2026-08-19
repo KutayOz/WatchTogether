@@ -43,6 +43,8 @@ interface ScreenShareViewProps {
    *  paying for pixels this screen has nowhere to put. Must be stable across
    *  renders — it drives a ResizeObserver. */
   onViewportChange?: (viewport: Viewport | null) => void;
+  /** Build and show the debug report. Passed through to the fullscreen controls. */
+  onDebugReport?: () => void;
 }
 
 export function ScreenShareView({
@@ -73,6 +75,7 @@ export function ScreenShareView({
   peerCursor,
   onLocalCursor,
   onViewportChange,
+  onDebugReport,
 }: ScreenShareViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -817,6 +820,7 @@ export function ScreenShareView({
             hasScreenAudio={hasAudioTrack && !isLocalSharing}
             screenAudioVolume={audioVolume}
             onScreenAudioVolumeChange={handleVolumeChange}
+            onDebugReport={onDebugReport}
           />
           <button
             type="button"

@@ -20,6 +20,7 @@ const SHORTCUTS: Array<{ keys: string[]; label: string }> = [
   { keys: ['V'], label: 'camera on / off' },
   { keys: ['S'], label: 'share screen' },
   { keys: ['C'], label: 'show / hide sidebar' },
+  { keys: ['D'], label: 'debug report (copy for a bug report)' },
   { keys: ['Esc'], label: 'exit fullscreen' },
   { keys: ['?'], label: 'this cheat sheet' },
 ];

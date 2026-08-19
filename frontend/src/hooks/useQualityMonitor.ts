@@ -58,6 +58,82 @@ interface InboundRtpVideoStats {
   jitter?: number;
   framesPerSecond?: number;
   totalFreezesDuration?: number;
+  frameWidth?: number;
+  frameHeight?: number;
+  freezeCount?: number;
+  framesReceived?: number;
+  framesDecoded?: number;
+  framesDropped?: number;
+  jitterBufferDelay?: number;
+  jitterBufferEmittedCount?: number;
+  pliCount?: number;
+  nackCount?: number;
+  decoderImplementation?: string;
+}
+
+/**
+ * What the RECEIVER is getting, for the diagnostics panel.
+ *
+ * Separate from `QualityMetrics`, which is the scoring input and is
+ * deliberately small. This is the readout, and it exists because every
+ * diagnostic in this app was on the sender: the person watching a picture
+ * freeze could see a coloured bar and nothing else, so a report could only ever
+ * say "it looks choppy". A freeze count beside the sender's own
+ * `qualityLimitationReason` turns the next one into a measurement.
+ */
+export interface InboundScreenStats {
+  frameWidth: number | null;
+  frameHeight: number | null;
+  framesPerSecond: number | null;
+  /** How many times the picture stopped, and for how long in total, in seconds. */
+  freezeCount: number | null;
+  totalFreezesDuration: number | null;
+  framesReceived: number | null;
+  framesDecoded: number | null;
+  framesDropped: number | null;
+  /** Cumulative; only meaningful against jitterBufferEmittedCount. See jitterBufferMs. */
+  jitterBufferDelay: number | null;
+  jitterBufferEmittedCount: number | null;
+  /** Recovery traffic: a keyframe we had to ask for, and packets we had to chase. */
+  pliCount: number | null;
+  nackCount: number | null;
+  decoderImplementation: string | null;
+}
+
+/**
+ * Mean milliseconds a frame waited in the jitter buffer.
+ *
+ * The two counters are a RATIO, not a duration: `jitterBufferDelay` is seconds
+ * summed over every frame emitted, so reading it on its own gives a number that
+ * climbs forever. Dividing by `jitterBufferEmittedCount` is the whole trick,
+ * and getting it wrong is the classic way to misread this statistic.
+ *
+ * null when either term is missing or nothing has been emitted yet.
+ */
+export function jitterBufferMs(s: InboundScreenStats | null): number | null {
+  if (!s) return null;
+  const { jitterBufferDelay: delay, jitterBufferEmittedCount: emitted } = s;
+  if (typeof delay !== 'number' || typeof emitted !== 'number' || emitted <= 0) return null;
+  return (delay / emitted) * 1000;
+}
+
+/** Pull the readout out of one inbound-rtp report. Every field independently optional. */
+function readInbound(r: InboundRtpVideoStats): InboundScreenStats {
+  return {
+    frameWidth: r.frameWidth ?? null,
+    frameHeight: r.frameHeight ?? null,
+    framesPerSecond: r.framesPerSecond ?? null,
+    freezeCount: r.freezeCount ?? null,
+    totalFreezesDuration: r.totalFreezesDuration ?? null,
+    framesReceived: r.framesReceived ?? null,
+    framesDecoded: r.framesDecoded ?? null,
+    framesDropped: r.framesDropped ?? null,
+    jitterBufferDelay: r.jitterBufferDelay ?? null,
+    jitterBufferEmittedCount: r.jitterBufferEmittedCount ?? null,
+    pliCount: r.pliCount ?? null,
+    nackCount: r.nackCount ?? null,
+    decoderImplementation: r.decoderImplementation ?? null,
+  };
 }
 
 interface CandidatePairStats {
@@ -138,13 +214,29 @@ interface StreamSample {
   at: number;
 }
 
+/**
+ * @param expectedFps The frame rate the SENDER says it is targeting, or
+ *   undefined when it has not said. Judging a 24 fps film share against the 30
+ *   fps default made a healthy stream look 6% short of nominal for its whole
+ *   run — not enough to reach a bad verdict on its own, but enough to narrow
+ *   the margin on a signal that is wired to an action.
+ */
 export function useQualityMonitor(
   isWatching: boolean,
-  onQualityChange?: (feedback: QualityFeedback) => void
+  onQualityChange?: (feedback: QualityFeedback) => void,
+  expectedFps?: number,
 ) {
   const [quality, setQuality] = useState<QualityLevel | null>(null);
   const [score, setScore] = useState<number | null>(null);
   const [metrics, setMetrics] = useState<QualityMetrics | null>(null);
+  const [inbound, setInbound] = useState<InboundScreenStats | null>(null);
+
+  // A ref, not a dependency: the sender's target arrives on its own heartbeat
+  // and must not tear down and rebuild the polling interval when it does.
+  const expectedFpsRef = useRef(expectedFps);
+  useEffect(() => {
+    expectedFpsRef.current = expectedFps;
+  }, [expectedFps]);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevLevelRef = useRef<QualityLevel | null>(null);
   // -Infinity so the first scoreable poll always reports, rather than starting
@@ -232,8 +324,11 @@ export function useQualityMonitor(
       };
 
       setMetrics(newMetrics);
+      setInbound(readInbound(best.stats));
 
-      const newScore = calculateQualityScore(newMetrics);
+      // Undefined falls through to the function's own default, so a peer on an
+      // older build behaves exactly as before.
+      const newScore = calculateQualityScore(newMetrics, expectedFpsRef.current);
       const newLevel = scoreToLevel(newScore);
 
       setScore(Math.round(newScore));
@@ -274,6 +369,7 @@ export function useQualityMonitor(
       setQuality(null);
       setScore(null);
       setMetrics(null);
+      setInbound(null);
       prevLevelRef.current = null;
       lastSentAtRef.current = -Infinity;
       // Counters belong to one connection. Carrying them into the next call
@@ -292,5 +388,6 @@ export function useQualityMonitor(
     quality,
     score,
     metrics,
+    inbound,
   };
 }

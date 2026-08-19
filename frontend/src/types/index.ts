@@ -415,40 +415,26 @@ export interface AuditEntry {
   createdAt: number;
 }
 
-// Network quality monitoring types
-export type QualityLevel = 'excellent' | 'good' | 'fair' | 'poor' | 'critical';
-
-/**
- * A rectangle of real pixels, on whichever end is being described.
+/*
+ * Network quality monitoring types.
  *
- * Crosses the wire inside QualityFeedback, which is why it lives here rather
- * than beside the chooser that consumes it.
+ * RE-EXPORTED, not redeclared. These cross the DataChannel, so the wire has to
+ * have exactly one definition of them — and it lives in the shared module the
+ * Worker and the frontend both compile against.
+ *
+ * This file used to declare its own `QualityFeedback` carrying a `viewport`
+ * that the shared `validateData` knew nothing about, so the field was stripped
+ * on arrival: the receiver's size never reached the sender and the whole
+ * viewport-aware resolution feature shipped inert, with nothing failing loudly
+ * enough to say so. A re-export makes that mistake a compile error instead.
  */
-export interface Viewport {
-  width: number;
-  height: number;
-}
-
-export interface QualityFeedback {
-  level: QualityLevel;
-  score: number;
-  packetLossPercent: number;
-  jitterMs: number;
-  rttMs: number;
-  fps: number;
-  /**
-   * How large the shared picture is actually being drawn on the receiver, in
-   * device pixels. Optional: a peer on an older build sends nothing, and the
-   * sender falls back to assuming 1080p (see resolutionBox).
-   *
-   * Carried on the quality message rather than one of its own because it wants
-   * exactly the same lifecycle as the verdict beside it — sent only while a
-   * share is being watched, expiring on the same clock, cleared when the peer
-   * changes. A second message would mean a second copy of that lifecycle, and
-   * the two would drift.
-   */
-  viewport?: Viewport;
-}
+export type {
+  QualityLevel,
+  Viewport,
+  QualityFeedback,
+  ShareStatus,
+  QualityLimitation,
+} from '@shared/dataChannelProtocol';
 
 /**
  * What the bandwidth estimator thinks this connection's uplink can carry, and

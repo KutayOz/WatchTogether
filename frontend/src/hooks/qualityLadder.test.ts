@@ -282,6 +282,7 @@ describe('a viewer verdict driving the budget', () => {
         mode: 'film',
         ceiling: 'auto',
         viewport: null,
+        capacityPixelsPerSecond: null,
       });
     }
     return budget;
@@ -319,6 +320,7 @@ describe('a viewer verdict against a healthy estimate', () => {
       mode: 'film',
       ceiling: 'auto',
       viewport: null,
+      capacityPixelsPerSecond: null,
     });
     expect(after.bps).toBeLessThan(before.bps);
   });
@@ -335,6 +337,7 @@ describe('a viewer verdict against a healthy estimate', () => {
       mode: 'film',
       ceiling: 'auto',
       viewport: null,
+      capacityPixelsPerSecond: null,
     });
     expect(after.bps).toBe(850_000);
   });
