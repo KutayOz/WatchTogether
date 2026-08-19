@@ -106,27 +106,22 @@ export function estimateFromBitrate(
   observedBps: number | null = null,
 ): UplinkEstimate {
   const budget = bitsPerSecond * HEADROOM_SELECT;
-  const supportedQualities = {} as Record<ScreenShareQuality, boolean>;
+  const withinEstimate = {} as Record<ScreenShareQuality, boolean>;
 
   for (const key of Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]) {
-    // `auto` sets no ceiling and lets the encoder track the estimator itself,
-    // so it fits by definition — and it is the honest answer on a link too
-    // slow for even the lowest fixed preset.
+    // `auto` sets no fixed ceiling of its own, so it fits by definition — and
+    // it is the honest answer on a link too slow for even the lowest preset.
     //
     // When capacity is unknown the number in hand is a lower bound, so it can
-    // say a preset FITS but never that one does not. The reported failure is
-    // exactly this: a TCP-relay estimate of 30 kbps disabled all five fixed
-    // presets (MediaControls sets `disabled={!isSupported}`), so the collapse
-    // took away the only manual escape from itself.
-    supportedQualities[key] =
-      key === 'auto' || !capacityKnown || presetBitrate(key) <= budget;
+    // say a preset fits but never that one does not.
+    withinEstimate[key] = key === 'auto' || !capacityKnown || presetBitrate(key) <= budget;
   }
 
-  // The best fixed preset that fits. QUALITY_LADDER carries the ordering,
-  // because "cheapest first" is a property of the ladder and not of the object
-  // literal's declaration order — and duplicating it here is how a new rung
-  // ends up silently uncovered.
-  const affordable = QUALITY_LADDER.filter((key) => supportedQualities[key]);
+  // The best fixed preset the link has actually shown it can fill. QUALITY_LADDER
+  // carries the ordering, because "cheapest first" is a property of the ladder
+  // and not of the object literal's declaration order — and duplicating it here
+  // is how a new rung ends up silently uncovered.
+  const affordable = QUALITY_LADDER.filter((key) => withinEstimate[key]);
 
   return {
     uplinkMbps: Math.round((bitsPerSecond / 1_000_000) * 10) / 10,
@@ -136,7 +131,7 @@ export function estimateFromBitrate(
     // instead of the UI recommending a preset that cannot be sustained. With
     // capacity unknown there is nothing to recommend FROM, so `auto` again.
     recommendedQuality: capacityKnown ? (affordable.at(-1) ?? 'auto') : 'auto',
-    supportedQualities,
+    withinEstimate,
     observedBps,
     capacityKnown,
   };

@@ -6,6 +6,22 @@ import type { QualityLevel, QualityFeedback } from '../types';
 const POLL_INTERVAL_MS = 3000; // 3 seconds
 
 /**
+ * Re-send the current verdict this often, even when it has not changed.
+ *
+ * Feedback used to be edge-triggered only, and that quietly made the sender's
+ * copy of it un-expirable: a viewer sitting at 'poor' sends once and then goes
+ * silent, so the sender cannot tell "still bad" from "peer vanished" and has to
+ * believe the last report forever. Repeating it turns the signal into state
+ * replication, which is what lets the sender apply VIEWER_REPORT_TTL_MS and
+ * recover on its own if the reports stop.
+ *
+ * Three polls, matching useSenderHealth's SUSTAIN_POLLS, so the two legs of the
+ * loop learn at the same rate. The cost is one small data-channel message every
+ * nine seconds.
+ */
+export const FEEDBACK_HEARTBEAT_MS = 9000;
+
+/**
  * What one polling interval looked like to the viewer.
  *
  * Deltas, not running totals. The old code summed packetsLost and
@@ -131,6 +147,9 @@ export function useQualityMonitor(
   const [metrics, setMetrics] = useState<QualityMetrics | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevLevelRef = useRef<QualityLevel | null>(null);
+  // -Infinity so the first scoreable poll always reports, rather than starting
+  // the share with up to a heartbeat of silence.
+  const lastSentAtRef = useRef(-Infinity);
   const samplesRef = useRef<Map<number, StreamSample>>(new Map());
 
   const pollStats = useCallback(async () => {
@@ -220,8 +239,11 @@ export function useQualityMonitor(
       setScore(Math.round(newScore));
       setQuality(newLevel);
 
-      // Notify on level change (to send feedback to streamer)
-      if (newLevel !== prevLevelRef.current && onQualityChange) {
+      // Notify the streamer on level change, and on a heartbeat so that a
+      // steady verdict keeps proving it is still being observed.
+      const due = now - lastSentAtRef.current >= FEEDBACK_HEARTBEAT_MS;
+      if (onQualityChange && (newLevel !== prevLevelRef.current || due)) {
+        lastSentAtRef.current = now;
         const total = newMetrics.packetsReceived + newMetrics.packetsLost;
         const feedback: QualityFeedback = {
           level: newLevel,
@@ -253,6 +275,7 @@ export function useQualityMonitor(
       setScore(null);
       setMetrics(null);
       prevLevelRef.current = null;
+      lastSentAtRef.current = -Infinity;
       // Counters belong to one connection. Carrying them into the next call
       // would difference against a stream that no longer exists.
       samplesRef.current.clear();

@@ -3,14 +3,20 @@ import {
   GOOD_POLLS_TO_PROBE,
   INITIAL_PROBE_BACKOFF_MS,
   MAX_PROBE_BACKOFF_MS,
+  VIEWER_REPORT_TTL_MS,
+  currentViewerLevel,
+  currentViewerViewport,
   initialLadderState,
   nextLadderState,
   stepDown,
   stepUp,
+  viewerIsUnhappy,
   withUserChoice,
   type LadderSignals,
   type LadderState,
+  type ViewerReport,
 } from './qualityLadder';
+import { initialBudgetState, minBudgetBps, nextBudget } from './operatingPoint';
 
 /**
  * How quality is allowed to move on its own.
@@ -215,5 +221,149 @@ describe('nextLadderState and a self-limited encoder', () => {
 
     expect(state.applied).toBe('medium');
     expect(state.probing).toBe(true);
+  });
+});
+
+/**
+ * The receiver's leg of the control loop.
+ *
+ * Everything else in this pipeline reads a signal the sender can re-measure on
+ * demand: the encoder's health, the candidate pair's estimate, the CPU. The
+ * viewer's verdict is the one input that arrives from somewhere else and cannot
+ * be re-asked for — which is what made it the last place a one-way ratchet
+ * could hide. It used to be recorded as a bare level with no timestamp and no
+ * reset, so one 'poor' from a peer whose cell dipped stayed true forever, and
+ * `shortage` in nextBudget stayed true with it.
+ */
+describe('currentViewerLevel', () => {
+  it('has no opinion when the viewer has never reported', () => {
+    expect(currentViewerLevel(null, 500_000)).toBeNull();
+  });
+
+  it('reports a fresh verdict', () => {
+    const report: ViewerReport = { level: 'poor', viewport: null, at: 1_000 };
+    expect(currentViewerLevel(report, 1_000 + VIEWER_REPORT_TTL_MS)).toBe('poor');
+  });
+
+  it('expires a verdict nobody is repeating', () => {
+    // The viewer re-sends every FEEDBACK_HEARTBEAT_MS, so silence past three
+    // heartbeats means the reporter is gone rather than still unhappy.
+    const report: ViewerReport = { level: 'critical', viewport: null, at: 1_000 };
+    expect(currentViewerLevel(report, 1_001 + VIEWER_REPORT_TTL_MS)).toBeNull();
+  });
+
+  it('expires a good verdict too, not just a bad one', () => {
+    // Symmetry matters: a stale 'excellent' would let the budget keep probing
+    // upward against a peer that stopped watching ten minutes ago.
+    const report: ViewerReport = { level: 'excellent', viewport: null, at: 0 };
+    expect(currentViewerLevel(report, VIEWER_REPORT_TTL_MS * 2)).toBeNull();
+  });
+});
+
+describe('a viewer verdict driving the budget', () => {
+  const FLOOR = minBudgetBps(24);
+  const POLL_MS = 3_000;
+
+  /** Run the budget loop for `untilMs`, refreshing the report per `resend`. */
+  function run(resend: (now: number) => boolean) {
+    let budget = initialBudgetState(2_000_000, 0);
+    let report: ViewerReport = { level: 'poor', viewport: null, at: 0 };
+
+    for (let now = POLL_MS; now <= 300_000; now += POLL_MS) {
+      if (resend(now)) report = { level: 'poor', viewport: null, at: now };
+      budget = nextBudget(budget, {
+        now,
+        estimateBps: null,
+        // The state the reported collapse actually sat in, so the only thing
+        // deciding the outcome here is the viewer's verdict.
+        health: 'self-limited',
+        viewerUnhappy: viewerIsUnhappy(currentViewerLevel(report, now)),
+        headroom: 0.85,
+        mode: 'film',
+        ceiling: 'auto',
+        viewport: null,
+      });
+    }
+    return budget;
+  }
+
+  it('holds the budget down for as long as the viewer keeps saying so', () => {
+    // Every heartbeat, forever. This is the case the signal exists for, and it
+    // must survive the expiry added for the case below.
+    const budget = run((now) => now % 9_000 === 0);
+    expect(budget.bps).toBe(FLOOR);
+  });
+
+  it('recovers once the reports stop, instead of pinning the rest of the film', () => {
+    // One report, then silence — a peer who closed the tab, walked out of
+    // coverage, or simply never changed level again back when feedback was
+    // sent on change only. Before the expiry this returned the floor.
+    const budget = run(() => false);
+    expect(budget.bps).toBeGreaterThanOrEqual(2_000_000);
+  });
+});
+
+describe('a viewer verdict against a healthy estimate', () => {
+  it('still lowers the budget when the estimate says there is room', () => {
+    // The far end is freezing on a decoder it cannot feed, so nothing is being
+    // lost in flight and the capacity estimate is honestly high. `min(bps,
+    // target)` is a no-op here, and without the multiplicative path the
+    // complaint would be completely inert.
+    const before = initialBudgetState(2_000_000, 0);
+    const after = nextBudget(before, {
+      now: 3_000,
+      estimateBps: 8_000_000,
+      health: 'satisfied',
+      viewerUnhappy: true,
+      headroom: 0.85,
+      mode: 'film',
+      ceiling: 'auto',
+      viewport: null,
+    });
+    expect(after.bps).toBeLessThan(before.bps);
+  });
+
+  it('still prefers the estimate when the estimate is the tighter of the two', () => {
+    // Unchanged behaviour: a trusted number below what we spend is followed
+    // down to exactly itself, not discounted a second time.
+    const after = nextBudget(initialBudgetState(2_000_000, 0), {
+      now: 3_000,
+      estimateBps: 1_000_000,
+      health: 'under-served',
+      viewerUnhappy: true,
+      headroom: 0.85,
+      mode: 'film',
+      ceiling: 'auto',
+      viewport: null,
+    });
+    expect(after.bps).toBe(850_000);
+  });
+});
+
+describe('currentViewerViewport', () => {
+  it('reports a fresh viewport', () => {
+    const report: ViewerReport = {
+      level: 'good',
+      viewport: { width: 3840, height: 2160 },
+      at: 1_000,
+    };
+    expect(currentViewerViewport(report, 2_000)).toEqual({ width: 3840, height: 2160 });
+  });
+
+  it('expires it on the same clock as the verdict', () => {
+    // A screen that stopped answering must stop authorising a 4K picture. The
+    // viewport rides on the verdict's message precisely so it cannot outlive it.
+    const report: ViewerReport = {
+      level: 'good',
+      viewport: { width: 3840, height: 2160 },
+      at: 0,
+    };
+    expect(currentViewerViewport(report, VIEWER_REPORT_TTL_MS + 1)).toBeNull();
+  });
+
+  it('has no opinion when a peer reports quality but no size', () => {
+    // An older build sends QualityFeedback without the viewport field.
+    const report: ViewerReport = { level: 'good', viewport: null, at: 0 };
+    expect(currentViewerViewport(report, 1_000)).toBeNull();
   });
 });

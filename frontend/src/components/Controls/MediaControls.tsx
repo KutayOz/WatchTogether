@@ -318,14 +318,18 @@ export function MediaControls({
                   const preset = QUALITY_PRESETS[key];
                   const isSelected = screenShareQuality === key;
                   const isRecommended = uplink?.recommendedQuality === key;
-                  const isSupported = !uplink || uplink.supportedQualities[key] !== false;
+                  // Advisory only. Never `disabled`: a preset is a ceiling, and
+                  // a ceiling above your link costs nothing — chooseOperatingPoint
+                  // still sits on the budget. Locking these was what left a
+                  // collapsed session with no way out, and on a fast link it is
+                  // what kept everything above `auto` permanently out of reach,
+                  // since `auto` bounds the very estimate the lock consults.
+                  const aboveLink = !!uplink && uplink.withinEstimate[key] === false;
                   return (
                     <button
                       key={key}
                       type="button"
-                      disabled={!isSupported}
                       onClick={() => {
-                        if (!isSupported) return;
                         onQualityChange(key);
                         setShowQualityMenu(false);
                       }}
@@ -338,14 +342,14 @@ export function MediaControls({
                         color: 'var(--ink)',
                         border: isSelected ? '2.5px solid var(--ink)' : '2.5px solid transparent',
                         borderRadius: 8,
-                        cursor: isSupported ? 'pointer' : 'not-allowed',
-                        opacity: isSupported ? 1 : 0.45,
+                        cursor: 'pointer',
+                        opacity: 1,
                         fontFamily: 'var(--font-body)',
                         fontWeight: 600,
                         transition: 'background .15s, border .15s',
                       }}
                       onMouseEnter={(e) => {
-                        if (!isSelected && isSupported) e.currentTarget.style.background = 'rgba(255,79,163,0.15)';
+                        if (!isSelected) e.currentTarget.style.background = 'rgba(255,79,163,0.15)';
                       }}
                       onMouseLeave={(e) => {
                         if (!isSelected) e.currentTarget.style.background = 'transparent';
@@ -361,9 +365,9 @@ export function MediaControls({
                             recommended
                           </span>
                         )}
-                        {!isSupported && (
-                          <span className="hand" style={{ marginLeft: 'auto', fontSize: 13, color: 'var(--orange-deep)' }}>
-                            may lag
+                        {aboveLink && !isRecommended && (
+                          <span className="hand" style={{ marginLeft: 'auto', fontSize: 13, color: 'rgba(26,20,23,0.5)' }}>
+                            above your link
                           </span>
                         )}
                       </div>

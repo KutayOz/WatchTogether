@@ -4,8 +4,10 @@ import {
   PROBE_INTERVAL_MS,
   PROBE_VERDICT_WINDOW_MS,
   TARGET_BPP,
+  MAX_USEFUL_BPP,
   budgetCeilingBps,
   chooseOperatingPoint,
+  resolutionBox,
   initialBudgetState,
   minBudgetBps,
   minVideoBps,
@@ -162,7 +164,7 @@ describe('chooseOperatingPoint', () => {
 describe('nextBudget', () => {
   const H = 0.85;
   const FLOOR = minBudgetBps(24); // film
-  const CAP = budgetCeilingBps('auto');
+  const CAP = budgetCeilingBps('auto', 24, null);
 
   /** Signals with everything quiet, so each test states only what it varies. */
   function sig(over: Partial<BudgetSignals> = {}): BudgetSignals {
@@ -174,6 +176,7 @@ describe('nextBudget', () => {
       headroom: H,
       mode: 'film',
       ceiling: 'auto',
+      viewport: null,
       ...over,
     };
   }
@@ -337,5 +340,86 @@ describe('nextBudget', () => {
 
     expect(state.bps).toBeGreaterThanOrEqual(2_000_000);
     expect(polls).toBeLessThanOrEqual(40); // 40 polls x 3 s = two minutes
+  });
+});
+
+/**
+ * The top end.
+ *
+ * The floor work made a bad link watchable. This is the other half of the same
+ * requirement — a good link reaching what it can actually carry — and it was
+ * blocked by `auto` being boxed at 1080p on a 6 Mbps cap that could not have
+ * funded 4K even if the box had allowed it (4K24 needs 6.97 Mbps merely to
+ * reach TARGET_BPP).
+ */
+describe('resolutionBox', () => {
+  it('holds auto at 1080p when the receiver has said nothing', () => {
+    expect(resolutionBox('auto', null)).toEqual({ width: 1920, height: 1080 });
+  });
+
+  it('lets auto past 1080p once the receiver reports a screen that large', () => {
+    expect(resolutionBox('auto', { width: 3840, height: 2160 })).toEqual({
+      width: 3840,
+      height: 2160,
+    });
+  });
+
+  it('follows the receiver down to a small window', () => {
+    expect(resolutionBox('auto', { width: 1280, height: 720 })).toEqual({
+      width: 1280,
+      height: 720,
+    });
+  });
+
+  it('does not narrow an explicit pick just because nothing was reported', () => {
+    // An explicit choice is a statement of intent — the same principle
+    // withUserChoice encodes. A peer on an older build sends no viewport, and
+    // that must not quietly demote someone who deliberately chose Ultra.
+    expect(resolutionBox('ultra', null)).toEqual({ width: 3840, height: 2160 });
+  });
+});
+
+describe('chooseOperatingPoint and the receiver', () => {
+  it('reaches 4K on a fast link once the receiver reports a 4K viewport', () => {
+    const point = chooseOperatingPoint(10_000_000, 'film', 'auto', {
+      width: 3840,
+      height: 2160,
+    });
+    expect(point.width).toBe(3840);
+    expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
+  });
+
+  it('still stops at 1080p on the same link when the receiver has said nothing', () => {
+    const point = chooseOperatingPoint(10_000_000, 'film', 'auto', null);
+    expect(point.width).toBe(1920);
+  });
+
+  it('does not pour a fast link into a small window', () => {
+    // 720p at 10 Mbps would be 0.45 bpp: bits with nowhere to land, taken from
+    // a connection the viewer is also using for everything else.
+    const point = chooseOperatingPoint(10_000_000, 'film', 'auto', {
+      width: 1280,
+      height: 720,
+    });
+    expect(point.width).toBe(1280);
+    expect(point.bpp).toBeLessThanOrEqual(MAX_USEFUL_BPP);
+  });
+
+  it('keeps the floor even when the viewport is smaller than the smallest rung', () => {
+    // A thumbnail-sized element must not push the bitrate under the floor the
+    // rest of this file exists to defend.
+    const point = chooseOperatingPoint(300_000, 'film', 'auto', { width: 320, height: 180 });
+    expect(point.videoBps).toBeGreaterThanOrEqual(minVideoBps(24));
+  });
+});
+
+describe('budgetCeilingBps and the receiver', () => {
+  it('stops the budget climbing past what the viewport can use', () => {
+    // Without this the budget would probe upward forever against an encoder
+    // configuration that cannot change — every cycle spent learning nothing.
+    const small = budgetCeilingBps('auto', 24, { width: 1280, height: 720 });
+    const large = budgetCeilingBps('auto', 24, { width: 3840, height: 2160 });
+    expect(small).toBeLessThan(large);
+    expect(large).toBe(AUTO_MAX_BITRATE + 96_000);
   });
 });
