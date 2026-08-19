@@ -199,6 +199,30 @@ Then, in a browser: sign in with a passkey, create a session, generate an
 invite, join it from another profile, and confirm video both ways, chat
 (including your own messages appearing), screen share and background blur.
 
+## Getting a quality problem written down
+
+Press **D** in a live session, or the clipboard button beside the quality
+control. Both ends can do it — the button sits outside the quality menu on
+purpose, because that menu is gated on `isSharer || !isScreenSharing` and the
+person watching someone else's share cannot open it at all. That person is the
+one who sees the picture freeze.
+
+The report holds the last six minutes at the same three-second cadence
+everything else here polls on: the transport path, the operating point asked
+for beside what the encoder achieved, bpp, `qualityLimitationReason`, the
+encoder implementation, the budget and the encode ceiling — and on the viewer's
+side the freeze count, freeze seconds, jitter-buffer delay, dropped frames and
+PLI/NACK counts, plus whatever the far end said about itself. The ICE candidate
+tables and the last 200 log lines come with it.
+
+Read it top-down. `asked` beside `sending` is the first thing to look at,
+because a collapsed frame rate INFLATES bits-per-pixel — `344x182 @ 1 · 0.479
+bpp` looks like excellent quality until you see what was requested. Then the
+path: `turn/tcp` and a bad picture is a transport problem, not a quality one.
+
+It is assembled in the browser and goes nowhere until somebody pastes it. There
+is no sink, and adding one would be a different decision.
+
 ## Known gaps
 
 - **No real-session budget numbers.** Needs two people on real devices.
@@ -264,6 +288,65 @@ invite, join it from another profile, and confirm video both ways, chat
   budget. Measured against the shipped modules: 1080p/4.98 Mbps with no viewport
   report, 4K/9.9 Mbps at 0.050 bpp with a 4K one, 720p/2.2 Mbps into a 1280x720
   window, and floor-to-cap in 108 s on probes alone.
+
+- **`cpu-bound` was a state the whole control loop answered by holding.** A real
+  session between two desktop Chromes froze and jumped on the RECEIVER from the
+  first second of every share and never recovered, while the sharer's own
+  preview stayed smooth — that preview is the raw capture, not the encode, so it
+  hides exactly this. Three things compounded:
+
+  1. `nextBudget`'s `cpu-bound` branch is FIRST and returned unchanged, which
+     pre-empts every downward path below it including `shortage`. The viewer was
+     sending `poor` every nine seconds and the sender could not hear it.
+     `nextLadderState` holds on the same verdict, and the only other reaction
+     was a toast. Both files' comments named the remedy — "a smaller resolution
+     or a cheaper codec" — and neither existed.
+  2. `preferVp9` promoted VP9 unconditionally. Apple Silicon has no hardware VP9
+     encoder, so that is realtime libvpx. Its own comment had already nominated
+     the revert condition: "if this flips the limitation from 'bandwidth' to
+     'cpu', this is the change to revert."
+  3. `budgetCeilingBps` was built from `MAX_USEFUL_BPP` and both upward branches
+     clamped to it, so every share on a link with headroom climbed to **1080p24
+     at 4.98 Mbps — 0.100 bpp, three times `TARGET_BPP`** — within about thirty
+     seconds. `MAX_USEFUL_BPP`'s own doc says "It is a ceiling on waste, not a
+     target. Nothing is ever raised TO it"; the reducer two hundred lines below
+     contradicted it.
+
+  What guards it now: `encodeCapacity.ts` — a measured pixels-per-second ceiling
+  that is the fourth bound on the picture beside budget, preset and viewport, cut
+  by `CAPACITY_BACKOFF` when the encoder is over its cliff and relaxed after
+  `CAPACITY_RETRY_MS` so a transient spike cannot pin a session. It bounds
+  PIXELS, never bitrate, so `SenderHealth`'s contract holds and bpp rises as the
+  picture shrinks. `shouldDowngradeCodec` + `webrtcService.downgradeScreenCodec()`
+  move a software VP9 encode to H.264 once, mid-session, over the existing
+  renegotiation path (no screen-permission re-prompt — only a fresh
+  `getDisplayMedia` does that). `PROBE_CEILING_BPP` (0.05) bounds the climb, so
+  1080p24 settles at 2.49 Mbps instead of 4.98. And `updateScreenShareQuality`
+  now reconfigures the capturer only when it must GROW past what is actually
+  being captured, with 30 s of hysteresis, so a probe/revert cycle cannot restart
+  Chrome's capture pipeline every nine seconds.
+
+- **The receiver's viewport had never once crossed the wire.** Found while
+  fixing the above. `frontend/src/types/index.ts` declared its own
+  `QualityFeedback` with a `viewport` field; the shared contract in
+  `worker/src/lib/dataChannelProtocol.ts` had no such field, and `validateData`
+  rebuilds the frame field by field — so it was stripped on arrival.
+  `grep -rn viewport worker/src` returned nothing. Every `auto` share was
+  therefore capped at `UNKNOWN_VIEWPORT` (1080p) for its whole life, and the
+  viewport-aware resolution work shipped inert with nothing failing loudly
+  enough to say so. The `@shared` alias exists to make exactly this a compile
+  error, and it was defeated by a parallel type declaration. `viewport` is now
+  in the shared contract with bounds, and `types/index.ts` **re-exports** the
+  shared types rather than redeclaring them.
+
+- **The viewer can now see why.** A `share` frame (sharer → viewer, over the
+  DataChannel) carries the sender's target fps, geometry, bitrate,
+  `qualityLimitationReason` and `encoderImplementation`; the diagnostics panel
+  shows the receiver's own `freezeCount`, freeze seconds, jitter-buffer delay,
+  dropped frames and PLI/NACK counts beside them. The person who sees a screen
+  share fail is not the person whose statistics explain it, which is how far the
+  last report got: "it looks choppy". The same frame fixes the fps yardstick —
+  `calculateQualityScore` was judging a 24 fps film share against 30.
 
 - **None of the top-end work has been watched on a real link.** It is verified
   by unit tests and by evaluating the real modules in a browser, not by two

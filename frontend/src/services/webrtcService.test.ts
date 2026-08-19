@@ -175,6 +175,84 @@ describe('webrtcService screen share codec', () => {
     ]);
   });
 
+  it('falls back to H.264 once the VP9 encode cannot keep up', async () => {
+    // The revert the original comment on preferVp9 nominated — "if this flips
+    // the limitation from 'bandwidth' to 'cpu', this is the change to revert" —
+    // performed by the session on itself. H.264 because it is the one codec
+    // with hardware encode essentially everywhere, which is the whole point.
+    stubCodecs(['video/VP8', 'video/VP9', 'video/H264']);
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      POINT,
+    );
+    expect(pc.transceiverFor('scr-v').codecPreferences?.[0]?.mimeType).toBe('video/VP9');
+
+    expect(webrtcService.downgradeScreenCodec()).toBe(true);
+
+    expect(pc.transceiverFor('scr-v').codecPreferences?.[0]?.mimeType).toBe('video/H264');
+    expect(webrtcService.getScreenCodec()).toBe('h264');
+  });
+
+  it('will not switch codec twice in one share', async () => {
+    // A codec that oscillates is worse than a suboptimal one: every switch
+    // costs the viewer a decoder teardown and a keyframe. The caller reads the
+    // false and skips the renegotiation.
+    stubCodecs(['video/VP8', 'video/VP9', 'video/H264']);
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      POINT,
+    );
+
+    expect(webrtcService.downgradeScreenCodec()).toBe(true);
+    expect(webrtcService.downgradeScreenCodec()).toBe(false);
+  });
+
+  it('has nothing to downgrade when nobody is sharing', async () => {
+    stubCodecs(['video/VP8', 'video/VP9', 'video/H264']);
+    expect(webrtcService.downgradeScreenCodec()).toBe(false);
+  });
+
+  it('starts the next share from VP9 again', async () => {
+    // A 720p window may run in VP9 on the very machine where a 4K one could
+    // not, so the downgrade is a fact about one share, not about the machine.
+    stubCodecs(['video/VP8', 'video/VP9', 'video/H264']);
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    const stream = screenStream() as unknown as MediaStream;
+    await webrtcService.addScreenShareTracks(stream, POINT);
+
+    webrtcService.downgradeScreenCodec();
+    expect(webrtcService.getScreenCodec()).toBe('h264');
+
+    await webrtcService.stopScreenShare();
+    expect(webrtcService.getScreenCodec()).toBe('vp9');
+  });
+
+  it('prefers H.264 with packetization-mode=1 over mode 0', async () => {
+    // Mode 0 cannot fragment a NAL unit across RTP packets, so every large
+    // frame has to fit an MTU — exactly the frames a screen share produces.
+    vi.stubGlobal('RTCRtpSender', {
+      getCapabilities: () => ({
+        codecs: [
+          { mimeType: 'video/VP8' },
+          { mimeType: 'video/H264', sdpFmtpLine: 'packetization-mode=0;profile-level-id=42e01f' },
+          { mimeType: 'video/H264', sdpFmtpLine: 'packetization-mode=1;profile-level-id=42e01f' },
+        ],
+      }),
+    });
+    webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
+    await webrtcService.addScreenShareTracks(
+      screenStream() as unknown as MediaStream,
+      POINT,
+    );
+
+    webrtcService.downgradeScreenCodec();
+
+    const offered = pc.transceiverFor('scr-v').codecPreferences;
+    expect(offered?.[0]?.sdpFmtpLine).toContain('packetization-mode=1');
+  });
+
   it('leaves the codec order alone when VP9 is unavailable', async () => {
     stubCodecs(['video/VP8', 'video/H264']);
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
@@ -346,6 +424,88 @@ describe('webrtcService capture geometry', () => {
     expect(track.constraints).toHaveLength(0);
     // The encoder ceiling still moved, though.
     expect(senderFor(pc, 'scr-v').maxBitrate).toBe(nudged.videoBps);
+  });
+
+  it('leaves the capturer alone when the picture gets smaller', async () => {
+    // Downward moves need no capturer change at all: the encoder's own scaler
+    // handles them, which is exactly why applyVideoEncoding leaves
+    // scaleResolutionDownBy unpinned. Restarting the capture pipeline costs the
+    // viewer a keyframe and a decoder re-init for a change the encoder was
+    // going to make anyway.
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const big = chooseOperatingPoint(2_300_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(big);
+    await webrtcService.addScreenShareTracks(captured, big);
+
+    const track = stream.getVideoTracks()[0];
+    track.constraints.length = 0;
+
+    const small = chooseOperatingPoint(1_000_000, 'film');
+    expect(small.height).toBe(720); // precondition: it really did shrink
+    await webrtcService.updateScreenShareQuality(small);
+
+    expect(track.constraints).toHaveLength(0);
+    // The encoder ceiling still came down, which is the part that matters.
+    expect(senderFor(pc, 'scr-v').maxBitrate).toBe(small.videoBps);
+  });
+
+  it('measures a raise against what is CAPTURED, not against the last ask', async () => {
+    // Down then back up to a size we never stopped capturing. `currentPoint`
+    // conflated the ask with the capture, so this counted as a change twice and
+    // restarted the pipeline on the way out and again on the way back.
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const big = chooseOperatingPoint(2_300_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(big);
+    await webrtcService.addScreenShareTracks(captured, big);
+
+    const track = stream.getVideoTracks()[0];
+    track.constraints.length = 0;
+
+    await webrtcService.updateScreenShareQuality(chooseOperatingPoint(1_000_000, 'film'));
+    await webrtcService.updateScreenShareQuality(big);
+
+    expect(track.constraints).toHaveLength(0);
+  });
+
+  it('will not restart the capturer twice inside the hysteresis window', async () => {
+    // The budget probes upward every 9 s and reverts exactly on failure. Left
+    // unguarded, a budget wandering across a rung boundary would restart the
+    // capture on every cycle — a stutter every nine seconds, for the whole film.
+    vi.useFakeTimers();
+    try {
+      const stream = screenStream();
+      stubDisplayMedia(stream);
+
+      const small = chooseOperatingPoint(1_000_000, 'film');
+      const { stream: captured } = await webrtcService.captureScreen(small);
+      await webrtcService.addScreenShareTracks(captured, small);
+
+      const track = stream.getVideoTracks()[0];
+      track.constraints.length = 0;
+
+      // The first raise after a capture is always allowed.
+      await webrtcService.updateScreenShareQuality(chooseOperatingPoint(2_300_000, 'film'));
+      expect(track.constraints).toHaveLength(1);
+
+      // A second one, moments later, is not.
+      await webrtcService.updateScreenShareQuality(
+        chooseOperatingPoint(15_000_000, 'film', 'extreme'),
+      );
+      expect(track.constraints).toHaveLength(1);
+
+      // Once the window has passed, it is.
+      vi.advanceTimersByTime(30_001);
+      await webrtcService.updateScreenShareQuality(
+        chooseOperatingPoint(15_000_000, 'film', 'extreme'),
+      );
+      expect(track.constraints).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('re-asserts geometry after the user switches shared surface', async () => {

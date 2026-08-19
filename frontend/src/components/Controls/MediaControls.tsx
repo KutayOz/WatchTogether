@@ -3,6 +3,7 @@ import {
   type ScreenShareQuality,
   type UplinkEstimate,
   type ContentMode,
+  type ShareStatus,
   QUALITY_PRESETS,
   CONTENT_MODES,
 } from '../../types';
@@ -11,6 +12,7 @@ import {
   type TransportDiagnostics,
 } from '../../hooks/useTransportDiagnostics';
 import type { OperatingPoint } from '../../hooks/operatingPoint';
+import { jitterBufferMs, type InboundScreenStats } from '../../hooks/useQualityMonitor';
 
 interface MediaControlsProps {
   isMuted: boolean;
@@ -47,8 +49,27 @@ interface MediaControlsProps {
   appliedPoint?: OperatingPoint | null;
   /** True when the budget is pinned at its floor — the link cannot fund more. */
   atBudgetFloor?: boolean;
+  /**
+   * What THIS end is receiving, when watching someone else's share.
+   *
+   * The sender's own readout ("sending", "asked", "limited by") is above; this
+   * is the other half, and it is the half that was missing. Freezing is a thing
+   * only the receiver can see.
+   */
+  inbound?: InboundScreenStats | null;
+  /** What the sharer says their encoder is doing, or null if they have not said. */
+  peerShare?: ShareStatus | null;
   contentMode?: ContentMode;
   onContentModeChange?: (mode: ContentMode) => void;
+  /**
+   * Build and show the debug report.
+   *
+   * Rendered OUTSIDE the quality menu on purpose. That menu is gated on
+   * `isSharer || !isScreenSharing`, so the one person who cannot reach it is
+   * the one watching someone else's share — which is exactly the person who
+   * sees the picture freeze and has something to report.
+   */
+  onDebugReport?: () => void;
 }
 
 export function MediaControls({
@@ -78,6 +99,9 @@ export function MediaControls({
   diagnostics,
   appliedPoint,
   atBudgetFloor = false,
+  inbound,
+  peerShare,
+  onDebugReport,
   contentMode = 'film',
   onContentModeChange,
 }: MediaControlsProps) {
@@ -187,7 +211,7 @@ export function MediaControls({
 
             {showQualityMenu && onQualityChange && (
               <PopMenu onClose={() => setShowQualityMenu(false)} title={isScreenSharing ? 'CHANGE QUALITY' : 'STREAM QUALITY'}>
-                {(uplink || diagnostics?.path || diagnostics?.outbound) && (
+                {(uplink || diagnostics?.path || diagnostics?.outbound || inbound || peerShare) && (
                   <div
                     className="hand"
                     style={{
@@ -240,6 +264,15 @@ export function MediaControls({
                         {diagnostics.outbound.targetBitrate != null &&
                           ` · ${(diagnostics.outbound.targetBitrate / 1_000_000).toFixed(2)} Mbps`}
                         {diagnostics.bpp != null && ` · ${diagnostics.bpp.toFixed(3)} bpp`}
+                        {/* Software or hardware, in one string. 'libvpx-vp9' on
+                            a machine with no hardware VP9 encoder is the whole
+                            explanation for a share that stops and starts. */}
+                        {diagnostics.outbound.encoderImplementation && (
+                          <span style={{ opacity: 0.7 }}>
+                            {' '}
+                            · {diagnostics.outbound.encoderImplementation}
+                          </span>
+                        )}
                       </div>
                     )}
                     {/* What we asked for, beside what came back. The reported
@@ -263,6 +296,63 @@ export function MediaControls({
                           limited by: {diagnostics.outbound.qualityLimitationReason}
                         </div>
                       )}
+
+                    {/* The viewer's half. Everything above describes the local
+                        encoder, which is exactly the wrong end when the person
+                        reporting the fault is the one watching. */}
+                    {inbound && (
+                      <div>
+                        receiving:{' '}
+                        {inbound.frameWidth != null
+                          ? `${inbound.frameWidth}×${inbound.frameHeight}`
+                          : '—'}
+                        {inbound.framesPerSecond != null &&
+                          ` @ ${Math.round(inbound.framesPerSecond)}`}
+                        {inbound.decoderImplementation && (
+                          <span style={{ opacity: 0.7 }}> · {inbound.decoderImplementation}</span>
+                        )}
+                      </div>
+                    )}
+                    {/* Freezing is the symptom nothing else in this panel can
+                        show, and it is the one the last bug report was about. */}
+                    {inbound?.freezeCount != null && (
+                      <div
+                        style={{
+                          color: inbound.freezeCount > 0 ? 'var(--orange-deep)' : undefined,
+                        }}
+                      >
+                        freezes: {inbound.freezeCount}
+                        {inbound.totalFreezesDuration != null &&
+                          ` (${inbound.totalFreezesDuration.toFixed(1)} s)`}
+                        {jitterBufferMs(inbound) != null &&
+                          ` · buffer ${Math.round(jitterBufferMs(inbound)!)} ms`}
+                        {inbound.framesDropped != null && ` · dropped ${inbound.framesDropped}`}
+                      </div>
+                    )}
+                    {/* Recovery traffic. A PLI is a keyframe we had to ask for,
+                        which is what a freeze ends with — so these two counters
+                        separate "the picture stalled" from "the link is lossy". */}
+                    {(inbound?.pliCount != null || inbound?.nackCount != null) && (
+                      <div style={{ opacity: 0.8 }}>
+                        recovery: {inbound.pliCount ?? '—'} PLI · {inbound.nackCount ?? '—'} NACK
+                      </div>
+                    )}
+                    {/* And what the far end says it is doing, so the two halves
+                        of the diagnosis finally sit on one screen. */}
+                    {peerShare && (
+                      <div>
+                        their encoder: {peerShare.encoder ?? 'unknown'}
+                        {peerShare.limitedBy && peerShare.limitedBy !== 'none' && (
+                          <span style={{ color: 'var(--orange-deep)' }}>
+                            {' '}
+                            · limited by {peerShare.limitedBy}
+                          </span>
+                        )}
+                        <br />
+                        their ask: {peerShare.width}×{peerShare.height} @ {peerShare.fps}
+                        {` · ${(peerShare.bps / 1_000_000).toFixed(2)} Mbps`}
+                      </div>
+                    )}
                   </div>
                 )}
                 {isScreenSharing && (
@@ -394,6 +484,16 @@ export function MediaControls({
           >
             {QUALITY_PRESETS[screenShareQuality]?.label ?? screenShareQuality}
           </div>
+        )}
+
+        {onDebugReport && (
+          <ControlBtn
+            onClick={onDebugReport}
+            title="debug report (D) — copy what is happening"
+            size="sm"
+          >
+            <BugIcon />
+          </ControlBtn>
         )}
       </div>
 
@@ -675,6 +775,18 @@ function ScreenIcon() {
       <rect x="2" y="4" width="20" height="13" rx="2" />
       <line x1="8" y1="21" x2="16" y2="21" />
       <path d="M12 6 L 12 14 M 8 10 L 12 6 L 16 10" />
+    </svg>
+  );
+}
+
+/** A clipboard with a line on it: this collects something and hands it over. */
+function BugIcon() {
+  return (
+    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 3h6v3H9z" />
+      <path d="M6 6h12v15H6z" />
+      <line x1="9" y1="12" x2="15" y2="12" />
+      <line x1="9" y1="16" x2="13" y2="16" />
     </svg>
   );
 }

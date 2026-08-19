@@ -1,6 +1,6 @@
 import { useEffect, useCallback } from 'react';
 import { transportService, type TransportEventHandlers } from '../services/transportService';
-import type { MediaState, QualityFeedback } from '../types';
+import type { MediaState, QualityFeedback, ShareStatus } from '../types';
 
 /**
  * Replaces useSignalR. The returned object has the same method names, so
@@ -102,6 +102,10 @@ export function useTransport(isAuthenticated: boolean, handlers: TransportEventH
     return transportService.sendRenegotiationAnswer(sessionId, sdpAnswer);
   }, []);
 
+  const sendShareStatus = useCallback((sessionId: string, status: ShareStatus) => {
+    return transportService.sendShareStatus(sessionId, status);
+  }, []);
+
   const sendQualityFeedback = useCallback((sessionId: string, feedback: QualityFeedback) => {
     return transportService.sendQualityFeedback(sessionId, feedback);
   }, []);
@@ -126,5 +130,6 @@ export function useTransport(isAuthenticated: boolean, handlers: TransportEventH
     sendRenegotiationOffer,
     sendRenegotiationAnswer,
     sendQualityFeedback,
+    sendShareStatus,
   };
 }

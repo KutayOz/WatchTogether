@@ -8,7 +8,7 @@ import { useWebRTC } from '../../hooks/useWebRTC';
 import { useMediaDevices } from '../../hooks/useMediaDevices';
 import { useUplinkEstimate } from '../../hooks/useUplinkEstimate';
 import { useTransportDiagnostics } from '../../hooks/useTransportDiagnostics';
-import { useSenderHealth } from '../../hooks/useSenderHealth';
+import { shouldDowngradeCodec, useSenderHealth } from '../../hooks/useSenderHealth';
 import {
   chooseOperatingPoint,
   initialBudgetState,
@@ -19,6 +19,11 @@ import {
   sameViewport,
   type OperatingPoint,
 } from '../../hooks/operatingPoint';
+import {
+  initialCapacityState,
+  nextCapacity,
+  type CapacityState,
+} from '../../hooks/encodeCapacity';
 import { HEADROOM_SELECT } from '../../hooks/useUplinkEstimate';
 import {
   currentViewerLevel,
@@ -31,6 +36,11 @@ import {
   type ViewerReport,
 } from '../../hooks/qualityLadder';
 import { useQualityMonitor } from '../../hooks/useQualityMonitor';
+import { useDiagnosticsRecorder } from '../../hooks/useDiagnosticsRecorder';
+import { formatDiagnosticsReport } from '../../hooks/diagnosticsReport';
+import { DebugReportModal } from './DebugReportModal';
+import { logBuffer } from '../../services/logBuffer';
+import { formatIceDiagnostics, webrtcService } from '../../services/webrtcService';
 import { useTalkingWhileMuted } from '../../hooks/useTalkingWhileMuted';
 import { api } from '../../services/api';
 import { Sidebar } from './Sidebar';
@@ -63,6 +73,8 @@ import type {
   QualityFeedback,
   ContentMode,
   Viewport,
+  OutboundScreenStats,
+  ShareStatus,
 } from '../../types';
 import { QUALITY_PRESETS, isContentMode, isScreenShareQuality } from '../../types';
 
@@ -219,6 +231,19 @@ export function SessionRoom() {
   // trigger one. Stamped, and read through currentViewerLevel, so a peer that
   // stops reporting cannot hold quality down for the rest of the session.
   const viewerReportRef = useRef<ViewerReport | null>(null);
+
+  /**
+   * What the SHARER says their encoder is doing, or null when nobody has said.
+   *
+   * State rather than a ref because both consumers render from it: the quality
+   * monitor's fps yardstick and the diagnostics panel. Cleared when the share
+   * ends, on the same argument as the viewer report — a status that outlives a
+   * share is by definition about the last one.
+   */
+  const [peerShareStatus, setPeerShareStatus] = useState<ShareStatus | null>(null);
+
+  /** The debug report, built when it is asked for and shown until dismissed. */
+  const [debugReport, setDebugReport] = useState<string | null>(null);
   // Our own size as a VIEWER, measured by ScreenShareView and sent to whoever
   // is sharing. A ref for the same reason: a ResizeObserver firing must not
   // re-render the whole room.
@@ -654,6 +679,13 @@ export function SessionRoom() {
         logger.error('[Renegotiation] failed to handle answer:', err);
       }
     },
+    onReceiveShareStatus: (_displayName, status) => {
+      // What the far end's encoder is doing. Two consumers: the frame rate is
+      // the yardstick our own quality score is judged against, and the rest is
+      // the diagnostics panel — the readout the person actually watching the
+      // picture freeze could never see before.
+      setPeerShareStatus(status);
+    },
     onReceiveQualityFeedback: (_displayName, feedback) => {
       setPeerQualityFeedback(feedback);
       if (feedback.level === 'poor' || feedback.level === 'critical') {
@@ -705,7 +737,79 @@ export function SessionRoom() {
   const qualityMonitor = useQualityMonitor(
     isCallActive,
     isWatchingRemoteScreen ? handleQualityFeedback : undefined,
+    // Only while watching a share: the sharer's frame rate says nothing about
+    // a camera-only call, and the default is right for that.
+    isWatchingRemoteScreen ? peerShareStatus?.fps : undefined,
   );
+
+  /*
+   * Hold the last few minutes of all of it, so a bug report can describe what
+   * happened rather than what is happening.
+   *
+   * Reads through a closure rebuilt every render, which the hook keeps in a ref
+   * — the same arrangement useSenderHealth uses for its ceiling, and for the
+   * same reason: the poller needs current state without the interval being torn
+   * down every time any of that state moves.
+   */
+  const recorder = useDiagnosticsRecorder(isCallActive, () => {
+    const metrics = qualityMonitor.metrics;
+    const total = metrics ? metrics.packetsReceived + metrics.packetsLost : 0;
+    const now = Date.now();
+    return {
+      path: diagnostics.path,
+      uplink,
+      point: webrtc.isScreenSharing ? operatingPoint : null,
+      outbound: diagnostics.outbound,
+      bpp: diagnostics.bpp,
+      senderHealth: senderHealth.health,
+      budgetBps: webrtc.isScreenSharing ? budget.bps : null,
+      probing: budget.probing,
+      capacityPixelsPerSecond,
+      inbound: isWatchingRemoteScreen ? qualityMonitor.inbound : null,
+      level: qualityMonitor.quality,
+      score: qualityMonitor.score,
+      lossPercent: metrics && total > 0 ? (metrics.packetsLost / total) * 100 : null,
+      viewerLevel: currentViewerLevel(viewerReportRef.current, now),
+      viewerViewport: currentViewerViewport(viewerReportRef.current, now),
+      peerShare: isWatchingRemoteScreen ? peerShareStatus : null,
+    };
+  });
+
+  /**
+   * Assemble the report.
+   *
+   * Async only because the ICE tables come from getStats. Everything else is
+   * already in memory — that is the whole point of the recorder.
+   */
+  const openDebugReport = useCallback(async () => {
+    // A fresh sample first, so pressing this one second into a call still shows
+    // the state that prompted it rather than an empty table.
+    recorder.capture();
+
+    const ice = await webrtcService
+      .getIceDiagnostics()
+      .then((d) => (d ? formatIceDiagnostics(d) : null))
+      .catch(() => null);
+
+    setDebugReport(
+      formatDiagnosticsReport({
+        header: {
+          generatedAt: new Date().toISOString(),
+          sessionId: sessionIdRef.current,
+          role: webrtc.isScreenSharing ? 'sharer' : isWatchingRemoteScreen ? 'viewer' : 'idle',
+          userAgent: navigator.userAgent,
+          devicePixelRatio: window.devicePixelRatio || 1,
+          quality: ladder.applied,
+          contentMode,
+          codec: webrtcService.getScreenCodec(),
+          viewport: myViewportRef.current,
+        },
+        samples: recorder.samples(),
+        logs: logBuffer.snapshot(),
+        ice,
+      }),
+    );
+  }, [recorder, webrtc.isScreenSharing, isWatchingRemoteScreen, ladder.applied, contentMode]);
 
   // Samples reset when sharing starts: eighteen seconds of camera-only readings
   // describe a completely different load than the one a share is about to place.
@@ -717,6 +821,21 @@ export function SessionRoom() {
     initialBudgetState(COLD_START_BUDGET_BPS, Date.now()),
   );
   const budgetBps = budget.bps;
+
+  /*
+   * What this machine's encoder has been shown to sustain, in pixels per second.
+   *
+   * The fourth bound on the picture, beside the budget, the preset and the
+   * viewer's viewport — and the only one about the sender itself. It exists
+   * because `cpu-bound` was a state nothing could answer: the budget holds on
+   * it by design, the ladder holds on it by design, and the viewer's report
+   * never reaches either. Something had to be able to come down.
+   */
+  const [capacity, setCapacity] = useState<CapacityState>(initialCapacityState);
+  const capacityPixelsPerSecond = capacity.maxPixelsPerSecond;
+
+  /** Last poll's encoder readout, so the cumulative counters can be differenced. */
+  const previousSenderSampleRef = useRef<OutboundScreenStats | null>(null);
 
   /*
    * The peer's viewport, as of the last poll, or null when they have not
@@ -739,8 +858,15 @@ export function SessionRoom() {
    * used to run 720p and leave a third of its uplink unused.
    */
   const operatingPoint = useMemo(
-    () => chooseOperatingPoint(budgetBps, contentMode, ladder.applied, viewerViewport),
-    [budgetBps, contentMode, ladder.applied, viewerViewport],
+    () =>
+      chooseOperatingPoint(
+        budgetBps,
+        contentMode,
+        ladder.applied,
+        viewerViewport,
+        capacityPixelsPerSecond,
+      ),
+    [budgetBps, contentMode, ladder.applied, viewerViewport, capacityPixelsPerSecond],
   );
 
   /*
@@ -790,9 +916,19 @@ export function SessionRoom() {
         headroom: HEADROOM_SELECT,
         mode: contentMode,
         ceiling: ladder.applied,
+        // The cap has to see every bound the chooser sees, or the budget spends
+        // its probe cycles climbing toward a picture the encoder will not run.
+        capacityPixelsPerSecond,
       }),
     );
-  }, [uplink, senderHealth.health, senderHealth.streak, contentMode, ladder.applied]);
+  }, [
+    uplink,
+    senderHealth.health,
+    senderHealth.streak,
+    contentMode,
+    ladder.applied,
+    capacityPixelsPerSecond,
+  ]);
 
   // A new share is a new load; carrying the old budget across would judge it by
   // the previous one's behaviour. The viewer's verdict goes with it, for the
@@ -802,6 +938,10 @@ export function SessionRoom() {
     if (!webrtc.isScreenSharing) {
       setBudget(initialBudgetState(COLD_START_BUDGET_BPS, Date.now()));
       viewerReportRef.current = null;
+      // A new share is a new encode. Carrying a ceiling learned from the last
+      // one would judge a 720p window by what a 4K one cost.
+      setCapacity(initialCapacityState());
+      previousSenderSampleRef.current = null;
     }
   }, [webrtc.isScreenSharing]);
 
@@ -828,6 +968,86 @@ export function SessionRoom() {
     webrtc.updateScreenShareQuality(operatingPoint).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [operatingPoint, webrtc.isScreenSharing]);
+
+  /*
+   * Advance the encode ceiling on every sender-health observation.
+   *
+   * Its own effect, not folded into the budget one, because it answers a
+   * different question with a different signal: the budget asks what the LINK
+   * can carry and reads the bandwidth estimate, this asks what the MACHINE can
+   * encode and reads the encoder's own clock. One hook, one concern.
+   *
+   * Measured against `appliedPointRef` rather than `operatingPoint`: the sample
+   * we are about to judge was produced by whatever the encoder was actually
+   * running, which on the tick after a change is not yet the point we just
+   * derived.
+   */
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) return;
+    const applied = appliedPointRef.current;
+    if (!applied) return;
+
+    const previous = previousSenderSampleRef.current;
+    previousSenderSampleRef.current = senderHealth.latest;
+
+    setCapacity((prev) =>
+      nextCapacity(prev, {
+        now: Date.now(),
+        health: senderHealth.health,
+        previous,
+        latest: senderHealth.latest,
+        askedPixelsPerSecond: applied.width * applied.height * applied.fps,
+        fps: applied.fps,
+      }),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
+
+  /*
+   * Tell the viewer what our encoder is doing.
+   *
+   * The counterpart to the quality feedback coming the other way, and it exists
+   * because the two ends knew completely different things. The sharer could see
+   * the operating point, the encoder's real output and what was limiting it;
+   * the viewer — the one actually watching the picture stop and start — could
+   * see a coloured bar. A bug report could only ever say "it looks choppy",
+   * which is exactly how far the last one got.
+   *
+   * On the diagnostics cadence rather than only on change, so `limitedBy` and
+   * the encoder name stay fresh. It rides the DataChannel, which is what that
+   * channel is for: no Durable Object request, no server, no cost.
+   */
+  useEffect(() => {
+    if (!webrtc.isScreenSharing) return;
+    const transport = transportRef.current;
+    const sessionId = sessionIdRef.current;
+    if (!transport || !sessionId) return;
+
+    void transport
+      .sendShareStatus(sessionId, {
+        fps: operatingPoint.fps,
+        width: operatingPoint.width,
+        height: operatingPoint.height,
+        bps: operatingPoint.videoBps,
+        ...(diagnostics.outbound?.qualityLimitationReason
+          ? { limitedBy: diagnostics.outbound.qualityLimitationReason }
+          : {}),
+        ...(diagnostics.outbound?.encoderImplementation
+          ? { encoder: diagnostics.outbound.encoderImplementation }
+          : {}),
+      })
+      .catch(() => {
+        /* best-effort presence traffic, exactly like the cursor */
+      });
+  }, [operatingPoint, diagnostics.outbound, webrtc.isScreenSharing]);
+
+  /*
+   * The peer's readout belongs to the share it described. With no remote share
+   * to watch, a stale one would render as fact.
+   */
+  useEffect(() => {
+    if (!isWatchingRemoteScreen) setPeerShareStatus(null);
+  }, [isWatchingRemoteScreen]);
 
   /**
    * Advance the ladder on every sender-health observation.
@@ -857,15 +1077,61 @@ export function SessionRoom() {
     });
   }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
 
-  // CPU pressure needs a different answer than bandwidth pressure, and the
-  // ladder deliberately refuses to act on it — say so rather than sitting on it.
+  /*
+   * CPU pressure needs a different answer than bandwidth pressure, and now it
+   * gets one.
+   *
+   * Two answers, in fact, and they are complementary. `encodeCapacity` has
+   * already begun taking pixels away — that runs on every poll and needs
+   * nothing from here. This effect handles the case pixels cannot fix: an
+   * encoder with no hardware path for the codec we chose, where a smaller
+   * picture only postpones the cliff. VP9 has no hardware encoder on Apple
+   * Silicon at all, and `preferVp9` asked for it unconditionally.
+   *
+   * Guarded on `stable` because this drives a renegotiation and the sharer may
+   * be the polite peer, whose offer is rolled back on a collision. That is
+   * self-correcting rather than tracked: the codec preference is sticky on the
+   * transceiver, so a lost race still leaves it set, and the next poll retries
+   * the offer. `downgradeScreenCodec` is one-way, so the retry cannot oscillate.
+   */
   useEffect(() => {
-    if (senderHealth.health !== 'cpu-bound') return;
+    if (!webrtc.isScreenSharing) return;
+    if (!shouldDowngradeCodec(senderHealth.latest, senderHealth.health)) {
+      if (senderHealth.health === 'cpu-bound') {
+        // Hardware encoder, or a browser that says nothing about it. The pixel
+        // bound is doing what it can; the rest is the machine.
+        setToast({
+          message: 'Encoder is CPU-limited — reducing picture size',
+          type: 'warning',
+        });
+      }
+      return;
+    }
+
+    const transport = transportRef.current;
+    const sessionId = sessionIdRef.current;
+    if (!transport || !sessionId) return;
+    if (webrtc.getSignalingState() !== 'stable') return;
+
+    if (!webrtc.downgradeScreenCodec()) return;
+
     setToast({
-      message: 'Encoder is CPU-limited — try a smaller share or close some tabs',
-      type: 'warning',
+      message: 'Switching to a codec this machine can encode — one moment',
+      type: 'info',
     });
-  }, [senderHealth.health]);
+
+    void (async () => {
+      try {
+        const offer = await webrtc.createOffer();
+        await transport.sendRenegotiationOffer(sessionId, offer);
+      } catch (err) {
+        // The preference is already on the transceiver; any later renegotiation
+        // from either side carries it. Nothing to undo.
+        logger.error('[Quality] codec downgrade renegotiation failed:', err);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
 
   /*
    * A link genuinely below the floor. Say so.
@@ -1169,7 +1435,7 @@ export function SessionRoom() {
   // editable-target guard already skips chat input; this disable flag is
   // for cases where a modal sits above the page.
   useKeyboardShortcuts({
-    enabled: stage === 'live' && !showCheatSheet && !screenShareRequest,
+    enabled: stage === 'live' && !showCheatSheet && !screenShareRequest && debugReport === null,
     onMuteToggle: () => toggleMute(webrtc.toggleAudio),
     onCameraToggle: () => toggleCamera(webrtc.toggleVideo),
     onScreenShareToggle: () => {
@@ -1182,6 +1448,7 @@ export function SessionRoom() {
     },
     onSidebarToggle: () => setIsSidebarOpen((o) => !o),
     onCheatSheet: () => setShowCheatSheet(true),
+    onDebugReport: () => void openDebugReport(),
   });
 
   useEffect(() => {
@@ -1299,6 +1566,12 @@ export function SessionRoom() {
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
       <KeyboardShortcutsModal isOpen={showCheatSheet} onClose={() => setShowCheatSheet(false)} />
+
+      <DebugReportModal
+        isOpen={debugReport !== null}
+        onClose={() => setDebugReport(null)}
+        report={debugReport ?? ''}
+      />
 
       {/* Watch Together URL prompt */}
       {showWatchPrompt && (
@@ -1622,6 +1895,7 @@ export function SessionRoom() {
               peerCursor={peerCursor}
               onLocalCursor={handleLocalCursor}
               onViewportChange={handleViewportChange}
+              onDebugReport={() => void openDebugReport()}
             />
             )}
           </div>
@@ -1644,6 +1918,9 @@ export function SessionRoom() {
               diagnostics={diagnostics}
               appliedPoint={webrtc.isScreenSharing ? operatingPoint : null}
               atBudgetFloor={atBudgetFloor}
+              inbound={isWatchingRemoteScreen ? qualityMonitor.inbound : null}
+              peerShare={isWatchingRemoteScreen ? peerShareStatus : null}
+              onDebugReport={() => void openDebugReport()}
               contentMode={contentMode}
               onContentModeChange={handleContentModeChange}
               isSharer={isLocalSharing}

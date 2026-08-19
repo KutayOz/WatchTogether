@@ -249,6 +249,17 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
     }
   }, []);
 
+  /**
+   * Give up on VP9 for this share, if we have not already.
+   *
+   * Returns true when the caller must renegotiate — the preference only affects
+   * the NEXT offer, so nothing changes until one is exchanged. Synchronous
+   * because there is nothing to await: it reorders a list and sets a flag.
+   */
+  const downgradeScreenCodec = useCallback(() => {
+    return webrtcService.downgradeScreenCodec();
+  }, []);
+
   const createOffer = useCallback(async () => {
     return webrtcService.createOffer();
   }, []);
@@ -340,6 +351,7 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
     updateScreenShareQuality,
     setRemoteScreenShareStreamId,
     createOffer,
+    downgradeScreenCodec,
     createIceRestartOffer,
     createAnswer,
     setRemoteDescription,

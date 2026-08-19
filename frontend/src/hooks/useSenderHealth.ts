@@ -54,6 +54,15 @@ export type SenderHealth =
    * Encoder cannot keep up. MUST NOT be answered by lowering the bitrate:
    * fewer bits do not buy CPU, they just make the picture worse for nothing.
    * The right answers are a smaller resolution or a cheaper codec.
+   *
+   * Both of those exist now, and neither is a bitrate. `encodeCapacity` bounds
+   * the PIXEL rate — which leaves the bitrate alone, so bits per pixel actually
+   * rises as the picture shrinks — and `shouldDowngradeCodec` below moves a
+   * software VP9 encode to H.264. This verdict used to reach a `return state`
+   * in every controller and nothing else at all, which is how a share that
+   * froze and jumped on the receiver could do it from the first second and
+   * never recover: the viewer's own report is read AFTER this branch, so a
+   * CPU-bound sender could not even hear the complaint.
    */
   | 'cpu-bound'
   /** Not sharing, or the browser does not publish enough to judge. */
@@ -97,6 +106,45 @@ export function classifySenderHealth(
     return 'self-limited';
   }
   return 'unknown';
+}
+
+/**
+ * Is this encoder running in software?
+ *
+ * `encoderImplementation` is a free-form browser string, which is why this is a
+ * match against what browsers actually publish rather than a lookup: Chrome
+ * reports 'libvpx' / 'libvpx-vp9' / 'libaom' / 'OpenH264' for its own encoders
+ * and 'ExternalEncoder' (plus platform names like 'VideoToolbox' and
+ * 'MediaFoundationVideoEncodeAccelerator') when the work is on silicon.
+ * Simulcast wraps the name — 'SimulcastEncoderAdapter (libvpx, libvpx)' — so
+ * this searches rather than compares.
+ *
+ * Unknown is NOT software. A codec downgrade costs the viewer a decoder
+ * teardown and a keyframe, and a browser that publishes nothing here (Firefox,
+ * Safari) should get the pixel bound instead, which costs nothing.
+ */
+export function isSoftwareEncoder(implementation: string | null): boolean {
+  if (!implementation) return false;
+  return /libvpx|libaom|openh264|ffmpeg|libx264/i.test(implementation);
+}
+
+/**
+ * Should this share give up on its codec?
+ *
+ * Only when both halves are true: the encoder is CPU-bound, and it is running
+ * in software. A hardware encoder that is CPU-bound is telling us something
+ * about the machine, not about the codec, and swapping codecs would spend a
+ * keyframe to learn nothing.
+ *
+ * Pure and exported for the same reason `classifySenderHealth` is — this is
+ * the part with the judgement in it, and the caller only does the plumbing.
+ */
+export function shouldDowngradeCodec(
+  stats: OutboundScreenStats | null,
+  health: SenderHealth,
+): boolean {
+  if (health !== 'cpu-bound') return false;
+  return isSoftwareEncoder(stats?.encoderImplementation ?? null);
 }
 
 export interface SenderHealthState {

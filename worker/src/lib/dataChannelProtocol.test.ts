@@ -36,6 +36,20 @@ describe("data channel decoding", () => {
             jitterMs: 18,
             rttMs: 140,
             fps: 22,
+            viewport: { width: 2560, height: 1440 },
+          },
+        },
+      },
+      {
+        t: "share",
+        d: {
+          status: {
+            fps: 24,
+            width: 1920,
+            height: 1080,
+            bps: 2_475_000,
+            limitedBy: "cpu",
+            encoder: "libvpx-vp9",
           },
         },
       },
@@ -157,6 +171,53 @@ describe("data channel decoding", () => {
       ).toBeNull();
     });
 
+    it("carries the viewer's viewport through", () => {
+      // It did not, for an entire release. The frontend declared its own
+      // QualityFeedback with a viewport field, sent it, and validateData —
+      // which rebuilds the frame field by field — dropped it on arrival. The
+      // sender therefore never learned how big the picture was being drawn, and
+      // the whole viewport-aware resolution feature was inert with nothing
+      // failing loudly enough to say so.
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({
+          t: "quality",
+          d: { feedback: { ...feedback, viewport: { width: 3024, height: 1964 } } },
+        }),
+      );
+      expect(decoded).toBeTruthy();
+      const carried = (decoded!.d as { feedback: { viewport?: unknown } }).feedback.viewport;
+      expect(carried).toEqual({ width: 3024, height: 1964 });
+    });
+
+    it("treats a malformed viewport as no viewport, not as a bad frame", () => {
+      // The consumer already has a conservative answer for "not sent" — it
+      // falls back to assuming 1080p — so a bad value takes the same path
+      // rather than throwing away a verdict that is otherwise fine.
+      for (const viewport of [
+        { width: 0, height: 1080 },
+        { width: 99_999, height: 1080 },
+        { width: "1920", height: 1080 },
+        null,
+        42,
+      ]) {
+        const decoded = decodeDataChannelMessage(
+          JSON.stringify({ t: "quality", d: { feedback: { ...feedback, viewport } } }),
+        );
+        expect(decoded).toBeTruthy();
+        expect((decoded!.d as { feedback: { viewport?: unknown } }).feedback.viewport)
+          .toBeUndefined();
+      }
+    });
+
+    it("accepts a quality frame from a peer that sends no viewport", () => {
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({ t: "quality", d: { feedback } }),
+      );
+      expect(decoded).toBeTruthy();
+      expect((decoded!.d as { feedback: { viewport?: unknown } }).feedback.viewport)
+        .toBeUndefined();
+    });
+
     it("drops unknown extra fields rather than passing them through", () => {
       const decoded = decodeDataChannelMessage(
         JSON.stringify({ t: "quality", d: { feedback: { ...feedback, evil: "payload" } } }),
@@ -174,6 +235,54 @@ describe("data channel decoding", () => {
     });
   });
 
+  describe("share", () => {
+    const status = { fps: 24, width: 1920, height: 1080, bps: 2_475_000 };
+
+    it("rejects an absurd frame rate", () => {
+      for (const fps of [0, 121, -24, null]) {
+        expect(
+          decodeDataChannelMessage(JSON.stringify({ t: "share", d: { status: { ...status, fps } } })),
+        ).toBeNull();
+      }
+    });
+
+    it("rejects a picture size nobody could mean", () => {
+      expect(
+        decodeDataChannelMessage(
+          JSON.stringify({ t: "share", d: { status: { ...status, width: 8 } } }),
+        ),
+      ).toBeNull();
+    });
+
+    it("rejects a negative bitrate", () => {
+      expect(
+        decodeDataChannelMessage(
+          JSON.stringify({ t: "share", d: { status: { ...status, bps: -1 } } }),
+        ),
+      ).toBeNull();
+    });
+
+    it("drops an unrecognised limitation rather than the whole frame", () => {
+      // The geometry is still worth having when one optional field is junk.
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({ t: "share", d: { status: { ...status, limitedBy: "vibes" } } }),
+      );
+      expect(decoded).toBeTruthy();
+      expect((decoded!.d as { status: { limitedBy?: unknown } }).status.limitedBy).toBeUndefined();
+    });
+
+    it("truncates an over-long encoder name rather than rejecting it", () => {
+      // It is a browser string that ends up rendered. A long one is a display
+      // problem, not a protocol violation.
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({ t: "share", d: { status: { ...status, encoder: "x".repeat(200) } } }),
+      );
+      expect(decoded).toBeTruthy();
+      const encoder = (decoded!.d as { status: { encoder?: string } }).status.encoder;
+      expect(encoder).toHaveLength(32);
+    });
+  });
+
   it("rejects an oversized frame before parsing it", () => {
     const huge = JSON.stringify({ t: "typing", d: {}, pad: "x".repeat(MAX_DATA_FRAME_BYTES) });
     expect(huge.length).toBeGreaterThan(MAX_DATA_FRAME_BYTES);
@@ -184,7 +293,7 @@ describe("data channel decoding", () => {
 describe("channel routing", () => {
   it("sends only cursors down the unreliable channel", () => {
     expect(channelFor("cursor")).toBe("fast");
-    for (const type of ["typing", "reaction", "videoSync", "quality"] as const) {
+    for (const type of ["typing", "reaction", "videoSync", "quality", "share"] as const) {
       expect(channelFor(type)).toBe("control");
     }
   });

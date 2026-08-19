@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifySenderHealth } from './useSenderHealth';
+import { classifySenderHealth, isSoftwareEncoder, shouldDowngradeCodec } from './useSenderHealth';
 import type { OutboundScreenStats } from '../types';
 
 /**
@@ -75,5 +75,57 @@ describe('classifySenderHealth', () => {
     expect(classifySenderHealth(stats({ targetBitrate: null }), 1_000_000)).toBe('unknown');
     expect(classifySenderHealth(null, 1_000_000)).toBe('unknown');
     expect(classifySenderHealth(stats(), 0)).toBe('unknown');
+  });
+});
+
+/**
+ * The second of the two answers this file's own SenderHealth comment names for
+ * a CPU-bound encoder — "a smaller resolution or a cheaper codec". The first
+ * lives in encodeCapacity; this decides whether the second is warranted.
+ */
+describe('isSoftwareEncoder', () => {
+  it('recognises the names Chrome uses for its own encoders', () => {
+    expect(isSoftwareEncoder('libvpx')).toBe(true);
+    expect(isSoftwareEncoder('libvpx-vp9')).toBe(true);
+    expect(isSoftwareEncoder('libaom')).toBe(true);
+    expect(isSoftwareEncoder('OpenH264')).toBe(true);
+  });
+
+  it('searches rather than compares, because simulcast wraps the name', () => {
+    expect(isSoftwareEncoder('SimulcastEncoderAdapter (libvpx, libvpx)')).toBe(true);
+  });
+
+  it('leaves hardware alone', () => {
+    expect(isSoftwareEncoder('ExternalEncoder')).toBe(false);
+    expect(isSoftwareEncoder('VideoToolbox')).toBe(false);
+    expect(isSoftwareEncoder('MediaFoundationVideoEncodeAccelerator')).toBe(false);
+  });
+
+  it('treats silence as hardware, not as software', () => {
+    // A codec downgrade costs the viewer a decoder teardown and a keyframe.
+    // Firefox and Safari publish nothing here and should get the pixel bound,
+    // which costs nothing.
+    expect(isSoftwareEncoder(null)).toBe(false);
+    expect(isSoftwareEncoder('')).toBe(false);
+  });
+});
+
+describe('shouldDowngradeCodec', () => {
+  it('fires only when the encoder is BOTH CPU-bound and in software', () => {
+    const software = stats({ encoderImplementation: 'libvpx-vp9' });
+    expect(shouldDowngradeCodec(software, 'cpu-bound')).toBe(true);
+    expect(shouldDowngradeCodec(software, 'under-served')).toBe(false);
+    expect(shouldDowngradeCodec(software, 'satisfied')).toBe(false);
+  });
+
+  it('leaves a hardware encoder on the codec it was given', () => {
+    // A hardware encoder that is CPU-bound is telling us about the machine, not
+    // about the codec, and swapping would spend a keyframe to learn nothing.
+    expect(shouldDowngradeCodec(stats({ encoderImplementation: 'ExternalEncoder' }), 'cpu-bound'))
+      .toBe(false);
+  });
+
+  it('has nothing to say without a sample', () => {
+    expect(shouldDowngradeCodec(null, 'cpu-bound')).toBe(false);
   });
 });

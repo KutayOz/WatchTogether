@@ -6,6 +6,8 @@ interface ShortcutHandlers {
   onScreenShareToggle?: () => void;
   onSidebarToggle?: () => void;
   onCheatSheet?: () => void;
+  /** Build and show the debug report. */
+  onDebugReport?: () => void;
   /** Whole hook can be turned off (e.g. while a modal is open and owns input). */
   enabled?: boolean;
 }
@@ -17,7 +19,12 @@ interface ShortcutHandlers {
  *   V  → camera toggle            (Zoom / Meet)
  *   S  → screen share toggle      (custom, intuitive)
  *   C  → chat / sidebar toggle    (Discord / Slack)
+ *   D  → debug report             (custom)
  *   ?  → cheat sheet modal        (Linear / Notion / GitHub)
+ *
+ * D is a shortcut and not only a button because the person who needs it most is
+ * the one watching someone else's share, and that person cannot open the
+ * quality menu at all — it is gated on `isSharer || !isScreenSharing`.
  *
  * Critical guard: shortcuts MUST NOT fire while the user is typing in an
  * input. ChatPanel + any future text input is full of `m`, `v`, etc. The
@@ -42,6 +49,12 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers): void {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
       switch (e.key.toLowerCase()) {
+        case 'd':
+          if (handlers.onDebugReport) {
+            e.preventDefault();
+            handlers.onDebugReport();
+          }
+          break;
         case 'm':
           if (handlers.onMuteToggle) {
             e.preventDefault();

@@ -71,6 +71,28 @@ const CAMERA_MAX_FRAMERATE_WHILE_SHARING = 8;
 const MIC_MAX_BITRATE = 24_000;
 
 /**
+ * Which codec the screen share is asking for.
+ *
+ * A field rather than a parameter because it has to survive the renegotiation
+ * that applies it: `setCodecPreferences` affects the NEXT offer, so the value
+ * has to still be there when that offer is built, and it has to stay there for
+ * any later renegotiation the peer starts.
+ */
+export type ScreenCodec = 'vp9' | 'h264';
+
+/**
+ * Shortest wait between two capture reconfigurations.
+ *
+ * Longer than one probe/revert cycle in `nextBudget` (PROBE_INTERVAL_MS of 9 s
+ * plus PROBE_VERDICT_WINDOW_MS of 12 s), so a budget that probes upward past a
+ * rung boundary and then reverts cannot restart the capturer on the way out and
+ * again on the way back. The cost of the guard is that a genuine raise can wait
+ * up to half a minute; a smaller picture that keeps running beats a bigger one
+ * that stutters every nine seconds.
+ */
+const CAPTURE_RECONFIG_MIN_MS = 30_000;
+
+/**
  * Capture constraints for an operating point.
  *
  * Shared by the initial getDisplayMedia and every later re-apply so the two can
@@ -229,6 +251,32 @@ class WebRTCService {
   // 'configurationchange' handler can re-assert geometry after a surface swap
   // without the caller having to remember what it asked for.
   private currentPoint: OperatingPoint | null = null;
+
+  /**
+   * The codec this share is asking for, and whether we have already given up
+   * on the first choice.
+   *
+   * One-way, deliberately. An encoder that could not sustain VP9 a minute ago
+   * might look fine for three polls after the picture shrank, and a codec that
+   * oscillates is worse than a suboptimal one: every switch costs the viewer a
+   * decoder teardown and a keyframe.
+   */
+  private screenCodec: ScreenCodec = 'vp9';
+
+  /**
+   * What the capturer is actually producing, as opposed to what we last ASKED
+   * the encoder for.
+   *
+   * `currentPoint` conflated the two, which made "has the geometry changed?"
+   * the wrong question: a picture that shrank and then grew back to a size we
+   * had never stopped capturing still counted as a change, and every
+   * applyConstraints on a live getDisplayMedia track restarts Chrome's capture
+   * pipeline — a keyframe and a decoder re-init for the viewer, for nothing.
+   */
+  private capturedPoint: OperatingPoint | null = null;
+
+  /** When the capturer was last reconfigured. Drives the hysteresis below. */
+  private lastCaptureReconfigAt = 0;
   private handlers: WebRTCEventHandlers = {};
   // The config we were initialized with. Kept so the ICE diagnostic can report
   // which servers were OFFERED, which is a different question from which
@@ -475,6 +523,10 @@ class WebRTCService {
       } as DisplayMediaStreamOptions;
 
       const stream = await navigator.mediaDevices.getDisplayMedia(constraints);
+      // What we asked the capturer for is what it is now producing. Left at 0
+      // deliberately: the first genuine raise after a capture is always allowed.
+      this.capturedPoint = point;
+      this.lastCaptureReconfigAt = 0;
 
       // Mark video tracks as screen share using contentHint (W3C standard)
       // This allows the receiving peer to identify screen share tracks reliably
@@ -501,6 +553,10 @@ class WebRTCService {
           void track.applyConstraints(displayConstraintsFor(current)).catch(() => {
             /* best effort — the encoder ceiling still holds the line */
           });
+          // The new surface is being captured at `current`, whatever the old
+          // one was. Without this the next raise would be measured against a
+          // size that no longer exists.
+          this.capturedPoint = current;
           if ('contentHint' in track) track.contentHint = 'motion';
         });
       }
@@ -643,7 +699,7 @@ class WebRTCService {
   }
 
   /**
-   * Ask for VP9 on the screen share.
+   * Choose the screen share's video codec.
    *
    * The measured session encoded with `libvpx` — VP8 — and the picture was the
    * complaint. VP9 carries roughly the same quality in 30-50% fewer bits, and
@@ -660,10 +716,21 @@ class WebRTCService {
    *
    * The trade is CPU: VP9 encode costs more than VP8. The measured session had
    * `qualityLimitationDurations.cpu` at 0, so there was headroom, but that was
-   * headroom at 318x178. If this flips the limitation from 'bandwidth' to
-   * 'cpu', this is the change to revert.
+   * headroom at 318x178. The original note here said "if this flips the
+   * limitation from 'bandwidth' to 'cpu', this is the change to revert" — and
+   * it did, on a machine with no hardware VP9 encoder at all. So the revert is
+   * now something the session can perform on itself: see downgradeScreenCodec.
+   *
+   * H.264 is the fallback rather than VP8 because it is the one codec with
+   * hardware encode essentially everywhere, which is the entire point of
+   * falling back. It costs roughly 30-50% more bits for the same quality; a
+   * slightly softer picture that runs at the frame rate it promised beats a
+   * sharp one that stops and starts.
    */
-  private preferVp9(sender: RTCRtpSender): void {
+  private applyCodecPreference(
+    sender: RTCRtpSender,
+    codec: ScreenCodec = this.screenCodec,
+  ): void {
     if (!this.peerConnection) return;
 
     const transceiver = this.peerConnection
@@ -688,37 +755,50 @@ class WebRTCService {
      */
     const wantsAv1 = readSetting('wt:codec') === 'av1';
 
+    // The opt-in still wins over everything: someone who set it is measuring.
     const rank = (mime: string): number => {
       if (wantsAv1 && /\/av01?$/i.test(mime)) return 0;
-      if (/\/vp9$/i.test(mime)) return 1;
-      return 2;
+      const wanted = codec === 'h264' ? /\/h264$/i : /\/vp9$/i;
+      return wanted.test(mime) ? 1 : 2;
     };
 
     /**
-     * VP9 profile 0 ahead of the rest.
+     * The right variant of whichever codec we picked, ahead of the rest.
      *
-     * The old filter promoted every VP9 entry while preserving the browser's
-     * own relative order, so a profile-2 entry (10-bit 4:2:0) listed first was
-     * what actually got offered — more CPU and more bits to carry content that
-     * is 8-bit anyway. A missing sdpFmtpLine is treated as profile 0, which is
-     * what browsers that omit it mean.
+     * VP9: profile 0. The old filter promoted every VP9 entry while preserving
+     * the browser's own relative order, so a profile-2 entry (10-bit 4:2:0)
+     * listed first was what actually got offered — more CPU and more bits to
+     * carry content that is 8-bit anyway. A missing sdpFmtpLine is treated as
+     * profile 0, which is what browsers that omit it mean.
+     *
+     * H.264: packetization-mode=1. Mode 0 cannot fragment a NAL unit across
+     * RTP packets, so every large frame has to fit an MTU — exactly the frames
+     * a screen share produces most of. Constrained baseline (42e01f) alongside
+     * it, for the same reason VP9 profile 0 is preferred: it is the profile
+     * every decoder has, and the content is 8-bit 4:2:0 regardless.
      */
-    const isProfile0 = (c: RTCRtpCodec): boolean => {
+    const isPreferredProfile = (c: RTCRtpCodec): boolean => {
       const fmtp = c.sdpFmtpLine;
+      if (codec === 'h264' && /\/h264$/i.test(c.mimeType)) {
+        if (!fmtp) return false;
+        return /packetization-mode=1/.test(fmtp) && /profile-level-id=42e01f/i.test(fmtp);
+      }
       if (!fmtp) return true;
       const match = /profile-id=(\d+)/.exec(fmtp);
       return !match || match[1] === '0';
     };
 
-    // Stable sort by rank, then profile — everything that is neither AV1 nor
-    // VP9 (RTX, RED, FEC, H.264) keeps its original relative order, so a
-    // browser without the preferred codecs is left exactly as it was.
+    // Stable sort by rank, then profile — everything we are not promoting (RTX,
+    // RED, FEC, and whichever of VP9/H.264 was not chosen) keeps its original
+    // relative order, so a browser without the preferred codec is left exactly
+    // as it was.
     const reordered = codecs
       .map((codec, index) => ({ codec, index }))
       .sort((a, b) => {
         const byRank = rank(a.codec.mimeType) - rank(b.codec.mimeType);
         if (byRank !== 0) return byRank;
-        const byProfile = Number(isProfile0(b.codec)) - Number(isProfile0(a.codec));
+        const byProfile =
+          Number(isPreferredProfile(b.codec)) - Number(isPreferredProfile(a.codec));
         if (byProfile !== 0) return byProfile;
         return a.index - b.index;
       })
@@ -781,6 +861,44 @@ class WebRTCService {
     params.degradationPreference = 'maintain-framerate';
   }
 
+  /**
+   * Give up on VP9 for this share and ask for H.264 instead.
+   *
+   * The second of the two answers `SenderHealth` names for a CPU-bound encoder
+   * — "a smaller resolution or a cheaper codec". The first one lives in
+   * `encodeCapacity`; this is the one for a machine that has no hardware VP9
+   * encoder at all, where shrinking the picture only postpones the problem.
+   *
+   * Returns true when the caller should renegotiate. It does NOT renegotiate
+   * itself: this service does not own the signalling socket, and every other
+   * renegotiation in the app is driven from SessionRoom through the same
+   * createOffer/sendRenegotiationOffer pair.
+   *
+   * No screen permission prompt. Only a fresh getDisplayMedia() re-prompts, and
+   * this path never calls one — the track, the sender, the SSRC and the stream
+   * id are all untouched, so the peer's screen-vs-camera routing (which keys on
+   * the signalled stream id) does not even notice.
+   *
+   * The preference is sticky on the transceiver, which is what makes this safe
+   * against offer glare: if our offer loses a collision and is rolled back, the
+   * preference survives and the next renegotiation from either side carries it.
+   */
+  downgradeScreenCodec(): boolean {
+    if (this.screenCodec === 'h264') return false;
+    const sender = this.resolveScreenVideoSender();
+    if (!sender) return false;
+
+    this.screenCodec = 'h264';
+    this.applyCodecPreference(sender, 'h264');
+    logger.warn('[WebRTC] screen share falling back to H.264 — VP9 encode could not keep up');
+    return true;
+  }
+
+  /** Which codec the screen share is currently asking for. For diagnostics. */
+  getScreenCodec(): ScreenCodec {
+    return this.screenCodec;
+  }
+
   // Add screen share tracks to peer connection (after permission granted)
   async addScreenShareTracks(stream: MediaStream, point: OperatingPoint): Promise<void> {
     try {
@@ -811,7 +929,7 @@ class WebRTCService {
                 this.applyVideoEncoding(params, point);
                 // Before the renegotiation this addTrack triggers, so the codec
                 // order lands in the offer rather than needing a second one.
-                this.preferVp9(sender);
+                this.applyCodecPreference(sender);
               } else if (track.kind === 'audio') {
                 if (point.audioBps > 0) {
                   params.encodings[0].maxBitrate = point.audioBps;
@@ -867,7 +985,9 @@ class WebRTCService {
   async updateScreenShareQuality(point: OperatingPoint): Promise<boolean> {
     if (!this.peerConnection || !this.screenStream) return false;
 
-    const previous = this.currentPoint;
+    // What we are asking for. The capturer's own geometry is tracked separately
+    // in `capturedPoint`, because the two answer different questions and
+    // conflating them is what made every rung change restart the capture.
     this.currentPoint = point;
 
     // Shared with getOutboundScreenStats: one resolver, so a stale reference
@@ -898,19 +1018,40 @@ class WebRTCService {
     // the entire constraint set — a frameRate-only call after a geometry call
     // silently clears the geometry.
     //
-    // Only when the geometry actually moved. Re-running applyConstraints on an
-    // unchanged size can make the capturer renegotiate its pipeline for nothing,
-    // and the bitrate above changes far more often than the resolution does.
-    const geometryChanged =
-      !previous ||
-      previous.width !== point.width ||
-      previous.height !== point.height ||
-      previous.fps !== point.fps;
+    // Only when the capturer genuinely has to GROW — measured against what it
+    // is producing, not against what we last asked for.
+    //
+    // Downward moves need no capturer change at all. The encoder's own scaler
+    // handles them, which is exactly why applyVideoEncoding leaves
+    // scaleResolutionDownBy unpinned and asks for 'maintain-framerate'. And
+    // every applyConstraints on a live getDisplayMedia track restarts Chrome's
+    // capture pipeline: the viewer pays a keyframe and a decoder re-init for a
+    // change that was going to happen inside the encoder anyway.
+    //
+    // A frame-rate change still counts either way. It comes from the content
+    // mode, which is a deliberate human action rather than the controller
+    // breathing, and the capturer is the only thing that can actually deliver
+    // more frames.
+    const captured = this.capturedPoint;
+    const mustGrow =
+      !captured ||
+      point.width > captured.width ||
+      point.height > captured.height ||
+      point.fps !== captured.fps;
+
+    // Hysteresis, longer than one probe/revert cycle (PROBE_INTERVAL_MS plus
+    // PROBE_VERDICT_WINDOW_MS), so a probe that overshoots and reverts cannot
+    // restart the capturer at all. The budget wanders by design; the capturer
+    // must not follow it.
+    const sinceReconfig = Date.now() - this.lastCaptureReconfigAt;
+    const settled = this.lastCaptureReconfigAt === 0 || sinceReconfig >= CAPTURE_RECONFIG_MIN_MS;
 
     const videoTrack = this.screenStream.getVideoTracks()[0];
-    if (videoTrack && geometryChanged) {
+    if (videoTrack && mustGrow && settled) {
       try {
         await videoTrack.applyConstraints(displayConstraintsFor(point));
+        this.capturedPoint = point;
+        this.lastCaptureReconfigAt = Date.now();
       } catch (err) {
         logger.debug('[WebRTC] applyConstraints(geometry) not supported here:', err);
       }
@@ -968,6 +1109,12 @@ class WebRTCService {
         this.screenStreamId = null;
         this.screenVideoSender = null;
         this.screenAudioSender = null;
+        this.capturedPoint = null;
+        this.lastCaptureReconfigAt = 0;
+        // A new share is a new encode: a 720p window may run in VP9 on the very
+        // machine where a 4K one could not. Starting from the better codec each
+        // time is what keeps the downgrade a response to evidence.
+        this.screenCodec = 'vp9';
 
         // Nothing left to yield to — give the camera its full ceiling back.
         await this.applyCameraEncoding(false);
@@ -1534,6 +1681,12 @@ class WebRTCService {
     this.screenAudioSender = null;
     this.cameraVideoSender = null;
     this.micAudioSender = null;
+    // The codec fallback and the captured geometry are facts about one share on
+    // one connection. A new peer connection renegotiates from scratch, so
+    // carrying them across would apply a verdict from a session that is over.
+    this.screenCodec = 'vp9';
+    this.capturedPoint = null;
+    this.lastCaptureReconfigAt = 0;
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];

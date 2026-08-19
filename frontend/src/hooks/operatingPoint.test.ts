@@ -5,6 +5,7 @@ import {
   PROBE_VERDICT_WINDOW_MS,
   TARGET_BPP,
   MAX_USEFUL_BPP,
+  PROBE_CEILING_BPP,
   budgetCeilingBps,
   chooseOperatingPoint,
   resolutionBox,
@@ -177,6 +178,7 @@ describe('nextBudget', () => {
       mode: 'film',
       ceiling: 'auto',
       viewport: null,
+      capacityPixelsPerSecond: null,
       ...over,
     };
   }
@@ -199,12 +201,35 @@ describe('nextBudget', () => {
     expect(state.bps).toBe(1_020_000);
   });
 
-  it('climbs when the link proves it has more', () => {
+  it('climbs when the link proves it has more, but only as far as it is worth', () => {
+    // 4 Mbps of measured capacity times HEADROOM_SELECT would be 3.4 Mbps, and
+    // that is what this used to become. Raising now stops at PROBE_CEILING_BPP:
+    // 0.05 x 1920 x 1080 x 24 = 2.488 Mbps of video, quantised down, plus the
+    // 96 kbps audio tier. The link having more is not by itself a reason to
+    // spend more on a picture that is already past the point of visible return.
     const state = nextBudget(
       initialBudgetState(1_000_000, 0),
       sig({ now: 3000, estimateBps: 4_000_000 }),
     );
-    expect(state.bps).toBe(3_400_000);
+    expect(state.bps).toBe(2_571_000);
+    expect(state.bps).toBeLessThan(3_400_000);
+  });
+
+  it('stops the climb at 1.4x TARGET_BPP rather than 3x', () => {
+    // The failure this guards: `budgetCeilingBps` was built from MAX_USEFUL_BPP
+    // and both upward branches clamped to it, so within about thirty seconds
+    // every share on a link with headroom settled at 0.100 bpp — three times
+    // what TARGET_BPP calls good — and asked a software encoder for a bitrate
+    // that could put it over its cliff. MAX_USEFUL_BPP's own comment says
+    // "Nothing is ever raised TO it"; this is the test that makes that true.
+    let state = initialBudgetState(minBudgetBps(24), 0);
+    for (let i = 1; i <= 40; i++) {
+      state = nextBudget(state, sig({ now: i * PROBE_INTERVAL_MS * 2, health: 'satisfied' }));
+    }
+    const point = chooseOperatingPoint(state.bps, 'film');
+    expect(point.bpp).toBeGreaterThan(TARGET_BPP);
+    expect(point.bpp).toBeLessThanOrEqual(PROBE_CEILING_BPP);
+    expect(point.bpp).toBeLessThan(MAX_USEFUL_BPP);
   });
 
   it('holds steady when the browser publishes no estimate', () => {
@@ -421,5 +446,64 @@ describe('budgetCeilingBps and the receiver', () => {
     const large = budgetCeilingBps('auto', 24, { width: 3840, height: 2160 });
     expect(small).toBeLessThan(large);
     expect(large).toBe(AUTO_MAX_BITRATE + 96_000);
+  });
+});
+
+describe('chooseOperatingPoint and the encoder it has to run on', () => {
+  it('is unchanged when the machine has no opinion about itself', () => {
+    // Every existing caller passed nothing here, and null has to mean exactly
+    // what it meant before this bound existed.
+    const withNull = chooseOperatingPoint(2_571_000, 'film', 'auto', null, null);
+    const without = chooseOperatingPoint(2_571_000, 'film', 'auto', null);
+    expect(withNull).toEqual(without);
+  });
+
+  it('will not ask for more pixels per second than the encoder has shown it can do', () => {
+    // 1080p24 is 49.8 Mpx/s. A machine that has proven 30 gets 1280x720, which
+    // is 22.1 — the largest rung that fits, not the closest.
+    const point = chooseOperatingPoint(2_571_000, 'film', 'auto', null, 30_000_000);
+    expect(point.width * point.height * point.fps).toBeLessThanOrEqual(30_000_000);
+    expect(point.width).toBe(1280);
+  });
+
+  it('takes pixels rather than bits, so the smaller picture looks sharper', () => {
+    // The reason this is a pixel bound and not a bitrate one. `SenderHealth`
+    // is explicit that a CPU limit "MUST NOT be answered by lowering the
+    // bitrate: fewer bits do not buy CPU". Fewer pixels do — and the bits stay
+    // where the budget put them, so bits-per-pixel goes UP.
+    //
+    // The bitrate is untouched HERE because the budget, not MAX_USEFUL_BPP, is
+    // still the binding constraint at this box. A much deeper cut would lower
+    // it too, and correctly so: that is `usefulVideoBps` declining to spend
+    // bits a small picture has nowhere to put, which is a different rule.
+    const free = chooseOperatingPoint(2_571_000, 'film');
+    const bound = chooseOperatingPoint(2_571_000, 'film', 'auto', null, 30_000_000);
+    expect(bound.videoBps).toBe(free.videoBps);
+    expect(bound.bpp).toBeGreaterThan(free.bpp);
+  });
+
+  it('trades resolution for frame rate under one bound', () => {
+    // The same machine asked for 60 fps content gets a much smaller picture,
+    // which is the trade the content mode is already making elsewhere.
+    const film = chooseOperatingPoint(4_000_000, 'film', 'auto', null, 30_000_000);
+    const games = chooseOperatingPoint(4_000_000, 'games', 'auto', null, 30_000_000);
+    expect(games.width).toBeLessThan(film.width);
+  });
+
+  it('keeps the floor even when the bound is below every rung', () => {
+    // Unwatchable is worse than wasteful — the precedence usefulVideoBps
+    // already settled for the viewport bound applies here too.
+    const point = chooseOperatingPoint(2_571_000, 'film', 'auto', null, 1_000);
+    expect(point.width).toBe(640);
+    expect(point.height).toBe(360);
+  });
+
+  it('stops the budget climbing toward a picture the encoder will not run', () => {
+    // Without this the budget burns every probe cycle learning nothing: the
+    // clamp would catch it in the end, but the ceiling has to see every bound
+    // the chooser sees. Same argument the viewport term already carries.
+    const free = budgetCeilingBps('auto', 24, null, null);
+    const bound = budgetCeilingBps('auto', 24, null, 30_000_000);
+    expect(bound).toBeLessThan(free);
   });
 });
