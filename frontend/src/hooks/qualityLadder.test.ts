@@ -370,3 +370,31 @@ describe('currentViewerViewport', () => {
     expect(currentViewerViewport(report, 1_000)).toBeNull();
   });
 });
+
+describe('nextLadderState and a still screen', () => {
+  it('does not walk the user down a preset because nobody moved the window', () => {
+    // A ladder step is PERSISTENT — it is written back as the user's quality —
+    // and `viewerLevel === 'critical'` reaches the step-down. A viewer watching
+    // a motionless capture reports critical indefinitely, so without the
+    // 'source-idle' gate a paused video was enough to demote someone from
+    // 'high' to the floor and keep them there for every future session.
+    const start = initialLadderState('high');
+    const held = run(start, { senderHealth: 'source-idle', viewerLevel: 'critical' }, 20);
+    expect(held.applied).toBe(start.applied);
+  });
+
+  it('proves the same report without the verdict does step down', () => {
+    const start = initialLadderState('high');
+    const stepped = run(start, { viewerLevel: 'critical' }, 20);
+    expect(stepped.applied).not.toBe(start.applied);
+  });
+
+  it('does not accumulate evidence to probe upward on the quiet', () => {
+    // Holding in both directions, same as the budget: a screen producing no
+    // frames says nothing about whether a bigger picture would survive.
+    const start = initialLadderState('auto');
+    const held = run(start, { senderHealth: 'source-idle' }, 20);
+    expect(held.consecutiveGood).toBe(0);
+    expect(held.probing).toBe(false);
+  });
+});

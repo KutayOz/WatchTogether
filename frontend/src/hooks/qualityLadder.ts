@@ -193,6 +193,19 @@ export function nextLadderState(state: LadderState, sig: LadderSignals): LadderS
     return { ...state, consecutiveGood: 0 };
   }
 
+  // Nor is a still screen. The frames are not being made — see 'source-idle' in
+  // useSenderHealth — so nothing the ladder can reach is the cause and nothing
+  // it can do is the cure.
+  //
+  // Holding matters more here than in the budget, because a ladder step is
+  // PERSISTENT: `sig.viewerLevel === 'critical'` reaches the step-down below,
+  // and a viewer watching a motionless capture reports critical indefinitely.
+  // That is a preset walked down and written to the user's saved quality for
+  // the sole reason that nobody moved the window they were sharing.
+  if (sig.senderHealth === 'source-idle') {
+    return { ...state, consecutiveGood: 0 };
+  }
+
   const sinceChange = sig.now - state.lastAutoChangeAt;
 
   // Did an upward probe just fail? Judged inside a short window after the

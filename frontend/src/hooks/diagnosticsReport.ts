@@ -282,7 +282,11 @@ function nowSection(last: DiagnosticsSnapshot | undefined): string[] {
     const p = last.peerShare;
     lines.push(
       `their share ${geometry(p.width, p.height, p.fps)} · ${mbps(p.bps)} · ` +
-        `${p.encoder ?? 'unknown encoder'} · limited by ${p.limitedBy ?? 'unknown'}`,
+        `${p.encoder ?? 'unknown encoder'} · limited by ${p.limitedBy ?? 'unknown'}` +
+        // Beside the ask, because the gap between the two IS the diagnosis
+        // whenever a viewer reports freezing: frames that were never made
+        // cannot have been lost on the way.
+        (p.sentFps === undefined ? '' : ` · actually sending ${Math.round(p.sentFps)} fps`),
     );
   }
   return lines;

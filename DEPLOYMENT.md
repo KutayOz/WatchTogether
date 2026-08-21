@@ -229,6 +229,36 @@ is no sink, and adding one would be a different decision.
 - **Background blur is verified only as far as the CSP.** WebAssembly compiles
   under the live policy and both MediaPipe origins load; that it segments a
   real camera feed correctly in production is untested.
+- **A still screen was read as a failing link, and that is what the reported
+  freeze-then-jump actually was.** The first two-machine capture through the
+  new debug report (`D` in session) settled it, and it ruled out both standing
+  suspects: `p2p/udp · 32 ms rtt · 4.7 Mbps`, and not one `cpu` in sixty
+  samples of `qualityLimitationReason`. The tell was elsewhere — long runs of
+  `asked 640x360@30 / sending 1280x678@1 / limit none`. `getDisplayMedia` is
+  change-driven, so a paused video produces about one frame a second; a picture
+  at full size and a thirtieth of the frames is not something bandwidth
+  pressure can cause under `maintain-framerate`, which spends resolution first.
+
+  From there both shortage inputs lied at once. The viewer scored the arriving
+  1 fps against the sender's ask of 30 — `calculateQualityScore` takes a
+  MINIMUM, so 3.9 was the whole verdict — and reported `critical` every 9 s
+  forever, since nothing the sender can do makes a paused video move. The
+  sender read that as `viewerUnhappy`, and `nextBudget`'s multiplicative branch
+  walked 1.9 Mbps to 250 kbps in thirteen polls; the ratio between consecutive
+  `updateScreenShareQuality` logs is `BACKOFF_FACTOR` to three decimals. The
+  freeze users reported was the *recovery*: the video resumed against a budget
+  sized for a still image, with the capturer still at the 1280x678 it had grown
+  to, because reconfiguration was grow-only.
+
+  What guards it now: a `'source-idle'` verdict that holds the budget and the
+  ladder in BOTH directions and is classified before any reading a link could
+  be blamed for (`useSenderHealth.ts`, and it needs the picture to still be at
+  full size, so a genuine shortage is untouched); `ShareStatus.sentFps` on the
+  wire so the receiver scores what ARRIVED against what was SENT rather than
+  against an ask it cannot see; and `CAPTURE_SHRINK_RATIO`, which lets the
+  capturer follow the ask down once it is two rungs away. Not yet watched on a
+  real link — the same caveat as everything above it.
+
 - **Quality adaptation has now been watched on a real link, and it failed.** A
   session between a 200 Mbps uplink and a 30 Mbps 5G phone, relayed over
   TURN/TCP at 231 ms, sent `344x182 @ 1 fps · 0.03 Mbps`. Three defects

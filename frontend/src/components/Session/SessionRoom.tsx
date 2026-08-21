@@ -739,7 +739,14 @@ export function SessionRoom() {
     isWatchingRemoteScreen ? handleQualityFeedback : undefined,
     // Only while watching a share: the sharer's frame rate says nothing about
     // a camera-only call, and the default is right for that.
-    isWatchingRemoteScreen ? peerShareStatus?.fps : undefined,
+    //
+    // What it is SENDING in preference to what it is asking for. Those differ
+    // by a factor of thirty whenever the shared window is still, and judging
+    // arriving frames against frames that were never made is what turned a
+    // paused video into a 'critical' report and a collapsing budget.
+    isWatchingRemoteScreen
+      ? (peerShareStatus?.sentFps ?? peerShareStatus?.fps)
+      : undefined,
   );
 
   /*
@@ -880,7 +887,23 @@ export function SessionRoom() {
   // Sender health is the control input for BOTH the budget and the ladder.
   // Judged against the ceiling we actually set, so "is it getting its ask" is a
   // real question rather than a restatement of what we chose to send.
-  const senderHealth = useSenderHealth(webrtc.isScreenSharing, operatingPoint.videoBps);
+  //
+  // The geometry goes in beside the bitrate so `source-idle` can be told apart
+  // from a shortage: a frame rate far under the ask, at a picture that is still
+  // full size, is a capture with nothing to capture rather than a link with
+  // nothing to spare.
+  const askedGeometry = useMemo(
+    () =>
+      webrtc.isScreenSharing
+        ? { area: operatingPoint.width * operatingPoint.height, fps: operatingPoint.fps }
+        : null,
+    [webrtc.isScreenSharing, operatingPoint.width, operatingPoint.height, operatingPoint.fps],
+  );
+  const senderHealth = useSenderHealth(
+    webrtc.isScreenSharing,
+    operatingPoint.videoBps,
+    askedGeometry,
+  );
 
   /*
    * Advance the budget on every sender-health observation.
@@ -1029,6 +1052,13 @@ export function SessionRoom() {
         width: operatingPoint.width,
         height: operatingPoint.height,
         bps: operatingPoint.videoBps,
+        // What is actually leaving, beside what was asked for. This is the
+        // receiver's yardstick — see ShareStatus.sentFps — so it is measured,
+        // never inferred: a browser that does not publish it sends nothing and
+        // the far end keeps using the ask.
+        ...(typeof diagnostics.outbound?.framesPerSecond === 'number'
+          ? { sentFps: diagnostics.outbound.framesPerSecond }
+          : {}),
         ...(diagnostics.outbound?.qualityLimitationReason
           ? { limitedBy: diagnostics.outbound.qualityLimitationReason }
           : {}),
