@@ -133,6 +133,23 @@ export interface QualityFeedback {
 export interface ShareStatus {
   /** Frame rate the sender is asking its encoder for. */
   fps: number;
+  /**
+   * Frame rate the sender is actually PUTTING ON THE WIRE, if it can measure
+   * one. The receiver's yardstick, and the reason it is on the wire at all.
+   *
+   * A receiver cannot tell a frame that was lost from a frame that was never
+   * sent, and `getDisplayMedia` never sends a great many of them: capture is
+   * change-driven, so a paused video or a still document produces about one
+   * frame a second. Scored against `fps` — the ASK, which is the only yardstick
+   * a receiver had — that arrives as 3 out of 100 and reports 'critical', and
+   * the sender then answers a report about its own motionless screen by cutting
+   * the budget. A captured session walked 1.9 Mbps down to 250 kbps that way,
+   * on a path measuring 4.7.
+   *
+   * Optional because it is additive: a peer on an older build sends no such
+   * field, and the receiver falls back to `fps` exactly as before.
+   */
+  sentFps?: number;
   width: number;
   height: number;
   /** Video bitrate ceiling currently applied, bps. */
@@ -286,6 +303,16 @@ function validateData(type: string, d: Record<string, unknown>): DataChannelMess
       if (!dimension(status.width) || !dimension(status.height)) return null;
       if (!finite(status.bps) || status.bps < 0) return null;
 
+      // Dropped rather than rejected when absent or out of range: it is an
+      // optional refinement of `fps`, and a peer that cannot measure it must
+      // still be able to say everything else. 0 is legal here where it is not
+      // for `fps` — a capture producing nothing is the case this field exists
+      // to describe.
+      const sentFps =
+        finite(status.sentFps) && status.sentFps >= 0 && status.sentFps <= MAX_SHARE_FPS
+          ? status.sentFps
+          : undefined;
+
       const limitedBy = QUALITY_LIMITATIONS.includes(status.limitedBy as QualityLimitation)
         ? (status.limitedBy as QualityLimitation)
         : undefined;
@@ -304,6 +331,7 @@ function validateData(type: string, d: Record<string, unknown>): DataChannelMess
             width: status.width,
             height: status.height,
             bps: status.bps,
+            ...(sentFps === undefined ? {} : { sentFps }),
             ...(limitedBy ? { limitedBy } : {}),
             ...(encoder ? { encoder } : {}),
           },

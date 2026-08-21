@@ -93,6 +93,25 @@ export type ScreenCodec = 'vp9' | 'h264';
 const CAPTURE_RECONFIG_MIN_MS = 30_000;
 
 /**
+ * How much smaller the ask must get before the capturer follows it down.
+ *
+ * About two rungs. One rung is 0.44 to 0.56 of the pixels depending where on
+ * the ladder you are (1080p to 720p is 0.444; 720p to 540p is 0.5625), so a
+ * threshold at 0.35 sits below every single step and above every double one.
+ * A single step stays with the encoder's own scaler, which is the point of
+ * leaving `scaleResolutionDownBy` unpinned and costs the viewer nothing.
+ *
+ * Following at all is new, and a captured session says why. A budget collapse
+ * had walked the ask down to 640x360 while the capturer sat where it had grown
+ * to, 1280x678, and the two stayed a rung and a half apart for twenty seconds:
+ * `asked 640x360@30 / sending 1280x678@1`. The encoder was under no pressure to
+ * scale down — with one frame a second arriving there was nothing to scale — so
+ * it held the big picture, and when motion resumed the first thing it had to do
+ * was encode four times the pixels the budget had been sized for.
+ */
+const CAPTURE_SHRINK_RATIO = 0.35;
+
+/**
  * Capture constraints for an operating point.
  *
  * Shared by the initial getDisplayMedia and every later re-apply so the two can
@@ -1018,26 +1037,32 @@ class WebRTCService {
     // the entire constraint set — a frameRate-only call after a geometry call
     // silently clears the geometry.
     //
-    // Only when the capturer genuinely has to GROW — measured against what it
+    // Only when the capturer genuinely has to move — measured against what it
     // is producing, not against what we last asked for.
     //
-    // Downward moves need no capturer change at all. The encoder's own scaler
-    // handles them, which is exactly why applyVideoEncoding leaves
-    // scaleResolutionDownBy unpinned and asks for 'maintain-framerate'. And
-    // every applyConstraints on a live getDisplayMedia track restarts Chrome's
-    // capture pipeline: the viewer pays a keyframe and a decoder re-init for a
-    // change that was going to happen inside the encoder anyway.
+    // Growing always counts: the capturer is the only thing that can deliver a
+    // bigger picture, so nothing else can satisfy the ask.
     //
-    // A frame-rate change still counts either way. It comes from the content
-    // mode, which is a deliberate human action rather than the controller
-    // breathing, and the capturer is the only thing that can actually deliver
-    // more frames.
+    // Shrinking counts only past CAPTURE_SHRINK_RATIO. Small downward moves
+    // still belong to the encoder's own scaler, which is why applyVideoEncoding
+    // leaves scaleResolutionDownBy unpinned and asks for 'maintain-framerate' —
+    // and every applyConstraints on a live getDisplayMedia track restarts
+    // Chrome's capture pipeline, so the viewer pays a keyframe and a decoder
+    // re-init for a change that was going to happen inside the encoder anyway.
+    // A rung and a half is the case where it was NOT going to happen inside the
+    // encoder; see the constant.
+    //
+    // A frame-rate change counts either way. It comes from the content mode,
+    // which is a deliberate human action rather than the controller breathing.
     const captured = this.capturedPoint;
     const mustGrow =
       !captured ||
       point.width > captured.width ||
       point.height > captured.height ||
       point.fps !== captured.fps;
+    const mustShrink =
+      !!captured &&
+      point.width * point.height < captured.width * captured.height * CAPTURE_SHRINK_RATIO;
 
     // Hysteresis, longer than one probe/revert cycle (PROBE_INTERVAL_MS plus
     // PROBE_VERDICT_WINDOW_MS), so a probe that overshoots and reverts cannot
@@ -1047,7 +1072,7 @@ class WebRTCService {
     const settled = this.lastCaptureReconfigAt === 0 || sinceReconfig >= CAPTURE_RECONFIG_MIN_MS;
 
     const videoTrack = this.screenStream.getVideoTracks()[0];
-    if (videoTrack && mustGrow && settled) {
+    if (videoTrack && (mustGrow || mustShrink) && settled) {
       try {
         await videoTrack.applyConstraints(displayConstraintsFor(point));
         this.capturedPoint = point;

@@ -526,6 +526,33 @@ describe('webrtcService capture geometry', () => {
     expect(track.lastConstraints).toMatchObject({ width: { max: 1920 } });
     expect(track.contentHint).toBe('motion');
   });
+
+  it('follows the ask down once it is two rungs away', async () => {
+    // The gap the encoder was never going to close on its own. A budget
+    // collapse had walked the ask to 640x360 while the capturer sat at the
+    // 1280x678 it had grown to, and with one frame a second arriving there was
+    // nothing to make the encoder scale down: `asked 640x360@30 / sending
+    // 1280x678@1` for twenty seconds. When motion resumed, the first thing the
+    // encoder had to do was four times the pixels the budget was sized for.
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+
+    const big = chooseOperatingPoint(2_300_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(big);
+    await webrtcService.addScreenShareTracks(captured, big);
+
+    const track = stream.getVideoTracks()[0];
+    track.constraints.length = 0;
+
+    const tiny = chooseOperatingPoint(320_000, 'film');
+    // Precondition: two rungs, not one. One rung stays with the encoder — the
+    // test above this one is the other half of that pair.
+    expect(tiny.width * tiny.height).toBeLessThan(big.width * big.height * 0.35);
+    await webrtcService.updateScreenShareQuality(tiny);
+
+    expect(track.constraints).toHaveLength(1);
+    expect(track.lastConstraints).toMatchObject({ width: { max: tiny.width } });
+  });
 });
 
 /**

@@ -507,3 +507,77 @@ describe('chooseOperatingPoint and the encoder it has to run on', () => {
     expect(bound).toBeLessThan(free);
   });
 });
+
+describe('nextBudget and a still screen', () => {
+  /** Signals with everything quiet, so each test states only what it varies. */
+  function sig(over: Partial<BudgetSignals> = {}): BudgetSignals {
+    return {
+      now: 0,
+      estimateBps: null,
+      health: 'unknown',
+      viewerUnhappy: false,
+      headroom: 0.85,
+      mode: 'motion',
+      ceiling: 'auto',
+      viewport: null,
+      capacityPixelsPerSecond: null,
+      ...over,
+    };
+  }
+
+  it('does not answer a motionless capture by cutting the budget', () => {
+    // The captured failure, reproduced. A viewer receiving the one frame a
+    // second a still window produces scores it 'critical' and says so every
+    // nine seconds — forever, because nothing the budget does can make a
+    // paused video move. Thirteen polls of that walked 1.9 Mbps to 250 kbps on
+    // a path measuring 4.7.
+    let state = initialBudgetState(1_900_000, 0);
+    for (let i = 1; i <= 20; i++) {
+      state = nextBudget(
+        state,
+        sig({ now: i * 3000, health: 'source-idle', viewerUnhappy: true }),
+      );
+    }
+    expect(state.bps).toBe(1_900_000);
+  });
+
+  it('proves the same signals without the verdict do cut it', () => {
+    // The companion to the test above: without 'source-idle' this is the
+    // shortage path, and it is supposed to be. The fix is the verdict, not a
+    // weakening of the response to a real shortage.
+    let state = initialBudgetState(1_900_000, 0);
+    for (let i = 1; i <= 20; i++) {
+      state = nextBudget(state, sig({ now: i * 3000, viewerUnhappy: true }));
+    }
+    expect(state.bps).toBeLessThan(400_000);
+  });
+
+  it('does not climb on the quiet either', () => {
+    // A screen producing no frames is no evidence of headroom. Holding has to
+    // mean holding in both directions or the budget would probe its way up
+    // during the calm and then meet the resumed video over-committed.
+    const start = initialBudgetState(1_000_000, 0);
+    let state = start;
+    for (let i = 1; i <= 20; i++) {
+      state = nextBudget(state, sig({ now: i * 3000, health: 'source-idle' }));
+    }
+    expect(state.bps).toBe(1_000_000);
+    expect(state.probing).toBe(false);
+  });
+
+  it('abandons a probe in flight without charging it as a failure', () => {
+    // The probe was never answerable — the screen stopped moving before a
+    // verdict could form — so it reverts to the proven value exactly and the
+    // backoff stays where it was. Doubling it would punish a probe that never
+    // got its question asked.
+    let state = initialBudgetState(1_000_000, 0);
+    state = nextBudget(state, sig({ now: 30_000, health: 'satisfied' }));
+    expect(state.probing).toBe(true);
+    const probeBackoffMs = state.probeBackoffMs;
+
+    state = nextBudget(state, sig({ now: 33_000, health: 'source-idle' }));
+    expect(state.probing).toBe(false);
+    expect(state.bps).toBe(1_000_000);
+    expect(state.probeBackoffMs).toBe(probeBackoffMs);
+  });
+});

@@ -281,6 +281,42 @@ describe("data channel decoding", () => {
       const encoder = (decoded!.d as { status: { encoder?: string } }).status.encoder;
       expect(encoder).toHaveLength(32);
     });
+
+    it("carries what the sender is actually sending, zero included", () => {
+      // The receiver's yardstick. Zero is legal here where it is not for `fps`:
+      // a capture producing nothing is the exact case this field exists to
+      // describe, and rejecting it would leave the far end judging arriving
+      // frames against an ask that was never met.
+      for (const sentFps of [0, 1, 24]) {
+        const decoded = decodeDataChannelMessage(
+          JSON.stringify({ t: "share", d: { status: { ...status, sentFps } } }),
+        );
+        expect(decoded).toBeTruthy();
+        expect((decoded!.d as { status: { sentFps?: number } }).status.sentFps).toBe(sentFps);
+      }
+    });
+
+    it("drops a junk sentFps rather than the whole frame", () => {
+      // Additive and optional: a peer that cannot measure it must still be able
+      // to say everything else, and so must one on an older build.
+      for (const sentFps of [-1, 121, "fast", null]) {
+        const decoded = decodeDataChannelMessage(
+          JSON.stringify({ t: "share", d: { status: { ...status, sentFps } } }),
+        );
+        expect(decoded).toBeTruthy();
+        expect(
+          (decoded!.d as { status: { sentFps?: number } }).status.sentFps,
+        ).toBeUndefined();
+      }
+    });
+
+    it("omits sentFps entirely when the peer never sent one", () => {
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({ t: "share", d: { status } }),
+      );
+      expect(decoded).toBeTruthy();
+      expect("sentFps" in (decoded!.d as { status: object }).status).toBe(false);
+    });
   });
 
   it("rejects an oversized frame before parsing it", () => {
