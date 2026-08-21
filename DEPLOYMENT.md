@@ -229,6 +229,34 @@ is no sink, and adding one would be a different decision.
 - **Background blur is verified only as far as the CSP.** WebAssembly compiles
   under the live policy and both MediaPipe origins load; that it segments a
   real camera feed correctly in production is untested.
+- **The viewer's size has never once reached the sender.** Every debug report
+  captured so far ends its `they say` line with `no viewport reported`, through
+  three deploys and on both peers, and the cause is not the wire: #25 already
+  fixed `validateData` dropping the field, and the worker validator round-trips
+  it. It never gets *populated*. `ScreenShareView` measures the viewer's box
+  with a `ResizeObserver`, in an effect that reads `videoRef.current` and bails
+  when it is null — but the component mounts with the room, long before anyone
+  shares, and its empty state returns early with no `<video>` in that branch.
+  So the ref is null at mount, and the effect's only dependency is a
+  `useCallback(…, [])` that never changes, so it never re-runs when the element
+  finally appears. `onViewportChange` was therefore never called once, for the
+  whole life of a session.
+
+  The neighbouring `srcObject` effect has the identical guard and works, because
+  its dependency list contains `screenStream` — which is what makes this a
+  dependency bug rather than a design one.
+
+  What it cost: `viewport` was always null on the sender, so `resolutionBox`
+  fell back to `UNKNOWN_VIEWPORT` on `auto` and to no resolution bound at all on
+  a fixed preset. The whole viewport feature has been inert since it shipped —
+  one layer above the wire bug that #25 fixed, which is why fixing that layer
+  did not change the symptom.
+
+  What guards it now: the element is routed through a callback ref into state,
+  and both effects depend on it, so they run on the edge where it appears.
+  Verified by typecheck and build only — this repo has no component-test
+  harness — so the proof is a debug report whose `they say` line names a size.
+
 - **A still screen was read as a failing link, and that is what the reported
   freeze-then-jump actually was.** The first two-machine capture through the
   new debug report (`D` in session) settled it, and it ruled out both standing
