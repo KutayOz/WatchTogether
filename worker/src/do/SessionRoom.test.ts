@@ -82,6 +82,30 @@ function send(peer: Peer, t: string, d: unknown) {
   peer.ws.send(JSON.stringify({ t, d }));
 }
 
+let drainSeq = 0;
+/**
+ * Wait until the room has processed everything this peer has sent so far.
+ *
+ * Delivery is asynchronous, so a fixed pause between "declare a share" and
+ * "connect someone to read it back" is a race — one that passes on a quiet
+ * laptop and fails on a loaded runner. chat is the one message echoed to its
+ * own sender, and a socket's frames are processed in order, so the echo coming
+ * back is proof that everything queued ahead of it has landed.
+ */
+async function drain(peer: Peer): Promise<void> {
+  const marker = `drain-${++drainSeq}`;
+  send(peer, "chat", { m: marker });
+
+  for (let i = 0; i < 50; i++) {
+    const seen = peer.received.some(
+      (m) => m.t === "ReceiveChatMessage" && (m.d as { message?: string }).message === marker,
+    );
+    if (seen) return;
+    await settle();
+  }
+  throw new Error(`timed out draining ${marker}`);
+}
+
 describe("session lifecycle", () => {
   it("reports a session that was never created as non-existent", async () => {
     const response = await stubFor(nextSessionId()).fetch("https://do/state");
@@ -314,7 +338,7 @@ describe("screen-share state", () => {
     await creator.waitFor("Joined");
 
     send(creator, "ss:start", { streamId: "stream-abc" });
-    await settle();
+    await drain(creator);
 
     const guest = await connect(stub, "guest", "Ada");
     expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({
@@ -341,9 +365,8 @@ describe("screen-share state", () => {
     await creator.waitFor("Joined");
 
     send(creator, "ss:start", { streamId: "stream-abc" });
-    await settle();
     send(creator, "ss:stop", {});
-    await settle();
+    await drain(creator);
 
     const guest = await connect(stub, "guest", "Ada");
     expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({ sharing: null });
@@ -354,7 +377,7 @@ describe("screen-share state", () => {
     const creator = await connect(stub, "creator", "Kutay");
     await creator.waitFor("Joined");
     send(creator, "ss:start", { streamId: "stream-abc" });
-    await settle();
+    await drain(creator);
 
     // Same user, new socket — the flap the client recovers from by re-declaring.
     // The room must not carry the old socket's claim forward: after a reload the
@@ -376,7 +399,7 @@ describe("screen-share state", () => {
     await settle();
 
     send(guest, "ss:start", { streamId: "guest-stream" });
-    await settle();
+    await drain(guest);
 
     // A third socket for the creator sees the guest sharing, not itself.
     const rejoined = await connect(stub, "creator", "Kutay");
@@ -412,18 +435,20 @@ describe("input guards", () => {
     await settle();
 
     const before = guest.received.length;
-    const senderBefore = creator.received.length;
     send(creator, type, payload);
-    await settle();
 
-    // Never relayed, and never fatal.
-    expect(guest.received.length).toBe(before);
-    expect(creator.closes).toHaveLength(0);
-
-    // But not silent any more. An over-cap SDP was the case that mattered: the
+    // Not silent any more. An over-cap SDP is the case that mattered: the
     // sharer believed it had renegotiated while the viewer's picture froze on a
     // connection both ends reported as healthy, and nothing anywhere said why.
-    expect(creator.received.slice(senderBefore).map((m) => m.t)).toContain("Error");
+    //
+    // Waited for rather than checked after a fixed settle. One frame's delivery
+    // does not fit reliably in 10 ms on a loaded CI runner, and a fixed pause
+    // turns "the room answered" into "the room answered fast enough".
+    await expect(creator.waitFor("Error")).resolves.toBeDefined();
+
+    // And by then the relay that never happened has had every chance to.
+    expect(guest.received.length).toBe(before);
+    expect(creator.closes).toHaveLength(0);
   });
 
   it("survives a non-JSON frame", async () => {
