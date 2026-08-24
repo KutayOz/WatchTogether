@@ -216,3 +216,24 @@ describe('nextCapacity', () => {
     expect(soon).toBe(cut);
   });
 });
+
+describe('overEncodeCliff and a still screen', () => {
+  it('does not read the encode clock while the source is idle', () => {
+    // Divide an interval's encode seconds by the two frames a motionless
+    // capture produced and one keyframe among them clears a per-frame budget
+    // sized for thirty. That is a cliff verdict from an encoder that was very
+    // nearly asleep, and it would shrink the picture for nothing.
+    const idle = {
+      now: 0,
+      health: 'source-idle' as const,
+      previous: stats({ totalEncodeTime: 1.0, framesEncoded: 100 }),
+      latest: stats({ totalEncodeTime: 1.1, framesEncoded: 102 }),
+      askedPixelsPerSecond: 1280 * 720 * 30,
+      fps: 30,
+    };
+    // 0.1 s over 2 frames is 50 ms each, well past the 23 ms a 30 fps budget
+    // allows — so the encode-time witness on its own would say yes.
+    expect(overEncodeCliff({ ...idle, health: 'unknown' })).toBe(true);
+    expect(overEncodeCliff(idle)).toBe(false);
+  });
+});

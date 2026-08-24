@@ -77,7 +77,32 @@ export function ScreenShareView({
   onViewportChange,
   onDebugReport,
 }: ScreenShareViewProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  /*
+   * The screen <video> is tracked twice on purpose: a ref to write through,
+   * and a piece of state that says whether it exists yet.
+   *
+   * It does not exist for most of this component's life. The empty state below
+   * returns early and that branch has no <video> in it, so the element mounts
+   * on a *later* commit than the component — and a ref does not re-run an
+   * effect when its element finally appears. That is not theoretical: the
+   * viewport effect below read the ref once on mount, found null, bailed, and
+   * never attached its ResizeObserver. `onViewportChange` was therefore never
+   * called, not even after the share started, and every debug report since the
+   * feature shipped has read "no viewport reported" for that reason alone —
+   * leaving the sender to fall back on a conservative guess at a viewer size
+   * it was in fact being told nothing about.
+   *
+   * A callback ref fires with the element on mount and with null on unmount,
+   * so routing it through state gives both effects below an edge to run on.
+   * srcObject keeps going through the ref: that is a write to the DOM node,
+   * and state is meant to be read, not mutated.
+   */
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const attachVideo = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    setVideoEl(el);
+  }, []);
   const audioRef = useRef<HTMLAudioElement>(null);
   const remoteCameraRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -114,7 +139,7 @@ export function ScreenShareView({
     } catch (err) {
       logger.error('[ScreenShare] Error setting video stream:', err);
     }
-  }, [screenStream]);
+  }, [screenStream, videoEl]);
 
   // Audio stream
   useEffect(() => {
@@ -209,7 +234,7 @@ export function ScreenShareView({
    * answer changes most.
    */
   useEffect(() => {
-    const el = videoRef.current;
+    const el = videoEl;
     if (!el || !onViewportChange) return;
 
     const report = () => {
@@ -226,7 +251,7 @@ export function ScreenShareView({
     const observer = new ResizeObserver(report);
     observer.observe(el);
     return () => observer.disconnect();
-  }, [onViewportChange]);
+  }, [onViewportChange, videoEl]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -520,7 +545,7 @@ export function ScreenShareView({
       }}
     >
       <video
-        ref={videoRef}
+        ref={attachVideo}
         autoPlay
         playsInline
         muted

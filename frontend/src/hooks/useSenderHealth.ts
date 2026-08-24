@@ -65,8 +65,106 @@ export type SenderHealth =
    * CPU-bound sender could not even hear the complaint.
    */
   | 'cpu-bound'
+  /**
+   * The frames are not being MADE. Nothing downstream can answer this.
+   *
+   * `getDisplayMedia` is change-driven: a still window — a paused video, a
+   * document nobody is scrolling — produces about one frame a second, and the
+   * encoder faithfully sends about one frame a second. Every downstream reading
+   * then looks like a link in trouble. It is not. There is nothing to send.
+   *
+   * This verdict exists because the reported freeze-then-jump turned out to be
+   * that misreading, not the CPU cliff `cpu-bound` was built for. A captured
+   * session shows it exactly: `asked 640x360@30 / sending 1280x678@1 / limit
+   * none` on a 4.7 Mbps p2p/udp path with 32 ms of RTT. The viewer scored the
+   * arriving 1 fps as 'critical' (see calculateQualityScore — frame rate was a
+   * term in a MINIMUM, so it alone decided the verdict), the sender read
+   * `viewerUnhappy` as shortage, and nextBudget's multiplicative back-off
+   * walked 1.9 Mbps down to 250 kbps in thirteen polls — the ratio between
+   * consecutive `updateScreenShareQuality` logs is BACKOFF_FACTOR to three
+   * decimals. Then the video resumed against a budget sized for nothing, and
+   * THAT is what froze and jumped.
+   *
+   * The only correct response is to stop moving. Not to lower the budget, which
+   * is what was happening; not to raise it either, since a still screen is no
+   * evidence of headroom.
+   */
+  | 'source-idle'
   /** Not sharing, or the browser does not publish enough to judge. */
   | 'unknown';
+
+/**
+ * How far under the asked frame rate counts as "the frames are not arriving".
+ *
+ * A fifth, which is much lower than it first needs to be, and the reason is
+ * that this verdict FREEZES the budget. Being wrong in the loose direction is
+ * therefore not a small error: content that is genuinely slower than the ask —
+ * a 30 fps game shared in `games` mode, which asks for 60 — would sit here for
+ * the whole session with nothing able to adapt. Half would have caught exactly
+ * that, and a healthy encoder delivering 28 of 60 with it.
+ *
+ * Starvation does not need the margin anyway. It is not a near miss: the
+ * captured session's still stretches read 1 fps against an ask of 30, and its
+ * healthy tail read 23-27. A fifth puts the line at 6 fps of 30, or 12 of 60,
+ * with nothing observed anywhere near it.
+ */
+export const SOURCE_IDLE_FPS_RATIO = 0.2;
+
+/**
+ * How much of the asked picture must still be arriving for a low frame rate to
+ * be the SOURCE's doing rather than the encoder's.
+ *
+ * This is the half of the test that makes it safe. `applyVideoEncoding` asks
+ * for 'maintain-framerate', which means a genuinely bandwidth-starved encoder
+ * spends its resolution first and only starves frames once it has nothing left
+ * to shrink — so a small picture at a low frame rate is a real shortage and
+ * must keep reaching the branches below. A picture at or above full size at one
+ * frame a second cannot be produced by any amount of bandwidth pressure. In the
+ * captured session the encoder was sending 1280x678 while being asked for
+ * 640x360: nearly four times the pixels, a thirtieth of the frames.
+ *
+ * Not 1.0 because the capturer's own aspect ratio letterboxes the box we ask
+ * for — 640x360 asked, 640x338 captured — and that 6% is not the encoder
+ * giving up.
+ */
+export const SOURCE_IDLE_AREA_RATIO = 0.8;
+
+/**
+ * Are the frames simply not being produced?
+ *
+ * Both halves are required, and the second one is what keeps this from eating
+ * real shortages — see SOURCE_IDLE_AREA_RATIO. Answering false whenever a term
+ * is missing is deliberate: Firefox and Safari publish no `framesPerSecond`
+ * here, and a browser we cannot read must fall through to the bitrate ratio
+ * rather than be declared idle on no evidence.
+ *
+ * Pure and exported for the same reason `classifySenderHealth` is.
+ *
+ * @param askedFps The operating point's frame rate — what we asked for, not
+ *   what the content mode nominally is, since a preset can cap it lower.
+ */
+export function sourceIsIdle(
+  stats: OutboundScreenStats | null,
+  askedArea: number | null,
+  askedFps: number | null,
+): boolean {
+  if (!stats) return false;
+  if (!askedFps || askedFps <= 0 || !askedArea || askedArea <= 0) return false;
+
+  const { framesPerSecond, frameWidth, frameHeight } = stats;
+  if (
+    typeof framesPerSecond !== 'number' ||
+    typeof frameWidth !== 'number' ||
+    typeof frameHeight !== 'number'
+  ) {
+    return false;
+  }
+
+  if (framesPerSecond >= askedFps * SOURCE_IDLE_FPS_RATIO) return false;
+
+  // The encoder has not given up on resolution, so it has not given up at all.
+  return frameWidth * frameHeight >= askedArea * SOURCE_IDLE_AREA_RATIO;
+}
 
 /**
  * Classify a single sample.
@@ -75,16 +173,27 @@ export type SenderHealth =
  * same convention as estimateFromBitrate and calculateQualityScore.
  *
  * @param configuredBps The ceiling we set, i.e. the operating point's videoBps.
+ * @param askedArea     Pixels per frame the operating point asked for, so a low
+ *   frame rate can be attributed to the source rather than the link.
+ * @param askedFps      Frames per second the operating point asked for.
  */
 export function classifySenderHealth(
   stats: OutboundScreenStats | null,
   configuredBps: number | null,
+  askedArea: number | null = null,
+  askedFps: number | null = null,
 ): SenderHealth {
   if (!stats) return 'unknown';
 
   // CPU first: it is the one verdict whose correct response is different in
   // kind, so it must never be masked by a bandwidth reading.
   if (stats.qualityLimitationReason === 'cpu') return 'cpu-bound';
+
+  // Then the source, BEFORE any reading that could be blamed on the link. This
+  // ordering is the fix: every branch below reads a bitrate, and a bitrate is
+  // exactly what collapses when the frames stop coming — which is how a still
+  // screen used to be classified 'under-served' and answered with a back-off.
+  if (sourceIsIdle(stats, askedArea, askedFps)) return 'source-idle';
 
   // Without both terms there is no ratio to judge, and a guess here would drive
   // the ladder. Firefox and Safari land in this branch.
@@ -159,10 +268,13 @@ export interface SenderHealthState {
 /**
  * @param isActive      Poll while true (i.e. while sharing).
  * @param configuredBps The ceiling currently applied, so the ratio is honest.
+ * @param asked         The geometry currently applied, so a frame rate far
+ *   under it can be attributed to the source. Null while not sharing.
  */
 export function useSenderHealth(
   isActive: boolean,
   configuredBps: number | null,
+  asked: { area: number; fps: number } | null = null,
 ): SenderHealthState {
   const [state, setState] = useState<SenderHealthState>({
     health: 'unknown',
@@ -177,6 +289,11 @@ export function useSenderHealth(
     configuredRef.current = configuredBps;
   }, [configuredBps]);
 
+  const askedRef = useRef(asked);
+  useEffect(() => {
+    askedRef.current = asked;
+  }, [asked]);
+
   const runRef = useRef<{ verdict: SenderHealth; count: number }>({
     verdict: 'unknown',
     count: 0,
@@ -185,7 +302,13 @@ export function useSenderHealth(
 
   const poll = useCallback(async () => {
     const stats = await webrtcService.getOutboundScreenStats().catch(() => null);
-    const verdict = classifySenderHealth(stats, configuredRef.current);
+    const askedNow = askedRef.current;
+    const verdict = classifySenderHealth(
+      stats,
+      configuredRef.current,
+      askedNow?.area ?? null,
+      askedNow?.fps ?? null,
+    );
 
     const run = runRef.current;
     run.count = verdict === run.verdict ? run.count + 1 : 1;

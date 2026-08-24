@@ -155,3 +155,25 @@ describe('jitterBufferMs', () => {
     expect(jitterBufferMs(null)).toBeNull();
   });
 });
+
+describe('the yardstick a receiver is judged against', () => {
+  it('calls a still screen faithfully received exactly that', () => {
+    // One frame sent, one frame arrived. The link did its whole job, and this
+    // is the report the sender acts on — a 'critical' here is what walked a
+    // budget from 1.9 Mbps to 250 kbps on a path measuring 4.7.
+    expect(calculateQualityScore({ ...healthy, fps: 1 }, 1)).toBeGreaterThanOrEqual(90);
+  });
+
+  it('still calls a link that is eating frames critical', () => {
+    // Thirty sent, three arrived. Same arithmetic, opposite verdict — which is
+    // the point: the fix is in the yardstick, not in the sensitivity.
+    expect(scoreToLevel(calculateQualityScore({ ...healthy, fps: 3 }, 30))).toBe('critical');
+  });
+
+  it('has no opinion when the sender says it is sending nothing', () => {
+    // sentFps of 0 reaches the `expectedFps > 0` guard. Nothing was sent, so
+    // nothing arriving is not a fault of the link, and the other four terms
+    // still decide the score on their own.
+    expect(calculateQualityScore({ ...healthy, fps: 0 }, 0)).toBeGreaterThanOrEqual(90);
+  });
+});

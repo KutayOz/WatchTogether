@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { classifySenderHealth, isSoftwareEncoder, shouldDowngradeCodec } from './useSenderHealth';
+import {
+  classifySenderHealth,
+  isSoftwareEncoder,
+  shouldDowngradeCodec,
+  sourceIsIdle,
+} from './useSenderHealth';
 import type { OutboundScreenStats } from '../types';
 
 /**
@@ -127,5 +132,124 @@ describe('shouldDowngradeCodec', () => {
 
   it('has nothing to say without a sample', () => {
     expect(shouldDowngradeCodec(null, 'cpu-bound')).toBe(false);
+  });
+});
+
+describe('sourceIsIdle', () => {
+  it('recognises a still screen from the captured session', () => {
+    // The row that started this: asked 640x360@30, sending 1280x678@1. Nearly
+    // four times the pixels at a thirtieth of the frames — a shape no amount of
+    // bandwidth pressure can produce under 'maintain-framerate', because a
+    // starved encoder spends resolution before it spends frames.
+    expect(
+      sourceIsIdle(
+        stats({ frameWidth: 1280, frameHeight: 678, framesPerSecond: 1 }),
+        640 * 360,
+        30,
+      ),
+    ).toBe(true);
+  });
+
+  it('leaves a healthy under-run alone', () => {
+    // 23 of 30 is the same session once the video resumed, and it is what an
+    // encoder does on a good day. The threshold has to sit well clear of it.
+    expect(
+      sourceIsIdle(
+        stats({ frameWidth: 1280, frameHeight: 720, framesPerSecond: 23 }),
+        1280 * 720,
+        30,
+      ),
+    ).toBe(false);
+  });
+
+  it('leaves content that is simply slower than the ask alone', () => {
+    // 28 fps of a 60 fps ask: `games` mode over content that was never 60 fps.
+    // This verdict freezes the budget, so calling it here would strand a real
+    // share with nothing able to adapt for the rest of the session.
+    expect(
+      sourceIsIdle(
+        stats({ frameWidth: 1280, frameHeight: 720, framesPerSecond: 28 }),
+        1280 * 720,
+        60,
+      ),
+    ).toBe(false);
+  });
+
+  it('does not eat a genuine shortage', () => {
+    // Small picture AND few frames is an encoder that has already spent its
+    // resolution and is now spending frames — a real shortage, and it has to
+    // keep reaching the branches that answer one.
+    expect(
+      sourceIsIdle(
+        stats({ frameWidth: 640, frameHeight: 360, framesPerSecond: 2 }),
+        1920 * 1080,
+        30,
+      ),
+    ).toBe(false);
+  });
+
+  it('tolerates the capturer letterboxing the box we asked for', () => {
+    // 640x360 asked, 640x338 captured. That 6% is the source's aspect ratio,
+    // not the encoder giving up, and a strict comparison would miss every
+    // still screen on a wide display.
+    expect(
+      sourceIsIdle(
+        stats({ frameWidth: 640, frameHeight: 338, framesPerSecond: 1 }),
+        640 * 360,
+        30,
+      ),
+    ).toBe(true);
+  });
+
+  it('says nothing when the browser publishes no frame rate', () => {
+    // Firefox and Safari. Declaring a source idle on no evidence would freeze
+    // their budget for the whole session; falling through to the bitrate ratio
+    // is what they should get.
+    expect(sourceIsIdle(stats({ framesPerSecond: null }), 640 * 360, 30)).toBe(false);
+  });
+
+  it('says nothing without an ask to measure against', () => {
+    expect(sourceIsIdle(stats({ framesPerSecond: 1 }), null, 30)).toBe(false);
+    expect(sourceIsIdle(stats({ framesPerSecond: 1 }), 640 * 360, null)).toBe(false);
+    expect(sourceIsIdle(null, 640 * 360, 30)).toBe(false);
+  });
+});
+
+describe('classifySenderHealth and a still screen', () => {
+  it('reads a motionless capture as source-idle, not as a shortage', () => {
+    // Before this verdict existed the same sample classified 'under-served'
+    // (reason bandwidth, ratio 0.73) and nextBudget answered it by cutting the
+    // budget 0.85x — every poll, for as long as nobody touched the window.
+    const still = stats({
+      frameWidth: 640,
+      frameHeight: 338,
+      framesPerSecond: 1,
+      qualityLimitationReason: 'bandwidth',
+      targetBitrate: 300_000,
+    });
+    expect(classifySenderHealth(still, 410_000)).toBe('under-served');
+    expect(classifySenderHealth(still, 410_000, 640 * 360, 30)).toBe('source-idle');
+  });
+
+  it('still puts CPU first', () => {
+    // The one verdict whose correct answer is different in kind. A CPU-bound
+    // encoder that is also producing few frames needs the codec and pixel
+    // remedies, not a hold.
+    expect(
+      classifySenderHealth(
+        stats({ framesPerSecond: 1, qualityLimitationReason: 'cpu' }),
+        410_000,
+        640 * 360,
+        30,
+      ),
+    ).toBe('cpu-bound');
+  });
+
+  it('changes nothing for callers that pass no geometry', () => {
+    // The parameters are optional so the classifier keeps working for anyone
+    // who only has a bitrate — and so this change cannot alter a verdict it
+    // was not given the evidence to alter.
+    const sample = stats({ framesPerSecond: 1, qualityLimitationReason: 'none', targetBitrate: 400_000 });
+    expect(classifySenderHealth(sample, 400_000)).toBe('satisfied');
   });
 });

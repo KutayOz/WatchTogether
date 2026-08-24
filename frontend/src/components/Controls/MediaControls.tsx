@@ -13,6 +13,7 @@ import {
 } from '../../hooks/useTransportDiagnostics';
 import type { OperatingPoint } from '../../hooks/operatingPoint';
 import { jitterBufferMs, type InboundScreenStats } from '../../hooks/useQualityMonitor';
+import { SOURCE_IDLE_FPS_RATIO } from '../../hooks/useSenderHealth';
 
 interface MediaControlsProps {
   isMuted: boolean;
@@ -351,6 +352,18 @@ export function MediaControls({
                         <br />
                         their ask: {peerShare.width}×{peerShare.height} @ {peerShare.fps}
                         {` · ${(peerShare.bps / 1_000_000).toFixed(2)} Mbps`}
+                        {/* Beside the ask, because the gap between the two is
+                            the answer whenever this side is freezing: frames
+                            that were never made cannot have been lost. */}
+                        {peerShare.sentFps !== undefined && (
+                          <>
+                            <br />
+                            they send: {Math.round(peerShare.sentFps)} fps
+                            {peerShare.sentFps < peerShare.fps * SOURCE_IDLE_FPS_RATIO && (
+                              <span style={{ opacity: 0.7 }}> · their screen is still</span>
+                            )}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>

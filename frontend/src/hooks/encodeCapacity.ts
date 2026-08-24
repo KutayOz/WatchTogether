@@ -141,6 +141,16 @@ export function encodeCostPerFrame(
  */
 export function overEncodeCliff(sig: CapacitySignals): boolean {
   if (sig.health === 'cpu-bound') return true;
+
+  // A still screen makes the encode-time witness unreadable, so do not read it.
+  // Divide the interval's encode seconds by the two or three frames a
+  // motionless capture produced and one keyframe among them clears a per-frame
+  // budget sized for thirty — a cliff verdict from an encoder that was very
+  // nearly asleep. The other consequence of `source-idle` is that neither term
+  // moved enough to mean anything either way, so there is nothing lost by
+  // waiting for frames.
+  if (sig.health === 'source-idle') return false;
+
   if (sig.fps <= 0) return false;
   const cost = encodeCostPerFrame(sig.previous, sig.latest);
   if (cost === null) return false;

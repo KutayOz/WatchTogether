@@ -579,6 +579,32 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
     return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
   }
 
+  /*
+   * A still screen is not a slow link.
+   *
+   * This branch sits above `shortage` for the same reason `cpu-bound` does, and
+   * it is the more important of the two in practice: `shortage` is an OR, and
+   * its second term is the viewer's report. A viewer receiving the one frame a
+   * second a motionless capture produces scores it 'critical' and says so every
+   * nine seconds, forever — so without this the loop had a shortage signal that
+   * could neither be satisfied nor switched off, and the budget fell 0.85× per
+   * poll for as long as nobody touched the shared window. The captured session
+   * did exactly that: 1.9 Mbps to 250 kbps in about forty seconds, on a path
+   * measuring 4.7 Mbps.
+   *
+   * Holding is the entire response. Not lowering — fewer bits will not make a
+   * still screen move. Not raising either: a screen producing no frames proves
+   * nothing about headroom, so `satisfied` must not be inferred from the calm.
+   *
+   * A probe in flight is abandoned rather than judged, and WITHOUT doubling the
+   * backoff, because it did not fail — it was never answerable. Reverting to
+   * `baseBps` exactly is the same non-ratcheting revert the probe path uses.
+   */
+  if (sig.health === 'source-idle') {
+    if (!state.probing) return state;
+    return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
+  }
+
   // A probe that made things worse. Revert to the proven value exactly, not by
   // a factor: this is the property that stops repeated failure from decaying
   // the budget, and it is the whole reason `baseBps` is carried.

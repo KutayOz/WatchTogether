@@ -172,6 +172,11 @@ function ramp(value: number, good: number, bad: number): number {
  *
  * Being a minimum also means each threshold below stands on its own and can be
  * read without holding the other four in your head.
+ *
+ * The one term that needs care is frame rate, and the care is in what gets
+ * passed as `expectedFps` rather than in the arithmetic here — see the doc on
+ * the hook's parameter. A receiver cannot tell a frame that was lost from a
+ * frame that was never sent, so the yardstick has to come from the sender.
  */
 export function calculateQualityScore(metrics: QualityMetrics, expectedFps = 30): number {
   const totalPackets = metrics.packetsReceived + metrics.packetsLost;
@@ -215,11 +220,24 @@ interface StreamSample {
 }
 
 /**
- * @param expectedFps The frame rate the SENDER says it is targeting, or
- *   undefined when it has not said. Judging a 24 fps film share against the 30
- *   fps default made a healthy stream look 6% short of nominal for its whole
- *   run — not enough to reach a bad verdict on its own, but enough to narrow
- *   the margin on a signal that is wired to an action.
+ * @param expectedFps The frame rate the SENDER says it is putting on the wire,
+ *   or undefined when it has not said.
+ *
+ *   Two corrections live in this one number, and the second is much larger than
+ *   the first. Judging a 24 fps film share against the 30 fps default made a
+ *   healthy stream look 6% short of nominal for its whole run — not enough to
+ *   reach a bad verdict alone, but enough to narrow the margin on a signal that
+ *   is wired to an action. Judging a STILL screen against its ask was the same
+ *   error at thirty times the size: `getDisplayMedia` produces about one frame
+ *   a second when nothing on screen moves, and 1 against 30 scores 3.9 in a
+ *   function that takes a minimum. The viewer reported 'critical' every nine
+ *   seconds, and the sender answered by cutting its budget from 1.9 Mbps to
+ *   250 kbps on a path measuring 4.7.
+ *
+ *   Which is why this is `ShareStatus.sentFps` and not `ShareStatus.fps`. The
+ *   question a receiver can actually answer is "did I get what was sent", and
+ *   whether enough was sent is the sender's own to answer — it has
+ *   `source-idle`, `cpu-bound` and `under-served` for exactly that.
  */
 export function useQualityMonitor(
   isWatching: boolean,
