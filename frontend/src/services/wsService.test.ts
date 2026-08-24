@@ -3,6 +3,8 @@ import { FakeWebSocket } from './testDoubles';
 import { logger } from './logger';
 import { wsService } from './wsService';
 import {
+  CLOSE_PAYLOAD_TOO_LARGE,
+  CLOSE_RATE_LIMITED,
   CLOSE_REPLACED,
   CLOSE_SESSION_FULL,
   CLOSE_UNAUTHORIZED,
@@ -100,10 +102,26 @@ describe('wsService', () => {
     it.each([
       [CLOSE_SESSION_FULL, /full/i],
       [CLOSE_UNAUTHORIZED, /sign in/i],
+      [CLOSE_RATE_LIMITED, /too many attempts/i],
+      [CLOSE_PAYLOAD_TOO_LARGE, /more than the session allows/i],
+      // The handshake never completed — no status reached us, so the honest
+      // message is about reachability rather than about the session.
+      [1006, /check your connection/i],
     ])('rejects close code %i with something worth showing a user', async (code, expected) => {
       const pending = wsService.join(SESSION);
       FakeWebSocket.latest.close(code);
       await expect(pending).rejects.toThrow(expected);
+    });
+
+    /*
+     * The message that sent us here. A code nothing anticipated used to reach
+     * the user as a bare "Could not join the session." — true, and useless to
+     * everyone including whoever gets asked to debug it.
+     */
+    it('surfaces the number for a code nothing has a name for', async () => {
+      const pending = wsService.join(SESSION);
+      FakeWebSocket.latest.close(4999);
+      await expect(pending).rejects.toThrow(/4999/);
     });
 
     it('gives up rather than hanging when Joined never arrives', async () => {
@@ -287,6 +305,71 @@ describe('wsService', () => {
       expect(onFatal).toHaveBeenCalledWith(expect.stringMatching(/another tab/i));
       expect(onReconnecting).not.toHaveBeenCalled();
       expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+
+    /*
+     * Counter-intuitive on its face: a rate limit reads like something to wait
+     * out. But the ladder is what tripped it, so continuing the ladder is the
+     * one response that cannot work. The user's own retry becomes the backoff.
+     */
+    it.each([
+      [CLOSE_RATE_LIMITED, /too many attempts/i],
+      [CLOSE_PAYLOAD_TOO_LARGE, /more than the session allows/i],
+    ])('stays down after close %i rather than retrying into it', async (code, expected) => {
+      const onFatal = vi.fn();
+      const onReconnecting = vi.fn();
+      wsService.setHandlers({ onFatal, onReconnecting });
+      const { socket } = await join();
+
+      socket.close(code);
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(onFatal).toHaveBeenCalledWith(expect.stringMatching(expected));
+      expect(onReconnecting).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+
+    /*
+     * The close code has to survive the promise boundary.
+     *
+     * A reconnect that fails rejects rather than reaching onclose, and the
+     * failure handler used to substitute a literal 1006 — so a reconnect
+     * refused as rate-limited, full or unauthorized never consulted the fatal
+     * set at all and retried forever. Marking codes fatal does not fix this on
+     * its own; only carrying the real code does.
+     */
+    it('learns the code from a failed reconnect, not just from a live socket', async () => {
+      const onFatal = vi.fn();
+      wsService.setHandlers({ onFatal });
+      const { socket } = await join();
+
+      socket.drop();
+      await vi.advanceTimersByTimeAsync(600);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      // The reconnect itself is refused, before any Joined arrives.
+      FakeWebSocket.latest.close(CLOSE_RATE_LIMITED);
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(onFatal).toHaveBeenCalledWith(expect.stringMatching(/too many attempts/i));
+      expect(FakeWebSocket.instances).toHaveLength(2);
+    });
+
+    /*
+     * The other half of that: 1006 must stay retryable. It is the code every
+     * ordinary network drop arrives as, so putting it in the fatal set would
+     * disable reconnection outright.
+     */
+    it('keeps retrying after 1006, which is just a dropped connection', async () => {
+      const onFatal = vi.fn();
+      wsService.setHandlers({ onFatal });
+      const { socket } = await join();
+
+      socket.close(1006);
+      await vi.advanceTimersByTimeAsync(600);
+
+      expect(onFatal).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(2);
     });
 
     it('holds signalling sent while down, then flushes it on rejoin', async () => {

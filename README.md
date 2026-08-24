@@ -150,7 +150,10 @@ worker/
 2. **Create a session** — `POST /api/session/create` names a `SessionRoom`.
 3. **Connect** — `wss://…/api/session/ws/:sessionId`. The socket *is* the join:
    the Worker checks the cookie and forwards the upgrade, so reconnecting is
-   rejoining, with no separate join message to forget to re-send.
+   rejoining, with no separate join message to forget to re-send. A refusal at
+   any layer answers 101 and then closes with a reason code — a browser can
+   read nothing else off a rejected upgrade, so a plain 401 or 429 would reach
+   the user as an unexplained failure.
 4. **Signal** — offer / answer / ICE relayed by the Durable Object.
 5. **Stream** — video, audio and screen share flow peer-to-peer.
 6. **Presence** — cursors, typing, reactions and video sync go over the WebRTC
