@@ -18,6 +18,9 @@ import type {
   JoinWithInviteResponse,
   AdminUser,
   UserTreeResponse,
+  DemoRequestSubmitResponse,
+  AdminDemoRequest,
+  ApproveDemoRequestResponse,
 } from '../types';
 
 // Auth is an HttpOnly cookie issued by the passkey endpoints. Every API call
@@ -416,6 +419,60 @@ export const api = {
     });
     if (!response.ok) throw await apiError(response, 'Failed to delete user');
     return readJson(response, 'Failed to delete user');
+  },
+
+  // ────────────────── Demo requests ──────────────────
+
+  /**
+   * Ask for an invite without holding one. The only write in this file that
+   * needs no session — the caller has no account, which is the point.
+   */
+  async submitDemoRequest(
+    email: string,
+    displayName: string,
+    message?: string,
+  ): Promise<DemoRequestSubmitResponse> {
+    const response = await publicFetch(`${API_URL}/api/demo-requests`, {
+      method: 'POST',
+      body: JSON.stringify({ email, displayName, message: message?.trim() || null }),
+    });
+    if (!response.ok) throw await apiError(response, 'Failed to send the request');
+    return readJson(response, 'Failed to send the request');
+  },
+
+  /** Envelope-unwrapping, for the reason spelled out over getAdminUsers. */
+  async getAdminDemoRequests(): Promise<AdminDemoRequest[]> {
+    const response = await authFetch(`${API_URL}/api/admin/demo-requests`);
+    if (!response.ok) throw await apiError(response, 'Failed to get demo requests');
+    const body = await readJson<{ requests: AdminDemoRequest[] }>(
+      response,
+      'Failed to get demo requests',
+    );
+    return body.requests ?? [];
+  },
+
+  /**
+   * Approve, and receive the invite link that answers the request.
+   *
+   * The link is in this response and nowhere else — the server keeps only its
+   * hash, exactly like the password reset link. Whatever shows it has to be the
+   * thing that lets root copy it.
+   */
+  async approveAdminDemoRequest(id: string): Promise<ApproveDemoRequestResponse> {
+    const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/approve`, {
+      method: 'POST',
+    });
+    if (!response.ok) throw await apiError(response, 'Failed to approve the request');
+    return readJson(response, 'Failed to approve the request');
+  },
+
+  async rejectAdminDemoRequest(id: string, reason?: string): Promise<{ message: string }> {
+    const response = await authFetch(`${API_URL}/api/admin/demo-requests/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason?.trim() || null }),
+    });
+    if (!response.ok) throw await apiError(response, 'Failed to close the request');
+    return readJson(response, 'Failed to close the request');
   },
 
 

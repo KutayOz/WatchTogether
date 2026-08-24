@@ -404,6 +404,38 @@ export interface UserTreeResponse {
   totalUsers: number;
 }
 
+// Demo requests — shapes mirror worker/src/routes/{demoRequests,admin}.ts.
+//
+// The one place an email address appears in this app. It belongs to somebody
+// who has no account: a reply-to on a request for an invite, kept until root
+// deals with it and swept a month later. Nothing copies it onto the user that
+// eventually registers.
+export interface DemoRequestSubmitResponse {
+  message: string;
+}
+
+export type DemoRequestStatus = 'pending' | 'approved' | 'rejected';
+
+export interface AdminDemoRequest {
+  id: string;
+  email: string;
+  displayName: string;
+  message: string | null;
+  status: DemoRequestStatus;
+  /** Unix millis. */
+  submittedAt: number;
+  reviewedAt: number | null;
+  reviewedByUserId: string | null;
+  rejectionReason: string | null;
+}
+
+/** The invite minted by approving. `inviteUrl` is the only copy there will be. */
+export interface ApproveDemoRequestResponse {
+  message: string;
+  inviteUrl: string;
+  expiresAt: number;
+}
+
 export interface AuditEntry {
   id: string;
   actorUserId: string;

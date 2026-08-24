@@ -1,5 +1,6 @@
 import init from "../../migrations/0001_init.sql?raw";
 import passwords from "../../migrations/0002_password_credentials.sql?raw";
+import demoRequests from "../../migrations/0003_demo_requests.sql?raw";
 
 /**
  * Every migration, in order.
@@ -9,7 +10,7 @@ import passwords from "../../migrations/0002_password_credentials.sql?raw";
  * a new migration from being invisible to four suites and applied by the
  * fifth: adding 0003 is one line, in one place.
  */
-const MIGRATIONS = [init, passwords];
+const MIGRATIONS = [init, passwords, demoRequests];
 
 /**
  * Every table, child-first.
@@ -19,6 +20,7 @@ const MIGRATIONS = [init, passwords];
  * exists", in whichever suite happens to run second.
  */
 const TABLES = [
+  "demo_requests",
   "password_reset_tokens",
   "password_credentials",
   "admin_audit_log",

@@ -2,6 +2,15 @@ import { Hono } from "hono";
 import type { AppEnv } from "../middleware/auth";
 import { requireRoot } from "../middleware/auth";
 import { appendAudit, listAudit } from "../db/audit";
+import {
+  MAX_LISTED,
+  getDemoRequest,
+  listDemoRequests,
+  markApproved,
+  markRejected,
+  type DemoRequestRow,
+} from "../db/demoRequests";
+import { createInvitationLink, maxLinksFor } from "../db/invitationLinks";
 import { createResetToken } from "../db/passwordResets";
 import { getUserById, softDeleteUser, tagOf, type UserRow } from "../db/users";
 
@@ -154,4 +163,136 @@ adminRoutes.delete("/users/:id", requireRoot, async (c) => {
   });
 
   return c.json({ message: "User deleted." });
+});
+
+// ────────────────── Demo requests ──────────────────
+//
+// The queue of people asking for an invite without holding one. Reviewing is
+// root's alone, like everything else in this file, and approval produces a
+// link rather than a message: nothing in this app can send mail, so root copies
+// the link and passes it on however they already talk to the applicant. Same
+// arrangement as the password reset above.
+
+/** A rejection note is for root's own memory — nothing shows it to the applicant. */
+const MAX_REJECTION_REASON = 500;
+
+interface DemoRequestSummary {
+  id: string;
+  email: string;
+  displayName: string;
+  message: string | null;
+  status: string;
+  submittedAt: number;
+  reviewedAt: number | null;
+  reviewedByUserId: string | null;
+  rejectionReason: string | null;
+}
+
+function summarizeRequest(row: DemoRequestRow): DemoRequestSummary {
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    message: row.message,
+    status: row.status,
+    submittedAt: row.submitted_at,
+    reviewedAt: row.reviewed_at,
+    reviewedByUserId: row.reviewed_by,
+    rejectionReason: row.rejection_reason,
+  };
+}
+
+adminRoutes.get("/demo-requests", requireRoot, async (c) => {
+  const rows = await listDemoRequests(c.env.DB);
+  return c.json({ requests: rows.map(summarizeRequest), truncated: rows.length === MAX_LISTED });
+});
+
+/**
+ * Approve a request and mint the invite that answers it.
+ *
+ * The status moves first and the link is minted second, so the two failure
+ * orders both land somewhere recoverable: a link that fails to mint leaves an
+ * approved row root can approve again (markApproved accepts `approved` for
+ * exactly this reason), whereas minting first would hand out a live invite for
+ * a request that a concurrent reject had just closed.
+ *
+ * The invite is an ordinary one, attributed to root, and inherits everything
+ * that comes with that: single use, 48 hours, and the invitee appears under
+ * root in the user tree. The raw token is in this response and nowhere else.
+ */
+adminRoutes.post("/demo-requests/:id/approve", requireRoot, async (c) => {
+  const actor = c.get("user");
+  const id = c.req.param("id");
+
+  const request = await getDemoRequest(c.env.DB, id);
+  if (!request) return c.json({ message: "Request not found." }, 404);
+  if (request.status === "rejected") {
+    return c.json(
+      { message: "That request was rejected. Invite them from the lobby instead." },
+      409,
+    );
+  }
+
+  if (!(await markApproved(c.env.DB, id, actor.id))) {
+    // Somebody else moved it between the read and the write.
+    return c.json({ message: "That request was just changed. Reload and try again." }, 409);
+  }
+
+  const link = await createInvitationLink(c.env.DB, actor.id, maxLinksFor(actor.is_root === 1));
+  if (!link.ok) {
+    return c.json(
+      { message: "You have no invite slots left. Revoke your active link first." },
+      400,
+    );
+  }
+
+  await appendAudit(c.env.DB, {
+    actorUserId: actor.id,
+    actorTag: tagOf(actor),
+    action: "DemoRequestApproved",
+    targetType: "DemoRequest",
+    targetId: id,
+    details: `Approved ${request.display_name} <${request.email}> and minted an invite link`,
+    ipAddress: c.req.header("CF-Connecting-IP") ?? undefined,
+  });
+
+  return c.json({
+    message: "Approved. The link below is the only copy.",
+    inviteUrl: `${c.env.RP_ORIGIN}/invite/${link.token}`,
+    expiresAt: link.expiresAt,
+  });
+});
+
+/** Close a request without minting anything. Terminal — see markRejected. */
+adminRoutes.post("/demo-requests/:id/reject", requireRoot, async (c) => {
+  const actor = c.get("user");
+  const id = c.req.param("id");
+
+  const body = await c.req
+    .json<{ reason?: unknown }>()
+    // A bodiless POST is the normal case — rejecting without a note.
+    .catch(() => ({}) as { reason?: unknown });
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (reason.length > MAX_REJECTION_REASON) {
+    return c.json({ message: `Keep the note under ${MAX_REJECTION_REASON} characters.` }, 400);
+  }
+
+  const request = await getDemoRequest(c.env.DB, id);
+  if (!request) return c.json({ message: "Request not found." }, 404);
+
+  if (!(await markRejected(c.env.DB, id, actor.id, reason))) {
+    return c.json({ message: "That request has already been dealt with." }, 409);
+  }
+
+  await appendAudit(c.env.DB, {
+    actorUserId: actor.id,
+    actorTag: tagOf(actor),
+    action: "DemoRequestRejected",
+    targetType: "DemoRequest",
+    targetId: id,
+    details: `Rejected ${request.display_name} <${request.email}>${reason ? `: ${reason}` : ""}`,
+    ipAddress: c.req.header("CF-Connecting-IP") ?? undefined,
+  });
+
+  return c.json({ message: "Request closed." });
 });

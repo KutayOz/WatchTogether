@@ -34,8 +34,10 @@ this](#why-it-is-shaped-like-this).
 - **Password sign-in** — for anyone who cannot or would rather not use a passkey,
   stretched in the browser so the Worker never sees it
 - **Invite-only accounts** — single-use links, quota-limited per user
+- **Request a demo** — no invite and nobody to ask? leave a note; root reviews it
+  and answers with an invite link by hand
 - **Reconnect that actually rejoins** — refresh mid-call and the session recovers
-- **Admin panel** — user tree, invite slots, audit log
+- **Admin panel** — user tree, invite slots, demo-request queue, audit log
 - **Perfect negotiation** — renegotiation with glare handling
 
 ## Tech stack
@@ -127,15 +129,17 @@ frontend/                     React SPA; dist/ is served by the Worker
 
 worker/
 ├─ wrangler.toml              Bindings, cron, assets, RP config
-├─ migrations/0001_init.sql   The whole schema
+├─ migrations/                0001 schema, 0002 passwords, 0003 demo requests
 └─ src/
    ├─ index.ts                Hono app, WS route, cron handler, DO exports
    ├─ do/
    │  ├─ SessionRoom.ts       One instance per session: participants, sockets, grace, invite
    │  └─ AuthChallenge.ts     One instance per in-flight WebAuthn ceremony
-   ├─ routes/                 auth, passkey, session, invitation, terms, admin
+   ├─ routes/                 auth, passkey, password, session, invitation, terms,
+   │                         admin, demoRequests
    ├─ middleware/             auth, rateLimit, securityHeaders
-   ├─ db/                     users, credentials, invitationLinks, revokedTokens, audit
+   ├─ db/                     users, credentials, invitationLinks, passwordCredentials,
+   │                         passwordResets, demoRequests, revokedTokens, audit
    └─ lib/                    jwt, cookies, crypto, identity, ice, protocol, dataChannelProtocol
 ```
 

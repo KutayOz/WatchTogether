@@ -69,6 +69,16 @@ type = "ratelimit"
 namespace_id = "1004"
 simple = { limit = 15, period = 60 }
 
+# Demo requests. The only endpoint in the app where an anonymous caller can
+# write a row, so it gets the tightest bucket here: five a minute is more than
+# any human filling in a form needs, and the partial unique index on
+# demo_requests already caps a persistent applicant at one open request.
+[[unsafe.bindings]]
+name = "RL_DEMO"
+type = "ratelimit"
+namespace_id = "1005"
+simple = { limit = 5, period = 60 }
+
 # Nightly housekeeping: sweep expired deny-list entries and return invite
 # slots held by unused links. Replaces Mongo's TTL indexes, which D1 lacks.
 [triggers]

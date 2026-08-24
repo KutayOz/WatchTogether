@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { PasskeyIcon } from '../Auth/PasskeyIcon';
@@ -34,6 +34,11 @@ import {
  *
  * First run is unchanged and still passkey-only: claiming root is a one-time
  * action at a keyboard, gated on an empty database plus a deployment secret.
+ *
+ * The third thing this screen offers is not a way in at all: "request a demo"
+ * files a note for root, who answers with an invite link by hand. It is the
+ * only affordance here for a visitor who has neither an account nor a friend
+ * holding a link, and it deliberately looks like the footnote it is.
  */
 export function Login() {
   const navigate = useNavigate();
@@ -219,11 +224,16 @@ export function Login() {
             </form>
           </div>
 
-          {/* No sign-up link, and no "forgot password" link, both on purpose.
-              Accounts exist only by invitation, so a "create account"
-              affordance would lead nowhere for anybody without a link; and
-              there is no email address on file, so the only way back from a
-              forgotten password is a link root issues by hand. */}
+          {/* Still no "create account" and no "forgot password", both on
+              purpose: an account comes from redeeming an invite, and with no
+              address on file the only way back from a forgotten password is a
+              link root issues by hand.
+
+              What this box does now have is the other half of "invite-only" —
+              a way in for somebody with nobody to ask. It files a request for
+              root to read; it mints nothing, which is why it sits as a quiet
+              line under the ask-a-friend sentence rather than as a second
+              button competing with sign-in. */}
           <div
             style={{
               marginTop: 36,
@@ -240,6 +250,34 @@ export function Login() {
             </div>
             <div className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.65)' }}>
               WatchTogether is invite-only. ask the friend who told you about it for a link.
+            </div>
+            <div
+              className="hand"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                marginTop: 14,
+                paddingTop: 12,
+                borderTop: '2px dashed rgba(26,20,23,0.25)',
+                fontSize: 18,
+                color: 'rgba(26,20,23,0.65)',
+                flexWrap: 'wrap',
+              }}
+            >
+              <Doodle kind="envelope" size={20} color="var(--purple)" />
+              nobody to ask?
+              <Link
+                to="/request-demo"
+                style={{
+                  color: 'var(--purple)',
+                  fontWeight: 700,
+                  textDecorationThickness: 2,
+                  textUnderlineOffset: 3,
+                }}
+              >
+                request a demo
+              </Link>
             </div>
           </div>
 
@@ -344,7 +382,9 @@ export function Login() {
             style={{
               position: 'absolute',
               right: 48,
-              bottom: 120,
+              // Clears the top edge of the invite-only box, which grew when the
+              // request-a-demo line was added under it.
+              bottom: 178,
               fontSize: 22,
               color: 'var(--purple)',
               transform: 'rotate(-6deg)',

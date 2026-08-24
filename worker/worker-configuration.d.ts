@@ -17,6 +17,7 @@ interface __BaseEnv_Env {
 	RL_AUTH: RateLimit;
 	RL_LOOKUP: RateLimit;
 	RL_PASSWORD: RateLimit;
+	RL_DEMO: RateLimit;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
