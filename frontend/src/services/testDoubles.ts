@@ -56,10 +56,17 @@ export class FakeWebSocket {
     this.sent.push(frame);
   }
 
-  close(code = 1000, reason = ''): void {
+  /**
+   * `code` is optional because the browser's is, and the distinction matters:
+   * close() with no arguments sends no status, so the close event reports 1005
+   * rather than 1000. wsService treats 1000 as "we meant to leave" and never
+   * reconnects, so a double that reported 1000 for an argument-less close would
+   * make a socket the heartbeat abandoned look like a deliberate exit.
+   */
+  close(code?: number, reason = ''): void {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.({ code, reason });
+    this.onclose?.({ code: code ?? 1005, reason });
   }
 
   /** Deliver a server frame. */
@@ -78,9 +85,23 @@ export class FakeWebSocket {
     this.onclose?.({ code, reason: '' });
   }
 
-  /** Frames decoded, for asserting on message types. */
+  /**
+   * Frames decoded, for asserting on message types.
+   *
+   * Skips anything that is not a protocol envelope, which today means the
+   * keepalive: it goes out as the bare string "ping" so the room can answer it
+   * from its auto-responder without waking. Assertions here are about what the
+   * app said, not about whether the socket was still breathing — `sent` is
+   * where the raw traffic lives if a test wants both.
+   */
   get frames(): Array<{ t: string; d: Record<string, unknown> }> {
-    return this.sent.map((raw) => JSON.parse(raw));
+    return this.sent.flatMap((raw) => {
+      try {
+        return [JSON.parse(raw)];
+      } catch {
+        return [];
+      }
+    });
   }
 }
 
@@ -324,6 +345,29 @@ export class FakePeerConnection {
   /** ICE state, so the diagnostics dump has something honest to report. */
   iceGatheringState: RTCIceGatheringState = 'complete';
   iceConnectionState: RTCIceConnectionState = 'connected';
+  signalingState: RTCSignalingState = 'stable';
+
+  /**
+   * Assigned by the service, invoked by the test.
+   *
+   * A connection that stays 'failed' emits no further state change, so recovery
+   * that only reacts to this event can never fire twice on its own — which is
+   * exactly the latch this lets a test reproduce.
+   */
+  oniceconnectionstatechange: (() => void) | null = null;
+
+  /** Options every createOffer was called with, newest last. */
+  readonly offers: RTCOfferOptions[] = [];
+  localDescription: RTCSessionDescriptionInit | null = null;
+
+  async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
+    this.offers.push(options ?? {});
+    return { type: 'offer', sdp: 'v=0\r\n' };
+  }
+
+  async setLocalDescription(description: RTCSessionDescriptionInit): Promise<void> {
+    this.localDescription = description;
+  }
 
   /** Connection-wide stats. Set by the test; empty by default. */
   stats: RTCStatsReport = new Map() as unknown as RTCStatsReport;
@@ -332,7 +376,12 @@ export class FakePeerConnection {
     return this.stats;
   }
 
-  close(): void {}
+  /** Whether close() was called — initialize must not orphan a live one. */
+  closed = false;
+
+  close(): void {
+    this.closed = true;
+  }
 }
 
 /**

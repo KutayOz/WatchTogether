@@ -309,9 +309,23 @@ export function SessionRoom() {
     }
   }, []);
 
+  /**
+   * The browser's own "Stop sharing" bar, routed into the app's stop path.
+   *
+   * Through a ref because handleStopScreenShare is defined further down the
+   * component and this callback has to be stable: useWebRTC's initialize lists
+   * it as a dependency, and a fresh function every render would rebuild the
+   * peer connection on every render.
+   */
+  const handleStopScreenShareRef = useRef<(() => Promise<void>) | null>(null);
+  const handleScreenShareEnded = useCallback(() => {
+    void handleStopScreenShareRef.current?.();
+  }, []);
+
   const webrtc = useWebRTC({
     onIceCandidate: handleIceCandidate,
     onIceRestart: handleIceRestart,
+    onScreenShareEnded: handleScreenShareEnded,
   });
 
   useEffect(() => {
@@ -778,6 +792,21 @@ export function SessionRoom() {
         const answer = await webrtc.createAnswer();
         if (sessionIdRef.current) {
           await transportRef.current?.sendRenegotiationAnswer(sessionIdRef.current, answer);
+        }
+
+        // The other half of perfect negotiation, which was missing.
+        //
+        // Accepting their offer during a collision rolled OUR pending offer
+        // back, and an answer cannot carry m-lines the offer did not have — so
+        // whatever we were renegotiating for, typically a screen share we had
+        // just added, silently never reached the wire. The textbook design
+        // leans on negotiationneeded firing again to re-offer; that handler is
+        // not registered here, every renegotiation in this file being explicit,
+        // so the re-offer has to be explicit too.
+        if (collision && sessionIdRef.current) {
+          logger.warn('[Renegotiation] re-offering after a polite rollback');
+          const reoffer = await webrtc.createOffer();
+          await transportRef.current?.sendRenegotiationOffer(sessionIdRef.current, reoffer);
         }
       } catch (err) {
         logger.error('[Renegotiation] failed to handle offer:', err);
@@ -1593,6 +1622,14 @@ export function SessionRoom() {
     }
   };
 
+  // Published for handleScreenShareEnded, which is created before this exists.
+  // No dependency array, matching webrtcRef above: handleStopScreenShare is a
+  // fresh closure every render, and the point of the ref is to always hold the
+  // current one. Safe in an effect because nothing reads it during render.
+  useEffect(() => {
+    handleStopScreenShareRef.current = handleStopScreenShare;
+  });
+
   const handleSendMessage = async (message: string) => {
     if (sessionIdRef.current) {
       await transport.sendChatMessage(sessionIdRef.current, message);
@@ -2041,6 +2078,7 @@ export function SessionRoom() {
               onRequestShare={handleRequestScreenShare}
               canRequestShare={canRequestShare}
               isWaitingForApproval={isWaitingForApproval}
+              onCancelRequest={handleCancelScreenShareRequest}
               isMuted={isMuted}
               isCameraOn={isCameraOn}
               isScreenSharing={webrtc.isScreenSharing}

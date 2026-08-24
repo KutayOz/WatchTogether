@@ -428,21 +428,61 @@ class WebRTCService {
       if (state === 'disconnected') {
         // Start timer for ICE restart if disconnection persists
         this.disconnectTimer = setTimeout(() => {
-          if (this.peerConnection?.iceConnectionState === 'disconnected' && !this.iceRestartInProgress) {
+          if (this.peerConnection?.iceConnectionState === 'disconnected') {
             logger.debug('[WebRTC Service] Prolonged disconnection detected, requesting ICE restart');
-            this.handlers.onIceRestart?.();
+            this.requestIceRestart();
           }
         }, WebRTCService.DISCONNECT_TIMEOUT_MS);
       } else if (state === 'failed') {
         // Immediately request ICE restart on failure
-        if (!this.iceRestartInProgress) {
-          logger.debug('[WebRTC Service] Connection failed, requesting ICE restart');
-          this.handlers.onIceRestart?.();
-        }
+        logger.debug('[WebRTC Service] Connection failed, requesting ICE restart');
+        this.requestIceRestart();
       } else if (state === 'connected' || state === 'completed') {
+        this.clearIceRestartTimer();
         this.iceRestartInProgress = false;
+        this.iceRestartAttempts = 0;
       }
     };
+  }
+
+  /**
+   * Ask for one ICE restart, and make sure another one is still possible.
+   *
+   * The in-progress flag is the only thing keeping restarts from stacking, so
+   * it has to be armed with an expiry rather than trusted to be cleared by a
+   * 'connected' that may never arrive. When the expiry fires and the connection
+   * is still broken, we try again — the state machine will not re-notify us,
+   * because a connection that stays 'failed' emits no further state change.
+   */
+  private requestIceRestart(): void {
+    if (this.iceRestartInProgress) return;
+
+    if (this.iceRestartAttempts >= WebRTCService.MAX_ICE_RESTARTS) {
+      logger.warn('[WebRTC] ICE restart gave up after', this.iceRestartAttempts, 'attempts');
+      return;
+    }
+
+    this.iceRestartAttempts += 1;
+    this.handlers.onIceRestart?.();
+
+    this.clearIceRestartTimer();
+    this.iceRestartTimer = setTimeout(() => {
+      this.iceRestartTimer = null;
+      this.iceRestartInProgress = false;
+
+      const state = this.peerConnection?.iceConnectionState;
+      if (state === 'failed' || state === 'disconnected') {
+        logger.warn('[WebRTC] ICE restart did not take — retrying');
+        this.requestIceRestart();
+      }
+    }, WebRTCService.ICE_RESTART_TIMEOUT_MS);
+  }
+
+  private clearIceRestartTimer(): void {
+    if (this.iceRestartTimer) {
+      clearTimeout(this.iceRestartTimer);
+      this.iceRestartTimer = null;
+    }
   }
 
   setHandlers(handlers: WebRTCEventHandlers): void {
@@ -1760,7 +1800,9 @@ class WebRTCService {
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];
+    this.clearIceRestartTimer();
     this.iceRestartInProgress = false;
+    this.iceRestartAttempts = 0;
   }
 }
 

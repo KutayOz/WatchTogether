@@ -521,6 +521,15 @@ export class SessionRoom {
   private participants(): Map<string, Attachment> {
     const map = new Map<string, Attachment>();
     for (const ws of this.state.getWebSockets()) {
+      // Live sockets only. getWebSockets keeps handing back a socket that has
+      // been closed until the runtime reaps it, and because this map is keyed by
+      // user, a lingering ghost could shadow the very socket that replaced it —
+      // with whatever it had declared frozen in its attachment. Harmless while
+      // an attachment held nothing but identity; not harmless now that it says
+      // whether the user is sharing their screen. handleDeparture already draws
+      // the line in exactly this place.
+      if (ws.readyState !== WebSocket.READY_STATE_OPEN) continue;
+
       const attachment = ws.deserializeAttachment() as Attachment | null;
       if (attachment) map.set(attachment.userId, attachment);
     }

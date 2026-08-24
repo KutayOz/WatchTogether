@@ -12,12 +12,19 @@ const JITTER_BUFFER_TARGET_MS = 250;
 type UseWebRTCOptions = {
   onIceCandidate: (candidate: string) => void;
   onIceRestart?: () => void;
+  /**
+   * The captured screen ended without going through our stop button — the
+   * browser's own "Stop sharing" bar, most often. Must be stable across
+   * renders: it feeds `initialize`, whose dependencies decide whether the peer
+   * connection is rebuilt.
+   */
+  onScreenShareEnded?: () => void;
 };
 
 export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => void)) {
   // Support both old API (function) and new API (options object)
-  const { onIceCandidate, onIceRestart } = typeof options === 'function'
-    ? { onIceCandidate: options, onIceRestart: undefined }
+  const { onIceCandidate, onIceRestart, onScreenShareEnded } = typeof options === 'function'
+    ? { onIceCandidate: options, onIceRestart: undefined, onScreenShareEnded: undefined }
     : options;
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
@@ -97,6 +104,23 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
           logger.debug(`[WebRTC] Track unmuted: kind=${track.kind} id=${track.id}`);
         });
 
+        // Backstop for a screen share that goes away without the peer saying so.
+        // ScreenShareStopped is still the signal we act on — it is the one that
+        // also clears the sharer's NAME — but nothing used to notice a dead
+        // inbound track at all, so a lost stop frame left the viewer staring at
+        // the last decoded frame with no way to tell it from a still window.
+        //
+        // 'ended' only. NOT 'mute': that fires routinely on brief packet loss,
+        // and a freeze that is really congestion is already scored by
+        // useQualityMonitor rather than treated as the end of the share.
+        track.addEventListener('ended', () => {
+          if (streamId !== remoteScreenStreamIdRef.current) return;
+          logger.warn('[WebRTC] remote screen track ended — clearing the frozen frame');
+          remoteScreenStreamRef.current = null;
+          remoteScreenStreamIdRef.current = null;
+          setRemoteScreenStream(null);
+        });
+
         // Store stream reference
         remoteStreamsRef.current.set(streamId, stream);
 
@@ -144,11 +168,15 @@ export function useWebRTC(options: UseWebRTCOptions | ((candidate: string) => vo
         logger.debug('[useWebRTC] ICE restart requested');
         onIceRestart?.();
       },
+      onScreenShareEnded: () => {
+        logger.debug('[useWebRTC] captured screen ended outside our stop button');
+        onScreenShareEnded?.();
+      },
     };
 
     webrtcService.setHandlers(handlers);
     await webrtcService.initialize(iceConfig);
-  }, [onIceCandidate, onIceRestart]);
+  }, [onIceCandidate, onIceRestart, onScreenShareEnded]);
 
   // Note: refs are updated immediately in onTrack handler, no useEffect needed
 

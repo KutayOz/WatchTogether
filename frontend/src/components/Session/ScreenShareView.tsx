@@ -12,6 +12,8 @@ interface ScreenShareViewProps {
   onRequestShare: () => void;
   canRequestShare: boolean;
   isWaitingForApproval: boolean;
+  /** Give up on a request the peer has not answered. See the waiting chip. */
+  onCancelRequest: () => void;
   isMuted: boolean;
   isCameraOn: boolean;
   isScreenSharing: boolean;
@@ -54,6 +56,7 @@ export function ScreenShareView({
   onRequestShare,
   canRequestShare,
   isWaitingForApproval,
+  onCancelRequest,
   isMuted,
   isCameraOn,
   isScreenSharing,
@@ -469,6 +472,7 @@ export function ScreenShareView({
           onRequestShare={onRequestShare}
           canRequestShare={canRequestShare}
           isWaitingForApproval={isWaitingForApproval}
+          onCancelRequest={onCancelRequest}
         />
       );
     }
@@ -507,19 +511,30 @@ export function ScreenShareView({
               </StickerButton>
             )}
             {isWaitingForApproval && (
-              <div
+              /* A button, not a label. Waiting used to be a dead end: it
+                 disabled every other way back to sharing, so a request the peer
+                 never answered could only be escaped by leaving the session. */
+              <button
+                type="button"
                 className="hand"
+                onClick={onCancelRequest}
+                title="cancel the request"
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 10,
                   fontSize: 20,
                   color: 'var(--purple)',
+                  background: 'none',
+                  border: 'none',
+                  padding: 0,
+                  cursor: 'pointer',
+                  font: 'inherit',
                 }}
               >
                 <span style={{ animation: 'speakPulse 1.2s ease-in-out infinite' }}>•</span>
-                waiting for approval…
-              </div>
+                waiting for approval… <span style={{ opacity: 0.6 }}>(cancel)</span>
+              </button>
             )}
           </div>
         </div>
@@ -895,6 +910,7 @@ interface PeerLargeViewProps {
   onRequestShare: () => void;
   canRequestShare: boolean;
   isWaitingForApproval: boolean;
+  onCancelRequest: () => void;
 }
 
 function PeerLargeView({
@@ -906,6 +922,7 @@ function PeerLargeView({
   onRequestShare,
   canRequestShare,
   isWaitingForApproval,
+  onCancelRequest,
 }: PeerLargeViewProps) {
   const peerVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -1085,8 +1102,13 @@ function PeerLargeView({
             </StickerButton>
           )}
           {isWaitingForApproval && (
-            <div
+            /* Same as the other waiting chip: clickable, so the user always has
+               a way out of a request nobody answered. */
+            <button
+              type="button"
               className="hand"
+              onClick={onCancelRequest}
+              title="cancel the request"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -1097,11 +1119,13 @@ function PeerLargeView({
                 boxShadow: '3px 3px 0 var(--ink)',
                 fontSize: 18,
                 color: 'var(--purple)',
+                cursor: 'pointer',
+                font: 'inherit',
               }}
             >
               <span style={{ animation: 'speakPulse 1.2s ease-in-out infinite' }}>•</span>
-              waiting for approval…
-            </div>
+              waiting for approval… <span style={{ opacity: 0.6 }}>(cancel)</span>
+            </button>
           )}
         </div>
       </div>
