@@ -64,6 +64,20 @@ async function regularCookie(): Promise<string> {
   return `${AUTH_COOKIE}=${token}`;
 }
 
+/**
+ * The one row a test just filed.
+ *
+ * `noUncheckedIndexedAccess` is on, so every index into a result set is
+ * `T | undefined`. Narrowing here rather than with a `!` at each call site keeps
+ * a miscount failing as a readable sentence instead of a TypeError three lines
+ * later.
+ */
+function only<T>(rows: T[]): T {
+  const [row, ...rest] = rows;
+  if (!row || rest.length > 0) throw new Error(`expected exactly one row, got ${rows.length}`);
+  return row;
+}
+
 /** The queue as root sees it. */
 async function listAsRoot(cookie: string) {
   const response = await request("/api/admin/demo-requests", {}, cookie);
@@ -73,8 +87,7 @@ async function listAsRoot(cookie: string) {
 
 async function fileOne(cookie: string) {
   expect((await submit(APPLICANT)).status).toBe(200);
-  const [row] = await listAsRoot(cookie);
-  return row;
+  return only(await listAsRoot(cookie));
 }
 
 describe("filing a request", () => {
@@ -95,7 +108,7 @@ describe("filing a request", () => {
   it("keeps the address as typed and compares it folded", async () => {
     expect((await submit({ ...APPLICANT, email: "  Ada@Example.COM " })).status).toBe(200);
 
-    const [row] = await listDemoRequests(db);
+    const row = only(await listDemoRequests(db));
     expect(row.email).toBe("Ada@Example.COM");
     expect(row.email_lookup).toBe("ada@example.com");
   });
@@ -156,7 +169,7 @@ describe("reviewing", () => {
     const validated = await request(`/api/invitation/validate/${token}`);
     expect(await validated.json<{ valid: boolean }>()).toMatchObject({ valid: true });
 
-    expect((await listAsRoot(cookie))[0].status).toBe("approved");
+    expect(only(await listAsRoot(cookie)).status).toBe("approved");
   });
 
   it("mints a fresh link if root asks again, since the first is shown once", async () => {
@@ -167,8 +180,9 @@ describe("reviewing", () => {
     const second = await post(`/api/admin/demo-requests/${filed.id}/approve`, {}, cookie);
 
     expect(second.status).toBe(200);
-    const urls = [await first.json<{ inviteUrl: string }>(), await second.json<{ inviteUrl: string }>()];
-    expect(urls[0].inviteUrl).not.toBe(urls[1].inviteUrl);
+    const firstUrl = (await first.json<{ inviteUrl: string }>()).inviteUrl;
+    const secondUrl = (await second.json<{ inviteUrl: string }>()).inviteUrl;
+    expect(secondUrl).not.toBe(firstUrl);
   });
 
   it("records the rejection note and closes the request for good", async () => {
@@ -182,8 +196,10 @@ describe("reviewing", () => {
     );
     expect(rejected.status).toBe(200);
 
-    const [row] = await listDemoRequests(db);
-    expect(row).toMatchObject({ status: "rejected", rejection_reason: "no idea who this is" });
+    expect(only(await listDemoRequests(db))).toMatchObject({
+      status: "rejected",
+      rejection_reason: "no idea who this is",
+    });
 
     expect((await post(`/api/admin/demo-requests/${filed.id}/reject`, {}, cookie)).status).toBe(409);
     expect((await post(`/api/admin/demo-requests/${filed.id}/approve`, {}, cookie)).status).toBe(409);
