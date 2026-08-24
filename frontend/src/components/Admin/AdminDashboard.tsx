@@ -4,23 +4,25 @@ import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { UserTree } from './UserTree';
 import { UserTable } from './UserTable';
+import { DemoRequests } from './DemoRequests';
 import {
   SectionTitle,
   TagSticker,
   ComicPanel,
   BackButton,
 } from '../manga';
-import type { AdminUser, UserTreeResponse } from '../../types';
+import type { AdminDemoRequest, AdminUser, UserTreeResponse } from '../../types';
 
 /**
- * Two tabs, down from four. Invitations and demo requests are gone with email:
- * invites are now a single self-serve link per user, and the demo-request queue
- * had no reviewer flow left once there was nothing to email an applicant.
+ * Three tabs. The invitations tab stays gone — invites are a single self-serve
+ * link per user now, minted from the lobby — but the demo-request queue is back,
+ * on different terms: reviewing it produces an invite link for root to pass on
+ * by hand, where the old flow ended in an email nothing here can send.
  *
  * The Worker also exposes GET /api/admin/audit-log, which nothing here surfaces
- * yet — deletions are recorded, just not shown.
+ * yet — deletions and demo-request decisions are recorded, just not shown.
  */
-type Tab = 'tree' | 'users';
+type Tab = 'tree' | 'users' | 'demo';
 
 export function AdminDashboard() {
   const navigate = useNavigate();
@@ -28,6 +30,7 @@ export function AdminDashboard() {
   const [activeTab, setActiveTab] = useState<Tab>('tree');
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [treeData, setTreeData] = useState<UserTreeResponse | null>(null);
+  const [demoRequests, setDemoRequests] = useState<AdminDemoRequest[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,12 +46,14 @@ export function AdminDashboard() {
     setIsLoading(true);
     setError(null);
     try {
-      const [usersData, treeDataRes] = await Promise.all([
+      const [usersData, treeDataRes, demoData] = await Promise.all([
         api.getAdminUsers(),
         api.getAdminUserTree(),
+        api.getAdminDemoRequests(),
       ]);
       setUsers(usersData);
       setTreeData(treeDataRes);
+      setDemoRequests(demoData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
@@ -124,6 +129,11 @@ export function AdminDashboard() {
           <TabBtn active={activeTab === 'users'} onClick={() => setActiveTab('users')}>
             USERS ({users.length})
           </TabBtn>
+          <TabBtn active={activeTab === 'demo'} onClick={() => setActiveTab('demo')}>
+            {/* The count is the pending ones — a dealt-with request is not a
+                thing anybody needs to be nudged about. */}
+            DEMO REQUESTS ({demoRequests.filter((r) => r.status === 'pending').length})
+          </TabBtn>
         </div>
 
         {/* Content panel */}
@@ -131,6 +141,8 @@ export function AdminDashboard() {
           {activeTab === 'tree' && treeData && <UserTree data={treeData.root} totalUsers={treeData.totalUsers} />}
 
           {activeTab === 'users' && <UserTable users={users} onRefresh={loadData} />}
+
+          {activeTab === 'demo' && <DemoRequests requests={demoRequests} onRefresh={loadData} />}
 
         </ComicPanel>
       </div>

@@ -10,9 +10,11 @@ import { sessionRoutes } from "./routes/session";
 import { invitationRoutes } from "./routes/invitation";
 import { termsRoutes } from "./routes/terms";
 import { adminRoutes } from "./routes/admin";
+import { demoRequestRoutes } from "./routes/demoRequests";
 import { sweepExpired } from "./db/revokedTokens";
 import { returnExpiredTickets } from "./db/invitationLinks";
 import { sweepExpiredResetTokens } from "./db/passwordResets";
+import { sweepReviewedDemoRequests } from "./db/demoRequests";
 
 export { SessionRoom } from "./do/SessionRoom";
 export { AuthChallenge } from "./do/AuthChallenge";
@@ -43,6 +45,9 @@ app.use("/api/auth/passkey/*", rateLimit("RL_AUTH"));
 // Without this /api/auth/* inherits only the 200/min global limit, which is far
 // too loose for the one endpoint in the app where guessing is viable.
 app.use("/api/auth/password/*", rateLimit("RL_PASSWORD"));
+// Exact path, not a prefix: the route is a bare POST to /api/demo-requests, and
+// a "/*" pattern would not match it.
+app.use("/api/demo-requests", rateLimit("RL_DEMO"));
 app.use("/api/invitation/validate/*", rateLimit("RL_LOOKUP"));
 app.use("/api/session/*", rateLimit("RL_LOOKUP"));
 
@@ -55,6 +60,7 @@ app.route("/api/session", sessionRoutes);
 app.route("/api/invitation", invitationRoutes);
 app.route("/api/terms", termsRoutes);
 app.route("/api/admin", adminRoutes);
+app.route("/api/demo-requests", demoRequestRoutes);
 
 export default {
   /**
@@ -71,16 +77,18 @@ export default {
    *
    * D1 has no TTL indexes, so the expiry the Mongo schema got for free is done
    * here: drop deny-list entries for tokens that have expired anyway, return
-   * invite slots held by links nobody used, and clear spent or stale password
-   * reset tickets.
+   * invite slots held by links nobody used, clear spent or stale password
+   * reset tickets, and drop demo requests dealt with long enough ago to be
+   * history. Pending requests are never swept — see db/demoRequests.ts.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     const revoked = await sweepExpired(env.DB);
     const tickets = await returnExpiredTickets(env.DB);
     const resets = await sweepExpiredResetTokens(env.DB);
+    const demos = await sweepReviewedDemoRequests(env.DB);
     console.log(
       `[cron] swept ${revoked} revoked tokens, returned ${tickets} invite tickets, ` +
-        `cleared ${resets} reset tickets`,
+        `cleared ${resets} reset tickets, dropped ${demos} reviewed demo requests`,
     );
   },
 } satisfies ExportedHandler<Env>;

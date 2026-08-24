@@ -15,7 +15,12 @@ import type { AppEnv } from "./auth";
  * distributed attacker gets the limit multiplied by the number of colos they
  * reach. For a private two-person app that is an acceptable trade.
  */
-export type RateLimitName = "RL_GLOBAL" | "RL_AUTH" | "RL_LOOKUP" | "RL_PASSWORD";
+export type RateLimitName =
+  | "RL_GLOBAL"
+  | "RL_AUTH"
+  | "RL_LOOKUP"
+  | "RL_PASSWORD"
+  | "RL_DEMO";
 
 /**
  * Client IP.

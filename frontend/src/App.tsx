@@ -31,6 +31,7 @@ import { ScreentoneDefs } from './components/manga';
 const Login = lazy(() => import('./components/Login/Login').then((m) => ({ default: m.Login })));
 const InviteSignup = lazy(() => import('./components/Auth/InviteSignup').then((m) => ({ default: m.InviteSignup })));
 const PasswordReset = lazy(() => import('./components/Auth/PasswordReset').then((m) => ({ default: m.PasswordReset })));
+const RequestDemo = lazy(() => import('./components/Auth/RequestDemo').then((m) => ({ default: m.RequestDemo })));
 const Lobby = lazy(() => import('./components/Lobby/Lobby').then((m) => ({ default: m.Lobby })));
 const SessionRoom = lazy(() => import('./components/Session/SessionRoom').then((m) => ({ default: m.SessionRoom })));
 const JoinSession = lazy(() => import('./components/Session/JoinSession').then((m) => ({ default: m.JoinSession })));
@@ -150,7 +151,9 @@ function AppRoutes() {
       {/* The only way to create an account. /register, /verify-email and
           /check-email are gone with email — passwords came back but the
           verification machinery did not, since there is no address to verify.
-          Any stale bookmark falls through to the catch-all below. */}
+          Any stale bookmark falls through to the catch-all below.
+          /request-demo below leads here eventually, but only via root: it files
+          a request, it does not mint anything. */}
       <Route path="/invite/:token" element={<InviteSignup />} />
 
       {/* Password recovery, such as it is: root mints the link by hand and
@@ -164,6 +167,19 @@ function AppRoutes() {
         element={
           <PublicRoute>
             <Login />
+          </PublicRoute>
+        }
+      />
+
+      {/* Asking for an invite, for people who have nobody to ask. Public in the
+          same sense /login is: behind PublicRoute, so a signed-in user who
+          follows an old link is sent to the lobby rather than shown a form
+          that would file a request for an account they already have. */}
+      <Route
+        path="/request-demo"
+        element={
+          <PublicRoute>
+            <RequestDemo />
           </PublicRoute>
         }
       />
