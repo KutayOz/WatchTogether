@@ -899,3 +899,139 @@ describe('webrtcService ice diagnostics', () => {
     expect(text).toContain('req=9 resp=0');
   });
 });
+
+describe('ending a share', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    pc = await freshService();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /*
+   * Clicking the browser's own "Stop sharing" bar is the most common way a
+   * share ends, and it used to be the one way that told nobody.
+   *
+   * The track's onended handler tore the share down inside this service, which
+   * skipped the app's stop path entirely: no ss:stop reached the peer, no
+   * renegotiation followed the removed tracks, and React still believed it was
+   * sharing. The viewer kept the last decoded frame on screen forever and, being
+   * convinced a share was still running, silently refused every later request —
+   * so one click on a browser button cost the whole session.
+   */
+  it('reports a share that ended on its own instead of tearing it down', async () => {
+    const onScreenShareEnded = vi.fn();
+    webrtcService.setHandlers({ onScreenShareEnded });
+
+    const stream = screenStream();
+    await webrtcService.addScreenShareTracks(stream as unknown as MediaStream, POINT);
+
+    stream.getVideoTracks()[0]!.onended!();
+
+    expect(onScreenShareEnded).toHaveBeenCalledTimes(1);
+    // Still holding the share. The caller stops it, through the same path the
+    // in-app button uses, so both endings tell the peer.
+    expect(webrtcService.getScreenStreamId()).toBe('screen-stream');
+    expect(senderFor(pc, 'scr-v').track).not.toBeNull();
+  });
+
+  it('leaves no live peer connection behind when the session is rebuilt', async () => {
+    const first = pc;
+
+    // Rejoining — the TRY AGAIN path, a second trip through preflight — used to
+    // overwrite the reference and strand this one, ICE agent and encoders still
+    // running, for the lifetime of the tab.
+    await freshService();
+
+    expect(first.closed).toBe(true);
+  });
+});
+
+describe('ICE restart', () => {
+  let pc: FakePeerConnection;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    pc = await freshService();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** Drive the event the way the browser would, for a state that has changed. */
+  function iceStateBecomes(state: RTCIceConnectionState) {
+    pc.iceConnectionState = state;
+    pc.oniceconnectionstatechange?.();
+  }
+
+  it('does not stack restarts while one is still in flight', async () => {
+    const onIceRestart = vi.fn(() => void webrtcService.createIceRestartOffer());
+    webrtcService.setHandlers({ onIceRestart });
+
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onIceRestart).toHaveBeenCalledTimes(1);
+
+    // A second failure moments later is the same failure.
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onIceRestart).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+   * The in-progress flag used to clear only on 'connected'.
+   *
+   * That is fine when the restart works and a latch when it does not: the offer
+   * can be lost in transit or dropped by the peer's glare guard, and from then
+   * on no further restart was ever attempted for the life of the connection.
+   * Whatever froze the picture stayed frozen, and the session had to be
+   * abandoned to get a working one.
+   */
+  it('tries again when a restart never lands', async () => {
+    const onIceRestart = vi.fn(() => void webrtcService.createIceRestartOffer());
+    webrtcService.setHandlers({ onIceRestart });
+
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onIceRestart).toHaveBeenCalledTimes(1);
+
+    // Nothing came of it, and a connection that stays failed emits no further
+    // state change — so the retry has to come from the timer, not the event.
+    await vi.advanceTimersByTimeAsync(12_001);
+    expect(onIceRestart).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops retrying rather than restarting forever', async () => {
+    const onIceRestart = vi.fn(() => void webrtcService.createIceRestartOffer());
+    webrtcService.setHandlers({ onIceRestart });
+
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // Three attempts, then the connection is left to the UI's 'lost' state.
+    expect(onIceRestart).toHaveBeenCalledTimes(3);
+  });
+
+  it('forgets the attempts once the connection comes back', async () => {
+    const onIceRestart = vi.fn(() => void webrtcService.createIceRestartOffer());
+    webrtcService.setHandlers({ onIceRestart });
+
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(0);
+    iceStateBecomes('connected');
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The recovered connection must start from a clean allowance, or a session
+    // that flapped three times early would have none left when it mattered.
+    expect(onIceRestart).toHaveBeenCalledTimes(1);
+
+    iceStateBecomes('failed');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onIceRestart).toHaveBeenCalledTimes(2);
+  });
+});

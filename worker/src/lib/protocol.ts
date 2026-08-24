@@ -142,7 +142,16 @@ export interface JoinedPayload {
 export type ServerMessage =
   | Envelope<"Joined", JoinedPayload>
   | Envelope<"PeerJoined", { name: string }>
-  | Envelope<"ExistingPeer", { name: string }>
+  /**
+   * Someone who was already here when we walked in.
+   *
+   * `sharing` carries their screen-share stream id, or null, because the room
+   * is the only party that knows it: a client's own record of who is sharing is
+   * a copy of the other side's state, and a copy that missed one frame stays
+   * wrong for the rest of the session with nothing to correct it. Sent on every
+   * join, so a reconnect is also a resync.
+   */
+  | Envelope<"ExistingPeer", { name: string; sharing: string | null }>
   | Envelope<"PeerLeft", { name: string }>
   | Envelope<"PeerReconnected", { name: string }>
   | Envelope<"ReceiveOffer", { sdp: string; name: string }>
