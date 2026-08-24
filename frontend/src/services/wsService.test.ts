@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeWebSocket } from './testDoubles';
+import { logger } from './logger';
 import { wsService } from './wsService';
 import {
   CLOSE_REPLACED,
@@ -347,6 +348,84 @@ describe('wsService', () => {
       const { socket: fresh } = await join();
       expect(FakeWebSocket.instances.length).toBe(opened + 1);
       expect(fresh.sent).toEqual([]);
+    });
+  });
+
+  /*
+   * The socket goes quiet for minutes at a time during a settled call —
+   * presence and quality ride the DataChannel, chat is sporadic — and a
+   * half-open socket keeps readyState at OPEN, so every send lands in a void
+   * that reports nothing back. A screen-share request lost that way left the
+   * asker waiting on a peer who was never told anything.
+   */
+  describe('keepalive', () => {
+    it('pings the room once the socket has gone quiet', async () => {
+      wsService.setHandlers({});
+      const { socket } = await join();
+
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      // The bare string, not an envelope: the room answers it from its
+      // auto-responder, which costs no Durable Object request at all.
+      expect(socket.sent).toContain('ping');
+    });
+
+    it('keeps a socket that answers', async () => {
+      const onReconnecting = vi.fn();
+      wsService.setHandlers({ onReconnecting });
+      const { socket } = await join();
+
+      // Land on each interval, answer it, then step past it. Answering has to
+      // happen inside the 10 s the ping is given, which is the whole contract.
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(25_000);
+        socket.receiveRaw('pong');
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+
+      expect(socket.readyState).toBe(FakeWebSocket.OPEN);
+      expect(onReconnecting).not.toHaveBeenCalled();
+    });
+
+    it('does not mistake a pong for a malformed frame', async () => {
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      wsService.setHandlers({});
+      const { socket } = await join();
+
+      socket.receiveRaw('pong');
+
+      // It is not JSON, so parsing it first would log this every 25 seconds for
+      // the life of every call.
+      expect(warn).not.toHaveBeenCalledWith('[ws] dropped unparseable frame');
+    });
+
+    it('abandons a socket that only looks open, and reconnects', async () => {
+      const onReconnecting = vi.fn();
+      wsService.setHandlers({ onReconnecting });
+      const { socket } = await join();
+
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(socket.sent).toContain('ping');
+
+      // Nothing comes back. Closing is the recovery: it is a local close, so it
+      // fires onclose even though the wire is dead, and that lands in the
+      // ordinary reconnect ladder.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+      expect(onReconnecting).toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+    });
+
+    it('stops pinging a socket the caller left', async () => {
+      wsService.setHandlers({});
+      const { socket } = await join();
+
+      wsService.leave();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(socket.sent).not.toContain('ping');
     });
   });
 

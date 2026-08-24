@@ -246,6 +246,18 @@ export type WebRTCEventHandlers = {
   onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
   onNegotiationNeeded?: () => void;
   onIceRestart?: () => void;
+  /**
+   * The captured screen ended on its own — the browser's "Stop sharing" bar,
+   * the shared window closing, a capture pipeline that died.
+   *
+   * A notification, NOT a teardown: this service deliberately does not stop the
+   * share itself here. Stopping it here is what the code used to do, and it
+   * meant the app's own stop path never ran — no ss:stop on the wire, no
+   * renegotiation, and React still holding isScreenSharing true. The peer was
+   * left watching a frozen final frame and refusing every later request, which
+   * is how one click on the browser's own button cost the whole session.
+   */
+  onScreenShareEnded?: () => void;
 };
 
 class WebRTCService {
@@ -307,10 +319,27 @@ class WebRTCService {
   private hasRemoteDescription = false;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private iceRestartInProgress = false;
+  /** Disarms iceRestartInProgress if the restart never lands. See armIceRestart. */
+  private iceRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private iceRestartAttempts = 0;
   // Perfect-negotiation: true only while we're building/applying our own offer.
   // Combined with signalingState, lets the receive side detect offer glare.
   private makingOffer = false;
   private static readonly DISCONNECT_TIMEOUT_MS = 5000; // 5 seconds before ICE restart
+  /**
+   * How long an ICE restart has to produce a connection before we conclude it
+   * did not happen.
+   *
+   * iceRestartInProgress exists to stop us stacking restarts on top of each
+   * other, and it used to clear only on 'connected'. That is fine when the
+   * restart works and a latch when it does not: the offer can be lost in transit
+   * or dropped by the peer's glare guard, and from then on the flag was true
+   * forever and no further restart was ever attempted for the life of the
+   * connection. Whatever froze the picture stayed frozen.
+   */
+  private static readonly ICE_RESTART_TIMEOUT_MS = 12_000;
+  /** Restarts to try before leaving the connection to the UI's 'lost' state. */
+  private static readonly MAX_ICE_RESTARTS = 3;
 
   async initialize(iceConfig: IceServerConfig): Promise<void> {
     // Retained so getIceDiagnostics can answer "was a UDP TURN URL even
@@ -331,6 +360,19 @@ class WebRTCService {
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
     };
+
+    // Close whatever was here first. Rejoining — the TRY AGAIN path, a second
+    // preflight — used to overwrite this reference and orphan a live
+    // RTCPeerConnection, ICE agent and encoders still running, for the lifetime
+    // of the tab. dataChannelService.attach has always detached first; this did
+    // not.
+    if (this.peerConnection) {
+      try {
+        this.peerConnection.close();
+      } catch {
+        // Already closed.
+      }
+    }
 
     this.peerConnection = new RTCPeerConnection(config);
     this.hasRemoteDescription = false;
@@ -386,21 +428,61 @@ class WebRTCService {
       if (state === 'disconnected') {
         // Start timer for ICE restart if disconnection persists
         this.disconnectTimer = setTimeout(() => {
-          if (this.peerConnection?.iceConnectionState === 'disconnected' && !this.iceRestartInProgress) {
+          if (this.peerConnection?.iceConnectionState === 'disconnected') {
             logger.debug('[WebRTC Service] Prolonged disconnection detected, requesting ICE restart');
-            this.handlers.onIceRestart?.();
+            this.requestIceRestart();
           }
         }, WebRTCService.DISCONNECT_TIMEOUT_MS);
       } else if (state === 'failed') {
         // Immediately request ICE restart on failure
-        if (!this.iceRestartInProgress) {
-          logger.debug('[WebRTC Service] Connection failed, requesting ICE restart');
-          this.handlers.onIceRestart?.();
-        }
+        logger.debug('[WebRTC Service] Connection failed, requesting ICE restart');
+        this.requestIceRestart();
       } else if (state === 'connected' || state === 'completed') {
+        this.clearIceRestartTimer();
         this.iceRestartInProgress = false;
+        this.iceRestartAttempts = 0;
       }
     };
+  }
+
+  /**
+   * Ask for one ICE restart, and make sure another one is still possible.
+   *
+   * The in-progress flag is the only thing keeping restarts from stacking, so
+   * it has to be armed with an expiry rather than trusted to be cleared by a
+   * 'connected' that may never arrive. When the expiry fires and the connection
+   * is still broken, we try again — the state machine will not re-notify us,
+   * because a connection that stays 'failed' emits no further state change.
+   */
+  private requestIceRestart(): void {
+    if (this.iceRestartInProgress) return;
+
+    if (this.iceRestartAttempts >= WebRTCService.MAX_ICE_RESTARTS) {
+      logger.warn('[WebRTC] ICE restart gave up after', this.iceRestartAttempts, 'attempts');
+      return;
+    }
+
+    this.iceRestartAttempts += 1;
+    this.handlers.onIceRestart?.();
+
+    this.clearIceRestartTimer();
+    this.iceRestartTimer = setTimeout(() => {
+      this.iceRestartTimer = null;
+      this.iceRestartInProgress = false;
+
+      const state = this.peerConnection?.iceConnectionState;
+      if (state === 'failed' || state === 'disconnected') {
+        logger.warn('[WebRTC] ICE restart did not take — retrying');
+        this.requestIceRestart();
+      }
+    }, WebRTCService.ICE_RESTART_TIMEOUT_MS);
+  }
+
+  private clearIceRestartTimer(): void {
+    if (this.iceRestartTimer) {
+      clearTimeout(this.iceRestartTimer);
+      this.iceRestartTimer = null;
+    }
   }
 
   setHandlers(handlers: WebRTCEventHandlers): void {
@@ -971,8 +1053,11 @@ class WebRTCService {
 
       const videoTrack = this.screenStream.getVideoTracks()[0];
       if (videoTrack) {
+        // Hand it up rather than tearing down here — see onScreenShareEnded.
+        // The caller routes it into the same stop path the in-app button uses,
+        // so both endings tell the peer and both leave one consistent state.
         videoTrack.onended = () => {
-          this.stopScreenShare();
+          this.handlers.onScreenShareEnded?.();
         };
       }
     } catch (err) {
@@ -1715,7 +1800,9 @@ class WebRTCService {
     this.peerConnection = null;
     this.hasRemoteDescription = false;
     this.pendingIceCandidates = [];
+    this.clearIceRestartTimer();
     this.iceRestartInProgress = false;
+    this.iceRestartAttempts = 0;
   }
 }
 
