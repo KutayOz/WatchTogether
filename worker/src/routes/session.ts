@@ -3,6 +3,7 @@ import type { AppEnv } from "../middleware/auth";
 import { requireAuth } from "../middleware/auth";
 import { getIceServers } from "../lib/ice";
 import { buildInviteToken, newSessionId, parseInviteToken } from "../lib/sessionId";
+import { isWebSocketUpgrade } from "../lib/upgrade";
 
 export const sessionRoutes = new Hono<AppEnv>();
 
@@ -111,10 +112,22 @@ sessionRoutes.post("/invite/:token/join", requireAuth, async (c) => {
  * spinning up an object per connection. The verified identity is passed on as
  * internal headers, which are safe because the Durable Object is not
  * addressable from outside this Worker.
+ *
+ * The refusals below stay plain HTTP responses on purpose. A browser cannot
+ * read them, but it never sees them either: asUpgradeClose in index.ts converts
+ * any non-101 answer to an upgrade request into a close code the client can act
+ * on. Doing it at the boundary rather than here means the rate limiters and the
+ * onError 500 are covered by the same mechanism, and a caller that is not a
+ * browser — curl, an uptime check — still gets a readable status.
  */
 sessionRoutes.get("/ws/:sessionId", async (c) => {
-  if (c.req.header("Upgrade") !== "websocket") {
-    return c.json({ message: "Expected a WebSocket upgrade." }, 426);
+  if (!isWebSocketUpgrade(c.req.raw)) {
+    // Not an upgrade at all, so there is no socket to close and nothing for the
+    // boundary to convert. RFC 7231 6.5.15 wants the protocol we expect named.
+    return c.json({ message: "Expected a WebSocket upgrade." }, 426, {
+      Upgrade: "websocket",
+      Connection: "Upgrade",
+    });
   }
 
   const user = c.get("user");

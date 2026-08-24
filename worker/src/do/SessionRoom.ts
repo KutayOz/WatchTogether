@@ -14,6 +14,7 @@ import {
   type ServerMessage,
 } from "../lib/protocol";
 import { sha256Hex, randomToken } from "../lib/crypto";
+import { rejectedUpgrade } from "../lib/upgrade";
 
 /** SessionService.cs:22 — how long an emptied session survives before removal. */
 const GRACE_PERIOD_MS = 5 * 60 * 1000;
@@ -198,34 +199,29 @@ export class SessionRoom {
     const userId = request.headers.get("X-WT-User-Id");
     const username = request.headers.get("X-WT-Username");
 
-    const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
+    // Accept then close: a browser cannot read a body from a rejected upgrade,
+    // so a close code is the only channel for the reason. acceptWebSocket, not
+    // socket.accept — this is the hibernation manager's registration.
+    const refuse = (code: number) =>
+      rejectedUpgrade(code, (socket) => this.state.acceptWebSocket(socket));
 
-    if (!userId || !username) {
-      // Accept then close: a browser cannot read a body from a rejected
-      // upgrade, so a close code is the only channel for the reason.
-      this.state.acceptWebSocket(server);
-      server.close(CLOSE_UNAUTHORIZED, "unauthorized");
-      return new Response(null, { status: 101, webSocket: client });
-    }
+    // Unreachable in practice: the Worker refuses an identity-less upgrade
+    // before it gets here, and converts its own refusal to the same code. Kept
+    // because this object must not depend on that for its own correctness.
+    if (!userId || !username) return refuse(CLOSE_UNAUTHORIZED);
 
     const meta = await this.getMeta();
-    if (!meta) {
-      this.state.acceptWebSocket(server);
-      server.close(CLOSE_SESSION_NOT_FOUND, "session_not_found");
-      return new Response(null, { status: 101, webSocket: client });
-    }
+    if (!meta) return refuse(CLOSE_SESSION_NOT_FOUND);
 
     // Capacity counts distinct *other* users, not sockets. Counting sockets
     // would let a user's own stale connection lock them out of their own
     // session, and would let two tabs fill a two-person room. Rejoining costs
     // nothing because the joiner is excluded from the tally.
     const others = [...this.participants().keys()].filter((id) => id !== userId);
-    if (others.length >= MAX_PARTICIPANTS) {
-      this.state.acceptWebSocket(server);
-      server.close(CLOSE_SESSION_FULL, "session_full");
-      return new Response(null, { status: 101, webSocket: client });
-    }
+    if (others.length >= MAX_PARTICIPANTS) return refuse(CLOSE_SESSION_FULL);
+
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
 
     // Evict this user's previous sockets. A client that dropped without a
     // clean close leaves a ghost whose webSocketClose has not fired yet;

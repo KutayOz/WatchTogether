@@ -15,6 +15,7 @@ import { sweepExpired } from "./db/revokedTokens";
 import { returnExpiredTickets } from "./db/invitationLinks";
 import { sweepExpiredResetTokens } from "./db/passwordResets";
 import { sweepReviewedDemoRequests } from "./db/demoRequests";
+import { asUpgradeClose } from "./lib/upgrade";
 
 export { SessionRoom } from "./do/SessionRoom";
 export { AuthChallenge } from "./do/AuthChallenge";
@@ -64,12 +65,18 @@ app.route("/api/demo-requests", demoRequestRoutes);
 
 export default {
   /**
-   * Wrapped rather than installed as Hono middleware so that the headers are
+   * Wrapped rather than installed as Hono middleware so that both of these are
    * applied to everything this Worker emits — including responses Hono did not
    * build, such as the onError 500 and whatever a Durable Object hands back.
+   *
+   * asUpgradeClose runs first because it can replace the response entirely:
+   * a refused WebSocket upgrade leaves here as a 101 with a socket that closes
+   * with a reason, not as a JSON body no browser can read. withSecurityHeaders
+   * then passes that 101 through untouched.
    */
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return withSecurityHeaders(await app.fetch(request, env, ctx));
+    const response = await app.fetch(request, env, ctx);
+    return withSecurityHeaders(asUpgradeClose(request, response));
   },
 
   /**

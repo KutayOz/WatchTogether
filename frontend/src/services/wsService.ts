@@ -1,5 +1,8 @@
 import { logger } from './logger';
 import {
+  CLOSE_INTERNAL_ERROR,
+  CLOSE_PAYLOAD_TOO_LARGE,
+  CLOSE_RATE_LIMITED,
   CLOSE_REPLACED,
   CLOSE_SESSION_FULL,
   CLOSE_SESSION_NOT_FOUND,
@@ -76,14 +79,70 @@ const FATAL_CLOSE_CODES = new Set<number>([
   CLOSE_UNAUTHORIZED,
   CLOSE_SESSION_NOT_FOUND,
   CLOSE_SESSION_FULL,
+  CLOSE_PAYLOAD_TOO_LARGE, // we sent something malformed; sending it again changes nothing
+  /*
+   * Fatal, which reads backwards until you see where it comes from: the server
+   * closes with this precisely because something retried too fast. An automatic
+   * ladder against a rate limiter is what produced the limit, so continuing it
+   * is the one response guaranteed not to work. Handing the retry to the user
+   * makes their own patience the backoff.
+   *
+   * Arrives from two places with the same meaning — the room's per-socket flood
+   * guard, and the Worker refusing the upgrade itself.
+   */
+  CLOSE_RATE_LIMITED,
 ]);
 
-const FATAL_MESSAGES: Record<number, string> = {
+/*
+ * User-facing copy per close code.
+ *
+ * Deliberately wider than FATAL_CLOSE_CODES: this is also read on the join
+ * path, where every close is terminal for that attempt whether or not it is
+ * terminal for the session. A code can therefore have a message here and still
+ * be worth reconnecting after.
+ */
+const CLOSE_MESSAGES: Record<number, string> = {
   [CLOSE_REPLACED]: 'This session was opened in another tab.',
   [CLOSE_UNAUTHORIZED]: 'Your session expired — please sign in again.',
   [CLOSE_SESSION_NOT_FOUND]: 'That session has ended.',
   [CLOSE_SESSION_FULL]: 'That session is full.',
+  [CLOSE_PAYLOAD_TOO_LARGE]: 'The connection sent more than the session allows.',
+  [CLOSE_RATE_LIMITED]: 'Too many attempts — wait a moment and try again.',
+  [CLOSE_INTERNAL_ERROR]: 'Something went wrong on our side.',
+  /*
+   * 1006 is the browser's "the handshake never completed" — no status reached
+   * us, so the honest message is about reachability rather than about the
+   * session. Message only: adding 1006 to FATAL_CLOSE_CODES would disable
+   * reconnection outright, since it is the code every ordinary network drop
+   * arrives as.
+   */
+  1006: 'Could not reach the session — check your connection.',
 };
+
+/** Carries the close code past the promise boundary. See handleClose. */
+class WsCloseError extends Error {
+  // Assigned in the body rather than as a parameter property: the frontend
+  // compiles with erasableSyntaxOnly, which forbids the shorthand.
+  readonly code: number;
+
+  constructor(code: number, message: string) {
+    super(message);
+    this.name = 'WsCloseError';
+    this.code = code;
+  }
+}
+
+/**
+ * What to show for a close that ended a join attempt.
+ *
+ * An unmapped code gets its number appended rather than swallowed: it is the
+ * only handle anyone has on a failure nothing anticipated, and it costs one
+ * parenthetical. 1006 is mapped above precisely so the common case does not
+ * take this branch and read like a defect leaking through.
+ */
+function joinFailureMessage(code: number): string {
+  return CLOSE_MESSAGES[code] ?? `Could not join the session. (code ${code})`;
+}
 
 const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 15_000];
 const JOIN_TIMEOUT_MS = 15_000;
@@ -196,7 +255,10 @@ class WsService {
 
         if (!settled) {
           settled = true;
-          reject(new Error(FATAL_MESSAGES[event.code] ?? 'Could not join the session.'));
+          // warn, not debug: logger silences debug and info in production
+          // builds, and this is the one line that says why a join failed.
+          logger.warn(`[ws] join rejected — close ${event.code} ${event.reason}`);
+          reject(new WsCloseError(event.code, joinFailureMessage(event.code)));
           return;
         }
 
@@ -210,7 +272,10 @@ class WsService {
 
     if (FATAL_CLOSE_CODES.has(code)) {
       this.queue = [];
-      this.handlers.onFatal?.(FATAL_MESSAGES[code] ?? 'Lost connection to the session.');
+      // warn rather than debug: a session ending for good is the one close
+      // worth having in a production log.
+      logger.warn(`[ws] closed for good (${code})`);
+      this.handlers.onFatal?.(CLOSE_MESSAGES[code] ?? 'Lost connection to the session.');
       return;
     }
 
@@ -234,8 +299,11 @@ class WsService {
         (err: unknown) => {
           logger.warn('[ws] reconnect attempt failed:', err);
           // A rejected reopen never reached onclose, so drive the next attempt
-          // from here or the retry chain stops silently.
-          this.handleClose(1006);
+          // from here or the retry chain stops silently. The code has to come
+          // off the error: substituting a literal 1006 here meant a reconnect
+          // refused as rate-limited, full or unauthorized never consulted
+          // FATAL_CLOSE_CODES at all, and retried forever.
+          this.handleClose(err instanceof WsCloseError ? err.code : 1006);
         },
       );
     }, delay);
