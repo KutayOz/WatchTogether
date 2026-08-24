@@ -64,6 +64,13 @@ export const CLOSE_SESSION_NOT_FOUND = 4004;
 export const CLOSE_SESSION_FULL = 4009;
 export const CLOSE_PAYLOAD_TOO_LARGE = 4013;
 export const CLOSE_RATE_LIMITED = 4029;
+/**
+ * Anything the Worker refused for a reason the client cannot act on. Exists so
+ * the boundary in index.ts always has a code to close with; without it an
+ * unmapped status would fall through to 1006, which is exactly the silence
+ * this whole mechanism is meant to end.
+ */
+export const CLOSE_INTERNAL_ERROR = 4500;
 
 export const CLOSE_REASONS: Record<number, string> = {
   [CLOSE_REPLACED]: "replaced",
@@ -72,6 +79,7 @@ export const CLOSE_REASONS: Record<number, string> = {
   [CLOSE_SESSION_FULL]: "session_full",
   [CLOSE_PAYLOAD_TOO_LARGE]: "payload_too_large",
   [CLOSE_RATE_LIMITED]: "rate_limited",
+  [CLOSE_INTERNAL_ERROR]: "internal_error",
 };
 
 // ---------------------------------------------------------------------------

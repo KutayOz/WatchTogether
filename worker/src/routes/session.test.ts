@@ -7,6 +7,10 @@ import { AUTH_COOKIE } from "../lib/cookies";
 import { buildInviteToken, parseInviteToken } from "../lib/sessionId";
 import { createInvitationLink } from "../db/invitationLinks";
 import { createUser } from "../db/users";
+import {
+  CLOSE_RATE_LIMITED,
+  CLOSE_UNAUTHORIZED,
+} from "../lib/protocol";
 
 const ORIGIN = env.RP_ORIGIN;
 const RP_ID = env.RP_ID;
@@ -171,21 +175,82 @@ describe("session invites", () => {
 });
 
 describe("websocket upgrade", () => {
-  it("refuses an unauthenticated upgrade before reaching the durable object", async () => {
-    const response = await SELF.fetch(`${ORIGIN}/api/session/ws/anysession`, {
-      headers: { Upgrade: "websocket" },
+  /**
+   * Read the close code a refused upgrade delivers.
+   *
+   * Every Worker-layer refusal answers 101 and then closes, because a browser
+   * cannot read a status or a body from a rejected upgrade — the close code is
+   * the only channel it has. Asserting on the code is therefore asserting on
+   * what the user actually ends up seeing.
+   */
+  async function closeCodeOf(response: Response): Promise<number> {
+    expect(response.status).toBe(101);
+    const ws = response.webSocket!;
+    const closes: number[] = [];
+    ws.addEventListener("close", (event) => {
+      closes.push(event.code);
     });
+    ws.accept();
+
+    for (let i = 0; i < 50 && closes.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return closes[0]!;
+  }
+
+  const upgrade = (path: string, cookie?: string, value = "websocket") =>
+    request(path, { headers: { Upgrade: value } }, cookie);
+
+  it("refuses an unauthenticated upgrade before reaching the durable object", async () => {
+    const response = await upgrade("/api/session/ws/anysession");
 
     // Rejecting in the Worker means a flood costs one Worker request rather
-    // than spinning up a Durable Object per connection.
-    expect(response.status).toBe(401);
+    // than spinning up a Durable Object per connection. It still has to say so
+    // in a close code: a plain 401 reaches the browser as 1006 and surfaces to
+    // the user as "Could not join the session.", which names nothing.
+    expect(await closeCodeOf(response)).toBe(CLOSE_UNAUTHORIZED);
+  });
+
+  it("refuses a rate-limited upgrade with a code the client can act on", async () => {
+    const cookie = await signedInUser("floodws");
+
+    // RL_LOOKUP is 60/min and /api/session/* shares one bucket, so the burst
+    // has to be long enough to cross it. Sockets are closed as we go rather
+    // than accumulated.
+    let limited: number | null = null;
+    for (let attempt = 0; attempt < 120 && limited === null; attempt++) {
+      const response = await upgrade("/api/session/ws/anysession", cookie);
+      const code = await closeCodeOf(response);
+      if (code === CLOSE_RATE_LIMITED) limited = code;
+    }
+
+    expect(limited).toBe(CLOSE_RATE_LIMITED);
+  });
+
+  it("treats the Upgrade token as case-insensitive, as RFC 6455 does", async () => {
+    const cookie = await signedInUser("mixedcase");
+    const { sessionId } = await (await post("/api/session/create", {}, cookie)).json<{
+      sessionId: string;
+    }>();
+
+    // An exact comparison here used to 426 a well-formed handshake, and the 426
+    // reached the user as the same contentless failure as everything else.
+    const response = await upgrade(`/api/session/ws/${sessionId}`, cookie, "WebSocket");
+
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBeTruthy();
+    response.webSocket!.accept();
+    response.webSocket!.close();
   });
 
   it("refuses a plain GET that is not an upgrade", async () => {
     const cookie = await signedInUser("notupgrade");
     const response = await request("/api/session/ws/anysession", {}, cookie);
 
+    // No upgrade was asked for, so there is no socket to close — this one stays
+    // a readable status, and names the protocol it wanted.
     expect(response.status).toBe(426);
+    expect(response.headers.get("Upgrade")).toBe("websocket");
   });
 
   it("connects an authenticated user and announces them as the offerer", async () => {
