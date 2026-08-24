@@ -297,6 +297,94 @@ describe("relay semantics", () => {
   });
 });
 
+describe("screen-share state", () => {
+  /*
+   * The room records who is sharing, and every joiner is told.
+   *
+   * It relays the other two share frames and forgets them, but ss:start and
+   * ss:stop are different in kind: they are the only ones whose effect outlives
+   * the moment they arrive. Leaving them to the clients meant each side kept a
+   * private copy of the other's state that nothing could ever correct — a stop
+   * lost to a dropped socket left the viewer convinced a share was still
+   * running, and from then on it refused every request that peer made, forever.
+   */
+  it("tells a joiner that the peer is already sharing", async () => {
+    const { stub } = await createSession("creator");
+    const creator = await connect(stub, "creator", "Kutay");
+    await creator.waitFor("Joined");
+
+    send(creator, "ss:start", { streamId: "stream-abc" });
+    await settle();
+
+    const guest = await connect(stub, "guest", "Ada");
+    expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({
+      name: "Kutay",
+      sharing: "stream-abc",
+    });
+  });
+
+  it("reports no share when the peer never started one", async () => {
+    const { stub } = await createSession("creator");
+    const creator = await connect(stub, "creator", "Kutay");
+    await creator.waitFor("Joined");
+
+    const guest = await connect(stub, "guest", "Ada");
+    expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({
+      name: "Kutay",
+      sharing: null,
+    });
+  });
+
+  it("forgets the share once it is stopped", async () => {
+    const { stub } = await createSession("creator");
+    const creator = await connect(stub, "creator", "Kutay");
+    await creator.waitFor("Joined");
+
+    send(creator, "ss:start", { streamId: "stream-abc" });
+    await settle();
+    send(creator, "ss:stop", {});
+    await settle();
+
+    const guest = await connect(stub, "guest", "Ada");
+    expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({ sharing: null });
+  });
+
+  it("starts a reconnecting sharer's new socket with nothing declared", async () => {
+    const { stub } = await createSession("creator");
+    const creator = await connect(stub, "creator", "Kutay");
+    await creator.waitFor("Joined");
+    send(creator, "ss:start", { streamId: "stream-abc" });
+    await settle();
+
+    // Same user, new socket — the flap the client recovers from by re-declaring.
+    // The room must not carry the old socket's claim forward: after a reload the
+    // share is genuinely gone, and only the client knows which of the two it is.
+    const rejoined = await connect(stub, "creator", "Kutay");
+    await rejoined.waitFor("Joined");
+    await settle();
+
+    const guest = await connect(stub, "guest", "Ada");
+    expect((await guest.waitFor("ExistingPeer")).d).toMatchObject({ sharing: null });
+  });
+
+  it("keeps the sharer's own declaration off their own ExistingPeer list", async () => {
+    const { stub } = await createSession("creator");
+    const creator = await connect(stub, "creator", "Kutay");
+    await creator.waitFor("Joined");
+    const guest = await connect(stub, "guest", "Ada");
+    await guest.waitFor("Joined");
+    await settle();
+
+    send(guest, "ss:start", { streamId: "guest-stream" });
+    await settle();
+
+    // A third socket for the creator sees the guest sharing, not itself.
+    const rejoined = await connect(stub, "creator", "Kutay");
+    const existing = await rejoined.waitFor("ExistingPeer");
+    expect(existing.d).toMatchObject({ name: "Ada", sharing: "guest-stream" });
+  });
+});
+
 describe("input guards", () => {
   it("closes a socket that sends an oversized frame", async () => {
     const { stub } = await createSession("creator");
@@ -315,7 +403,7 @@ describe("input guards", () => {
     ["an over-cap chat message", "chat", { m: "m".repeat(5_001) }],
     ["a malformed media state", "media", { isMuted: "yes" }],
     ["an unknown verb", "definitely-not-a-verb", {}],
-  ])("silently drops %s", async (_label, type, payload) => {
+  ])("drops %s, and tells the sender why", async (_label, type, payload) => {
     const { stub } = await createSession("creator");
     const creator = await connect(stub, "creator", "Kutay");
     await creator.waitFor("Joined");
@@ -324,12 +412,18 @@ describe("input guards", () => {
     await settle();
 
     const before = guest.received.length;
+    const senderBefore = creator.received.length;
     send(creator, type, payload);
     await settle();
 
-    // Dropped without an error frame and without closing, matching the hub.
+    // Never relayed, and never fatal.
     expect(guest.received.length).toBe(before);
     expect(creator.closes).toHaveLength(0);
+
+    // But not silent any more. An over-cap SDP was the case that mattered: the
+    // sharer believed it had renegotiated while the viewer's picture froze on a
+    // connection both ends reported as healthy, and nothing anywhere said why.
+    expect(creator.received.slice(senderBefore).map((m) => m.t)).toContain("Error");
   });
 
   it("survives a non-JSON frame", async () => {

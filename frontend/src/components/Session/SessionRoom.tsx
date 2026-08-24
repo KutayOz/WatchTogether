@@ -108,6 +108,15 @@ export function SessionRoom() {
   const [isJoining, setIsJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isWaitingForApproval, setIsWaitingForApproval] = useState(false);
+  /**
+   * How long to wait on a peer's answer before giving the button back.
+   *
+   * Generous, because the peer is a person reading a modal — but finite,
+   * because the alternative is what this fixes: an unanswered request disabled
+   * every path back to sharing, in every surface, with no cancel and no expiry,
+   * and the session had to be abandoned.
+   */
+  const SCREEN_SHARE_REQUEST_TIMEOUT_MS = 30_000;
   const [toast, setToast] = useState<{ message: string; type: 'info' | 'error' | 'warning' } | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
@@ -300,9 +309,23 @@ export function SessionRoom() {
     }
   }, []);
 
+  /**
+   * The browser's own "Stop sharing" bar, routed into the app's stop path.
+   *
+   * Through a ref because handleStopScreenShare is defined further down the
+   * component and this callback has to be stable: useWebRTC's initialize lists
+   * it as a dependency, and a fresh function every render would rebuild the
+   * peer connection on every render.
+   */
+  const handleStopScreenShareRef = useRef<(() => Promise<void>) | null>(null);
+  const handleScreenShareEnded = useCallback(() => {
+    void handleStopScreenShareRef.current?.();
+  }, []);
+
   const webrtc = useWebRTC({
     onIceCandidate: handleIceCandidate,
     onIceRestart: handleIceRestart,
+    onScreenShareEnded: handleScreenShareEnded,
   });
 
   useEffect(() => {
@@ -310,7 +333,7 @@ export function SessionRoom() {
   }, [webrtc]);
 
   /**
-   * Offer, and re-announce any screen share we are already running.
+   * Offer.
    *
    * One path for all four ways a peer can appear: they join, we join and find
    * them already there, they refresh, we refresh. Only the offerer acts, so it
@@ -318,7 +341,9 @@ export function SessionRoom() {
    *
    * Media state deliberately does NOT belong here. It used to, and that was a
    * bug: the answering side returns early and so never told the peer whether
-   * its mic was on. sendMediaState covers both roles.
+   * its mic was on. sendMediaState covers both roles — and for the same reason
+   * the screen-share re-announce that used to live here now lives in
+   * declareScreenShareState, which the answering side also reaches.
    */
   const offerToPeer = useCallback(async () => {
     const currentSessionId = sessionIdRef.current;
@@ -327,17 +352,57 @@ export function SessionRoom() {
     try {
       const offer = await webrtc.createOffer();
       await transportRef.current?.sendOffer(currentSessionId, offer);
-
-      if (localScreenStreamIdRef.current) {
-        await transportRef.current?.notifyScreenShareStarted(
-          currentSessionId,
-          localScreenStreamIdRef.current,
-        );
-      }
     } catch (err) {
       logger.error('[transport] Failed to create/send offer:', err);
     }
   }, [webrtc]);
+
+  /**
+   * Abandon a share we asked for and never got an answer to.
+   *
+   * One helper because every way out of "waiting for approval" has to do the
+   * same three things, and the old code did them in only two of the several
+   * places that could reach this state. The capture is the reason it matters:
+   * pendingScreenShareRef holds a LIVE getDisplayMedia stream, so a request
+   * left hanging keeps the operating system's "you are sharing your screen"
+   * indicator lit over a share nobody is watching.
+   */
+  const cancelPendingScreenShare = useCallback((message: string | null) => {
+    const pending = pendingScreenShareRef.current;
+    if (pending) {
+      pending.stream.getTracks().forEach((t) => t.stop());
+      pendingScreenShareRef.current = null;
+    }
+    setIsWaitingForApproval(false);
+    if (message) setToast({ message, type: 'warning' });
+  }, []);
+
+  /**
+   * Say what we are doing with our screen, whether or not that is anything.
+   *
+   * Sent on every event that means "somebody's picture of this room may be out
+   * of date" — we rejoined, they joined, they rejoined. The negative case is
+   * the load-bearing one: a share that ended while the socket was down is a
+   * share the peer still believes in, and only an explicit ss:stop retires it.
+   *
+   * Safe to send from a peer who is not sharing: the receiving side only clears
+   * on a stop whose name matches the sharer it has on record.
+   */
+  const declareScreenShareState = useCallback(async () => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) return;
+
+    try {
+      const streamId = localScreenStreamIdRef.current;
+      if (streamId) {
+        await transportRef.current?.notifyScreenShareStarted(currentSessionId, streamId);
+      } else {
+        await transportRef.current?.stopScreenShare(currentSessionId);
+      }
+    } catch (err) {
+      logger.error('[transport] Failed to declare screen-share state:', err);
+    }
+  }, []);
 
   // Background blur pipeline lives here (after webrtc so cameraTrack is in
   // scope). useBackgroundBlur returns outputTrack === sourceTrack when
@@ -464,17 +529,35 @@ export function SessionRoom() {
       // Deliberately outside offerToPeer, which no-ops for the answering side:
       // the peer needs our badges whether or not we are the one who offers.
       await sendMediaState({ isMuted, isCameraOn });
+      await declareScreenShareState();
     },
-    onExistingPeer: (displayName) => {
+    onExistingPeer: (displayName, sharing) => {
       setPeerHasLeft(false);
       setPeerName(displayName);
       peerNameRef.current = displayName;
+
+      // The room's record, not our memory of it. This is the whole reason the
+      // server tracks it: our own copy could have missed the stop that ended
+      // their last share, and nothing else in the session would ever correct
+      // it — leaving us convinced someone is sharing and silently refusing
+      // every request they make from then on.
+      if (sharing) {
+        setCurrentScreenSharer(displayName);
+        webrtc.setRemoteScreenShareStreamId(sharing);
+      } else if (!localScreenStreamIdRef.current) {
+        // Guarded, because currentScreenSharer may be US. The room reporting
+        // that the OTHER side is not sharing says nothing about our own share.
+        setCurrentScreenSharer(null);
+        webrtc.setRemoteScreenShareStreamId(null);
+      }
+
       // We're the side that just walked in, so nobody has heard our state yet
       // — and the preflight lobby may already have put us in muted /
       // camera-off (see the initial?.micOff handling in joinExistingSession).
       // Without this the peer renders default badges for us until our first
       // in-call toggle.
       void sendMediaState({ isMuted, isCameraOn });
+      void declareScreenShareState();
     },
     // The peer replaced their socket — refresh, tab restore, network flap. The
     // server tells us rather than leaving us to infer it from a PeerLeft that
@@ -491,16 +574,24 @@ export function SessionRoom() {
       // Their reload wiped whatever we last told them, so this is a re-announce
       // rather than an update.
       await sendMediaState({ isMuted, isCameraOn });
+      await declareScreenShareState();
     },
     onReconnecting: () => {
       setToast({ message: 'reconnecting…', type: 'warning' });
     },
     onReconnected: () => {
       setToast({ message: 'back online', type: 'info' });
+      // Our own socket came back. The peer's view of us is as old as the drop,
+      // and ExistingPeer only repairs the direction pointing the other way.
+      void declareScreenShareState();
     },
     onFatal: (reason) => {
       setError(reason);
       setToast({ message: reason, type: 'error' });
+      // Nothing is coming back over this socket, so an outstanding request will
+      // never be answered. Release the capture rather than leave the browser
+      // announcing a share into a dead session.
+      cancelPendingScreenShare(null);
     },
     onPeerLeft: (displayName) => {
       setPeerHasLeft(true);
@@ -520,6 +611,10 @@ export function SessionRoom() {
       setPeerVolume(100);
       setHasScreenAudio(false);
       setScreenAudioVolume(100);
+      // The only person who could have approved is gone. Waiting on them is
+      // waiting forever, and the pending capture is still running.
+      cancelPendingScreenShare('they left before answering your share request');
+      setScreenShareRequest(null);
     },
     onReceiveOffer: async (sdpOffer) => {
       try {
@@ -597,15 +692,49 @@ export function SessionRoom() {
       setPeerMediaState(state);
     },
     onScreenShareRequested: (displayName) => {
-      if (!currentScreenSharer) {
-        setScreenShareRequest({ from: displayName, timestamp: Date.now() });
+      const currentSessionId = sessionIdRef.current;
+      if (!currentSessionId) return;
+
+      // Never fall through without answering. This used to be a bare
+      // `if (!currentScreenSharer)` with no else, and a dropped request sent
+      // nothing back — so the asker sat on "waiting for approval" forever with
+      // every retry path disabled, and the only way out was a new session.
+      if (currentScreenSharer && currentScreenSharer !== displayName) {
+        // Somebody really is sharing, and it is not the person asking — in a
+        // two-person room, us. Say no out loud.
+        void transportRef.current?.respondScreenShare(currentSessionId, false);
+        return;
       }
+
+      if (currentScreenSharer) {
+        // The asker IS the peer we have on record as sharing. They would not be
+        // asking if that were still true, so the record is what is stale — a
+        // stop that never reached us, or a share we pinned at approval that
+        // never started. Trust the request over our own bookkeeping.
+        setCurrentScreenSharer(null);
+        webrtc.setRemoteScreenShareStreamId(null);
+      }
+
+      setScreenShareRequest({ from: displayName, timestamp: Date.now() });
     },
     onScreenShareResponse: async (approved) => {
       setIsWaitingForApproval(false);
 
-      if (approved && sessionIdRef.current && pendingScreenShareRef.current) {
-        const { stream, streamId } = pendingScreenShareRef.current;
+      if (!approved || !sessionIdRef.current || !pendingScreenShareRef.current) {
+        // Says so out loud now. A silent stop was indistinguishable from the
+        // request never having been delivered, which is the failure this whole
+        // change is about.
+        cancelPendingScreenShare(approved ? null : 'screen share request declined');
+        return;
+      }
+
+      const { stream, streamId } = pendingScreenShareRef.current;
+
+      // Wrapped, because a throw partway through used to leave
+      // pendingScreenShareRef set and the capture running — and, worse, leave
+      // the VIEWER pinned to a sharer whose share never started, so every later
+      // request from us was refused by their own stale bookkeeping.
+      try {
         localScreenStreamIdRef.current = streamId;
         // Via the ref, not the render-time value: this callback is registered
         // once and its closure is stale by the time an approval arrives.
@@ -624,11 +753,14 @@ export function SessionRoom() {
         });
 
         pendingScreenShareRef.current = null;
-      } else {
-        if (pendingScreenShareRef.current) {
-          pendingScreenShareRef.current.stream.getTracks().forEach((t) => t.stop());
-          pendingScreenShareRef.current = null;
-        }
+      } catch (err) {
+        logger.error('[Session] Failed to start the approved screen share:', err);
+        localScreenStreamIdRef.current = null;
+        setCurrentScreenSharer(null);
+        // Retract it, so the peer is not left believing in a share that never
+        // reached the wire.
+        await transportRef.current?.stopScreenShare(sessionIdRef.current);
+        cancelPendingScreenShare('could not start the screen share');
       }
     },
     onScreenShareStarted: (displayName, streamId) => {
@@ -660,6 +792,21 @@ export function SessionRoom() {
         const answer = await webrtc.createAnswer();
         if (sessionIdRef.current) {
           await transportRef.current?.sendRenegotiationAnswer(sessionIdRef.current, answer);
+        }
+
+        // The other half of perfect negotiation, which was missing.
+        //
+        // Accepting their offer during a collision rolled OUR pending offer
+        // back, and an answer cannot carry m-lines the offer did not have — so
+        // whatever we were renegotiating for, typically a screen share we had
+        // just added, silently never reached the wire. The textbook design
+        // leans on negotiationneeded firing again to re-offer; that handler is
+        // not registered here, every renegotiation in this file being explicit,
+        // so the re-offer has to be explicit too.
+        if (collision && sessionIdRef.current) {
+          logger.warn('[Renegotiation] re-offering after a polite rollback');
+          const reoffer = await webrtc.createOffer();
+          await transportRef.current?.sendRenegotiationOffer(sessionIdRef.current, reoffer);
         }
       } catch (err) {
         logger.error('[Renegotiation] failed to handle offer:', err);
@@ -1407,12 +1554,33 @@ export function SessionRoom() {
       await transport.requestScreenShare(sessionIdRef.current);
     } catch (err) {
       logger.error('[Session] Screen share error:', err);
-      setIsWaitingForApproval(false);
-      if (pendingScreenShareRef.current) {
-        pendingScreenShareRef.current.stream.getTracks().forEach((t) => t.stop());
-        pendingScreenShareRef.current = null;
-      }
+      // No message: the usual cause is the user dismissing the browser's own
+      // picker, and there is nothing to tell them about a thing they just did.
+      cancelPendingScreenShare(null);
     }
+  };
+
+  /**
+   * Give up on a request the peer never answered.
+   *
+   * The peer is supposed to answer every request now — including a refusal when
+   * they are the one sharing — so reaching this timeout means the frame itself
+   * was lost, or their tab died between the ask and the answer. Either way the
+   * user gets their button back instead of the session.
+   */
+  useEffect(() => {
+    if (!isWaitingForApproval) return;
+
+    const timer = window.setTimeout(() => {
+      cancelPendingScreenShare('no answer to your share request — try again');
+    }, SCREEN_SHARE_REQUEST_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [isWaitingForApproval, cancelPendingScreenShare, SCREEN_SHARE_REQUEST_TIMEOUT_MS]);
+
+  /** The waiting chip is a cancel button; this is what it does. */
+  const handleCancelScreenShareRequest = () => {
+    cancelPendingScreenShare(null);
   };
 
   const handleApproveScreenShare = async () => {
@@ -1453,6 +1621,14 @@ export function SessionRoom() {
       setCurrentScreenSharer(null);
     }
   };
+
+  // Published for handleScreenShareEnded, which is created before this exists.
+  // No dependency array, matching webrtcRef above: handleStopScreenShare is a
+  // fresh closure every render, and the point of the ref is to always hold the
+  // current one. Safe in an effect because nothing reads it during render.
+  useEffect(() => {
+    handleStopScreenShareRef.current = handleStopScreenShare;
+  });
 
   const handleSendMessage = async (message: string) => {
     if (sessionIdRef.current) {
@@ -1902,6 +2078,7 @@ export function SessionRoom() {
               onRequestShare={handleRequestScreenShare}
               canRequestShare={canRequestShare}
               isWaitingForApproval={isWaitingForApproval}
+              onCancelRequest={handleCancelScreenShareRequest}
               isMuted={isMuted}
               isCameraOn={isCameraOn}
               isScreenSharing={webrtc.isScreenSharing}

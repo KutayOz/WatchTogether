@@ -38,6 +38,16 @@ interface Attachment {
   userId: string;
   username: string;
   joinedAt: number;
+  /**
+   * Screen-share stream id this socket last declared, or null.
+   *
+   * Lives in the attachment rather than a field on this class because a field
+   * would not survive hibernation, and hibernation is exactly when a long
+   * screen share is running: the room sleeps through a settled call and would
+   * wake up having forgotten who was sharing. The client declares, the room
+   * records, and every joiner is told — see the ExistingPeer send below.
+   */
+  sharing: string | null;
 }
 
 interface RateBucket {
@@ -243,7 +253,14 @@ export class SessionRoom {
     // The tag is what makes getWebSockets(userId) work above, and it survives
     // hibernation.
     this.state.acceptWebSocket(server, [userId]);
-    server.serializeAttachment({ userId, username, joinedAt: Date.now() } satisfies Attachment);
+    server.serializeAttachment({
+      userId,
+      username,
+      joinedAt: Date.now(),
+      // A fresh socket has declared nothing yet. The client re-declares right
+      // after Joined, so a reconnecting sharer fills this back in immediately.
+      sharing: null,
+    } satisfies Attachment);
 
     if (meta.emptySince !== null) {
       meta.emptySince = null;
@@ -261,7 +278,15 @@ export class SessionRoom {
 
     for (const [otherId, attachment] of this.participants()) {
       if (otherId === userId) continue;
-      server.send(encode({ t: "ExistingPeer", d: { name: attachment.username } }));
+      server.send(
+        encode({
+          t: "ExistingPeer",
+          // ?? null rather than a bare read: a socket accepted before this
+          // field existed deserializes without it, and undefined would reach
+          // the client as a missing key rather than an honest "not sharing".
+          d: { name: attachment.username, sharing: attachment.sharing ?? null },
+        }),
+      );
     }
 
     server.send(
@@ -304,9 +329,23 @@ export class SessionRoom {
     if (!attachment) return;
 
     const message = decodeClientMessage(raw);
-    // Malformed, blank and oversized payloads are dropped without a reply,
-    // matching the hub's silent-discard policy.
-    if (!message) return;
+    // Dropped, but no longer in silence. The payload the decoder actually
+    // refuses in practice is an SDP over MAX_SDP_LENGTH, and a renegotiation
+    // offer vanishing without a word is indistinguishable from one that was
+    // delivered and ignored: the sharer believes it renegotiated, the viewer
+    // keeps decoding a track that is no longer being sent, and the picture
+    // freezes on a connection that reports itself healthy. The error frame does
+    // not repair that, but it puts the reason in the sender's own console.
+    // Cheap to emit and already bounded by the token bucket above.
+    if (!message) {
+      ws.send(
+        encode({
+          t: "Error",
+          d: { code: 400, message: "Frame rejected: malformed, blank, or over a field limit." },
+        }),
+      );
+      return;
+    }
 
     await this.route(ws, attachment, message);
   }
@@ -373,12 +412,17 @@ export class SessionRoom {
           t: "ScreenShareResponse",
           d: { approved: message.d.approved, name: self.username },
         });
+      // ss:start and ss:stop are the two frames the room does not merely relay:
+      // it records them, so a peer who joins or rejoins later can be told the
+      // truth instead of inferring it from frames that may never have arrived.
       case "ss:start":
+        ws.serializeAttachment({ ...self, sharing: message.d.streamId } satisfies Attachment);
         return this.broadcastExcept(ws, {
           t: "ScreenShareStarted",
           d: { name: self.username, streamId: message.d.streamId },
         });
       case "ss:stop":
+        ws.serializeAttachment({ ...self, sharing: null } satisfies Attachment);
         return this.broadcastExcept(ws, {
           t: "ScreenShareStopped",
           d: { name: self.username },
@@ -481,6 +525,15 @@ export class SessionRoom {
   private participants(): Map<string, Attachment> {
     const map = new Map<string, Attachment>();
     for (const ws of this.state.getWebSockets()) {
+      // Live sockets only. getWebSockets keeps handing back a socket that has
+      // been closed until the runtime reaps it, and because this map is keyed by
+      // user, a lingering ghost could shadow the very socket that replaced it —
+      // with whatever it had declared frozen in its attachment. Harmless while
+      // an attachment held nothing but identity; not harmless now that it says
+      // whether the user is sharing their screen. handleDeparture already draws
+      // the line in exactly this place.
+      if (ws.readyState !== WebSocket.READY_STATE_OPEN) continue;
+
       const attachment = ws.deserializeAttachment() as Attachment | null;
       if (attachment) map.set(attachment.userId, attachment);
     }
