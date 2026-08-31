@@ -11,6 +11,7 @@ import { useTransportDiagnostics } from '../../hooks/useTransportDiagnostics';
 import { shouldDowngradeCodec, useSenderHealth } from '../../hooks/useSenderHealth';
 import {
   chooseOperatingPoint,
+  coldStartBudgetBps,
   initialBudgetState,
   minVideoBps,
   nextBudget,
@@ -27,9 +28,11 @@ import {
 import { HEADROOM_SELECT } from '../../hooks/useUplinkEstimate';
 import {
   currentViewerLevel,
+  currentViewerPicture,
   currentViewerViewport,
   initialLadderState,
   nextLadderState,
+  viewerIsStarved,
   viewerIsUnhappy,
   withUserChoice,
   type LadderState,
@@ -262,17 +265,29 @@ export function SessionRoom() {
   }, []);
 
   /**
-   * Budget assumed before the estimator has an opinion.
+   * Whether this connection's bandwidth estimate has ever meant anything.
    *
-   * Start safe and climb, rather than start high and ratchet down. 2 Mbps lands
-   * on a good 1080p24 for film and does not oversubscribe a modest uplink
-   * during the ~9 s before the first real estimate; a faster link is back above
-   * this within a couple of ladder probes. The reverse policy is what produced
-   * the original complaint — the old default asked 4.1 Mbps of every link on
-   * contact, and on anything slower that means overshoot, a standing queue, and
-   * a picture that is soft and laggy at once.
+   * Latched from the uplink estimate rather than read live, because the one
+   * moment it is needed — a share starting — is the one moment `uplink` is
+   * null: its sample window resets on exactly that transition (see
+   * useUplinkEstimate's resetKey). The camera-only phase before the share has
+   * been polling the same peer connection for as long as the call has been up,
+   * so the answer is already known by then; it just has to survive the reset.
+   *
+   * State and not a ref, and that distinction is the whole point. It has to
+   * re-seed the idle budget the moment the path reveals itself, because the
+   * cold start is consumed BEFORE `isScreenSharing` ever turns true:
+   * `handleStartScreenShare` passes the current operating point straight to
+   * `captureScreen`, so a budget corrected on the way into a share would open
+   * the capturer at a size the encoder was about to be told it could not
+   * afford — which is its own failure, since the capturer is then held there by
+   * CAPTURE_RECONFIG_MIN_MS. Re-seeding while still idle means the point handed
+   * to getDisplayMedia is already the right one.
+   *
+   * Defaults to true, i.e. to the generous cold start, so a call that starts
+   * sharing before any estimate exists behaves exactly as it always did.
    */
-  const COLD_START_BUDGET_BPS = 2_000_000;
+  const [capacityMeasurable, setCapacityMeasurable] = useState(true);
 
   const { isMuted, isCameraOn, toggleMute, toggleCamera } = useMediaDevices();
 
@@ -850,6 +865,10 @@ export function SessionRoom() {
         // Absent from an older peer's build, which is why resolutionBox has a
         // conservative answer for null rather than requiring one.
         viewport: feedback.viewport ?? null,
+        // The size that actually ARRIVED, against the size it is drawn at just
+        // above. Absent for the same reason and answered the same way: see
+        // viewerIsStarved, which is false whenever either term is missing.
+        picture: feedback.picture ?? null,
         at: Date.now(),
       };
     },
@@ -925,6 +944,8 @@ export function SessionRoom() {
       lossPercent: metrics && total > 0 ? (metrics.packetsLost / total) * 100 : null,
       viewerLevel: currentViewerLevel(viewerReportRef.current, now),
       viewerViewport: currentViewerViewport(viewerReportRef.current, now),
+      viewerPicture: currentViewerPicture(viewerReportRef.current, now),
+      viewerStarved: viewerIsStarved(viewerReportRef.current, now),
       peerShare: isWatchingRemoteScreen ? peerShareStatus : null,
     };
   });
@@ -972,7 +993,7 @@ export function SessionRoom() {
 
   /** What the link has earned, held across polls so it cannot decay. */
   const [budget, setBudget] = useState<BudgetState>(() =>
-    initialBudgetState(COLD_START_BUDGET_BPS, Date.now()),
+    initialBudgetState(coldStartBudgetBps(true), Date.now()),
   );
   const budgetBps = budget.bps;
 
@@ -1053,12 +1074,40 @@ export function SessionRoom() {
   );
 
   /*
-   * Advance the budget on every sender-health observation.
+   * The uplink estimate, reachable without depending on its identity.
    *
-   * `senderHealth.streak` is in the dependency list on purpose: it changes on
-   * every poll, which is what lets the time-gated upward probe fire once per
-   * poll rather than only when the verdict itself changes. The ladder effect
-   * below depends on it for exactly the same reason.
+   * This ref is the fix for the collapse in the captured session, and the bug
+   * was in the dependency array below rather than in any of the arithmetic.
+   * `uplink` was a dependency, and useUplinkEstimate builds a fresh object
+   * every three seconds on a timer of its own — so `nextBudget` ran on TWO
+   * unsynchronised tickers, and its multiplicative decrease compounded about
+   * twice per health observation: 0.85^2 = 0.72 per poll against a designed
+   * 0.85. Eleven `updateScreenShareQuality` steps across six polls, 2 Mbps to
+   * the floor in twenty-one seconds, while the encoder needed several seconds
+   * to converge onto each new ceiling — so `under-served` stayed true all the
+   * way down and the hysteresis useSenderHealth documents never got a chance to
+   * engage.
+   *
+   * Read through a ref, the budget advances once per observation and uses the
+   * freshest estimate available at that moment, which is what the comment on
+   * this effect claimed all along.
+   */
+  const uplinkRef = useRef(uplink);
+  useEffect(() => {
+    uplinkRef.current = uplink;
+    // Latched here rather than at the point of use; see capacityMeasurable.
+    if (uplink) setCapacityMeasurable(uplink.capacityKnown);
+  }, [uplink]);
+
+  /*
+   * Advance the budget on every sender-health observation, and only then.
+   *
+   * `senderHealth.tick` is the dependency that means "a new sample exists". It
+   * replaces `senderHealth.streak`, which was wrong in both directions: streak
+   * resets to 1 when the verdict changes, so an alternating verdict holds it at
+   * 1 and the effect never re-runs at all, and it was joined by `uplink`, whose
+   * independent timer ran this reducer a second time per poll. See
+   * SenderHealthState.tick.
    *
    * `capacityKnown` gates the estimate: a TCP-relay reading is a measured lower
    * bound, not a capacity measurement, and nextBudget's contract is that null
@@ -1066,6 +1115,7 @@ export function SessionRoom() {
    */
   useEffect(() => {
     const now = Date.now();
+    const uplink = uplinkRef.current;
     // Same freshness rule as the verdict: a viewport nobody has confirmed in
     // thirty seconds must stop authorising a picture that large.
     const viewport = currentViewerViewport(viewerReportRef.current, now);
@@ -1083,6 +1133,12 @@ export function SessionRoom() {
         // Read through currentViewerLevel so a report that stopped arriving
         // expires instead of pinning `shortage` true forever.
         viewerUnhappy: viewerIsUnhappy(currentViewerLevel(viewerReportRef.current, now)),
+        // The other direction, and until now there was no other direction: the
+        // receiver could ask for less and never for more, because its score has
+        // no resolution term and a collapsed picture arriving cleanly reports
+        // 'excellent'. This is the far end saying "I have room for more than
+        // this", which earns a probe rather than a back-off.
+        viewerStarved: viewerIsStarved(viewerReportRef.current, now),
         headroom: HEADROOM_SELECT,
         mode: contentMode,
         ceiling: ladder.applied,
@@ -1091,14 +1147,10 @@ export function SessionRoom() {
         capacityPixelsPerSecond,
       }),
     );
-  }, [
-    uplink,
-    senderHealth.health,
-    senderHealth.streak,
-    contentMode,
-    ladder.applied,
-    capacityPixelsPerSecond,
-  ]);
+    // `health` rides along for the linter's benefit and costs nothing: it is
+    // set in the same update as `tick`, so the two can never change on separate
+    // renders. `tick` is the one that means "a new sample exists".
+  }, [senderHealth.tick, senderHealth.health, contentMode, ladder.applied, capacityPixelsPerSecond]);
 
   // A new share is a new load; carrying the old budget across would judge it by
   // the previous one's behaviour. The viewer's verdict goes with it, for the
@@ -1106,14 +1158,21 @@ export function SessionRoom() {
   // watched, so a report that outlives one is by definition about the last one.
   useEffect(() => {
     if (!webrtc.isScreenSharing) {
-      setBudget(initialBudgetState(COLD_START_BUDGET_BPS, Date.now()));
+      // Sized to the path we are actually on. On a TCP/TLS relay nothing will
+      // ever be able to tell us a generous opening bid was too generous, so the
+      // opening bid is where that has to be got right — see coldStartBudgetBps.
+      //
+      // `capacityMeasurable` is a dependency so this re-seeds the instant the
+      // path reveals itself, while still idle. The share that starts a moment
+      // later then reads an operating point that already fits.
+      setBudget(initialBudgetState(coldStartBudgetBps(capacityMeasurable), Date.now()));
       viewerReportRef.current = null;
       // A new share is a new encode. Carrying a ceiling learned from the last
       // one would judge a 720p window by what a 4K one cost.
       setCapacity(initialCapacityState());
       previousSenderSampleRef.current = null;
     }
-  }, [webrtc.isScreenSharing]);
+  }, [webrtc.isScreenSharing, capacityMeasurable]);
 
   // Long-lived signalling callbacks (screen-share approval, in particular) are
   // registered once and close over their first render, so anything they need
@@ -1171,7 +1230,7 @@ export function SessionRoom() {
       }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
+  }, [senderHealth.health, senderHealth.tick, webrtc.isScreenSharing]);
 
   /*
    * Tell the viewer what our encoder is doing.
@@ -1252,7 +1311,7 @@ export function SessionRoom() {
       }
       return next;
     });
-  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
+  }, [senderHealth.health, senderHealth.tick, webrtc.isScreenSharing]);
 
   /*
    * CPU pressure needs a different answer than bandwidth pressure, and now it
@@ -1308,7 +1367,7 @@ export function SessionRoom() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [senderHealth.health, senderHealth.streak, webrtc.isScreenSharing]);
+  }, [senderHealth.health, senderHealth.tick, webrtc.isScreenSharing]);
 
   /*
    * A link genuinely below the floor. Say so.

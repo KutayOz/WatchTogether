@@ -203,18 +203,34 @@ export function classifySenderHealth(
 
   const ratio = stats.targetBitrate / configuredBps;
 
-  if (stats.qualityLimitationReason === 'bandwidth' && ratio < UNDER_SERVED_RATIO) {
-    return 'under-served';
+  // Nothing is limiting the encoder. Only its own ask can be the yardstick, so
+  // SATISFIED_RATIO governs; below it the encoder is simply not spending what
+  // it was offered, which is a statement about the CONTENT and not about the
+  // link. Holding is the only honest answer to that.
+  if (stats.qualityLimitationReason === 'none') {
+    return ratio >= SATISFIED_RATIO ? 'satisfied' : 'unknown';
   }
-  if (stats.qualityLimitationReason === 'none' && ratio >= SATISFIED_RATIO) {
-    return 'satisfied';
-  }
-  // Served in full, yet still limited by something other than CPU. The ceiling
-  // we set is the binding constraint — see 'self-limited' above.
-  if (ratio >= SATISFIED_RATIO) {
-    return 'self-limited';
-  }
-  return 'unknown';
+
+  /*
+   * Something IS limiting the encoder, and it is not CPU. One threshold decides
+   * which of the two answers applies, and it must be the SAME threshold on both
+   * sides or a band opens between them where the loop cannot move.
+   *
+   * That band was real and it stalled recovery. 'under-served' needed
+   * ratio < 0.85 and 'self-limited' needed ratio >= 0.95, so a reading between
+   * the two — reason 'bandwidth' at 0.85-0.95 of the ask, which is precisely
+   * where a SUCCESSFUL probe on a busy link lands — fell through to 'unknown'.
+   * 'unknown' is neither `shortage` nor `wantsMore`, so nextBudget returned its
+   * state untouched and the ladder reset its good-poll count: a budget that had
+   * climbed back to the edge of the link's real capacity could go no further,
+   * because arriving there was classified as knowing nothing.
+   *
+   * Both verdicts now split on UNDER_SERVED_RATIO, which is the line this file
+   * already defines as "materially below the ask". At or above it the encoder
+   * got what we asked for and is still being held back — our ceiling is the
+   * binding constraint, which is what 'self-limited' means.
+   */
+  return ratio < UNDER_SERVED_RATIO ? 'under-served' : 'self-limited';
 }
 
 /**
@@ -261,6 +277,32 @@ export interface SenderHealthState {
   health: SenderHealth;
   /** How many consecutive polls have agreed. Lets callers require a longer run. */
   streak: number;
+  /**
+   * Observations taken since this share began. Monotonic, one per poll.
+   *
+   * The thing a controller should key its effect on, and `streak` was standing
+   * in for it badly in both directions.
+   *
+   * It under-counted: `streak` resets to 1 when the verdict changes, so a
+   * verdict alternating A, B, A, B holds it at 1 forever. Nothing in the state
+   * object changes, no effect re-runs, and the budget stops advancing entirely
+   * on exactly the flapping link that most needs it to.
+   *
+   * And it over-counted, which is what actually shipped: the budget effect also
+   * listed `uplink` in its dependencies, and useUplinkEstimate hands back a
+   * fresh object on its own independent three-second timer. Two unsynchronised
+   * tickers drove one reducer, so the multiplicative decrease in nextBudget
+   * compounded twice per observation — 0.85^2 = 0.72 per poll against a
+   * designed 0.85. The captured collapse shows it plainly: eleven
+   * `updateScreenShareQuality` steps across six health polls, budget ratios of
+   * 0.72 where the constant says 0.85. The loop was descending at double its
+   * intended rate while the encoder needed several seconds to converge on each
+   * new ceiling, so `under-served` could never stop being true on the way down.
+   *
+   * One counter, incremented in one place, is the whole fix: an effect keyed on
+   * this runs exactly once per sample, whatever else re-renders.
+   */
+  tick: number;
   /** Most recent raw sample, for display. */
   latest: OutboundScreenStats | null;
 }
@@ -279,6 +321,7 @@ export function useSenderHealth(
   const [state, setState] = useState<SenderHealthState>({
     health: 'unknown',
     streak: 0,
+    tick: 0,
     latest: null,
   });
 
@@ -314,14 +357,16 @@ export function useSenderHealth(
     run.count = verdict === run.verdict ? run.count + 1 : 1;
     run.verdict = verdict;
 
-    setState({
+    setState((prev) => ({
       // Report the verdict only once it has held. A single bad 3-second window
       // — a passing wifi dip, someone else on the link starting a download —
       // must not move anyone's quality.
       health: run.count >= SUSTAIN_POLLS ? verdict : 'unknown',
       streak: run.count,
+      // The one place this is incremented. See the field's doc.
+      tick: prev.tick + 1,
       latest: stats,
-    });
+    }));
   }, []);
 
   useEffect(() => {
@@ -334,7 +379,10 @@ export function useSenderHealth(
       if (intervalRef.current) clearInterval(intervalRef.current);
       intervalRef.current = null;
       runRef.current = { verdict: 'unknown', count: 0 };
-      setState({ health: 'unknown', streak: 0, latest: null });
+      // `tick` restarts with the share it counts. A controller keyed on it sees
+      // the reset as one more observation and re-evaluates against the fresh
+      // cold-start budget, which is exactly right.
+      setState({ health: 'unknown', streak: 0, tick: 0, latest: null });
     };
   }, [isActive, poll]);
 

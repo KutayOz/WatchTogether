@@ -1,18 +1,26 @@
 import { describe, expect, it } from 'vitest';
+import { QUALITY_PRESETS } from '../types';
 import {
   AUTO_MAX_BITRATE,
+  BACKOFF_FACTOR,
+  COMPANION_STREAMS_BPS,
+  COLD_START_BUDGET_BPS,
+  MIN_DECREASE_INTERVAL_MS,
   PROBE_INTERVAL_MS,
   PROBE_VERDICT_WINDOW_MS,
+  RELAY_COLD_START_BUDGET_BPS,
   TARGET_BPP,
   MAX_USEFUL_BPP,
   PROBE_CEILING_BPP,
   budgetCeilingBps,
   chooseOperatingPoint,
+  coldStartBudgetBps,
   resolutionBox,
   initialBudgetState,
   minBudgetBps,
   minVideoBps,
   nextBudget,
+  usefulVideoBps,
   type BudgetSignals,
 } from './operatingPoint';
 
@@ -62,7 +70,10 @@ describe('chooseOperatingPoint', () => {
     // (720p, 1.5 Mbps) here and left the rest of the link on the table.
     const point = chooseOperatingPoint(2_000_000, 'film');
     expect(point.height).toBeGreaterThanOrEqual(900);
-    expect(point.videoBps + point.audioBps).toBeGreaterThan(1_900_000);
+    // Measured across the whole budget, because the share is not the only thing
+    // the budget pays for. The camera thumbnail and the mic take 88 kbps of
+    // this and always did — the difference is that the number now says so.
+    expect(point.videoBps + point.audioBps + COMPANION_STREAMS_BPS).toBeGreaterThan(1_900_000);
   });
 
   it('gives auto a finite ceiling instead of an unbounded encoder', () => {
@@ -174,6 +185,7 @@ describe('nextBudget', () => {
       estimateBps: null,
       health: 'unknown',
       viewerUnhappy: false,
+      viewerStarved: false,
       headroom: H,
       mode: 'film',
       ceiling: 'auto',
@@ -205,13 +217,14 @@ describe('nextBudget', () => {
     // 4 Mbps of measured capacity times HEADROOM_SELECT would be 3.4 Mbps, and
     // that is what this used to become. Raising now stops at PROBE_CEILING_BPP:
     // 0.05 x 1920 x 1080 x 24 = 2.488 Mbps of video, quantised down, plus the
-    // 96 kbps audio tier. The link having more is not by itself a reason to
-    // spend more on a picture that is already past the point of visible return.
+    // 96 kbps audio tier and the camera and mic the same uplink is carrying.
+    // The link having more is not by itself a reason to spend more on a picture
+    // that is already past the point of visible return.
     const state = nextBudget(
       initialBudgetState(1_000_000, 0),
       sig({ now: 3000, estimateBps: 4_000_000 }),
     );
-    expect(state.bps).toBe(2_571_000);
+    expect(state.bps).toBe(2_475_000 + 96_000 + COMPANION_STREAMS_BPS);
     expect(state.bps).toBeLessThan(3_400_000);
   });
 
@@ -445,7 +458,9 @@ describe('budgetCeilingBps and the receiver', () => {
     const small = budgetCeilingBps('auto', 24, { width: 1280, height: 720 });
     const large = budgetCeilingBps('auto', 24, { width: 3840, height: 2160 });
     expect(small).toBeLessThan(large);
-    expect(large).toBe(AUTO_MAX_BITRATE + 96_000);
+    // Video ceiling, the audio tier, and the rest of the call — a budget number
+    // has to cover everything the budget pays for.
+    expect(large).toBe(AUTO_MAX_BITRATE + 96_000 + COMPANION_STREAMS_BPS);
   });
 });
 
@@ -516,6 +531,7 @@ describe('nextBudget and a still screen', () => {
       estimateBps: null,
       health: 'unknown',
       viewerUnhappy: false,
+      viewerStarved: false,
       headroom: 0.85,
       mode: 'motion',
       ceiling: 'auto',
@@ -549,7 +565,10 @@ describe('nextBudget and a still screen', () => {
     for (let i = 1; i <= 20; i++) {
       state = nextBudget(state, sig({ now: i * 3000, viewerUnhappy: true }));
     }
-    expect(state.bps).toBeLessThan(400_000);
+    // All the way to the floor. Stated as the floor rather than as a literal
+    // below it, so counting a new cost into the budget moves the assertion
+    // with the thing it is asserting about.
+    expect(state.bps).toBe(minBudgetBps(30));
   });
 
   it('does not climb on the quiet either', () => {
@@ -579,5 +598,266 @@ describe('nextBudget and a still screen', () => {
     expect(state.probing).toBe(false);
     expect(state.bps).toBe(1_000_000);
     expect(state.probeBackoffMs).toBe(probeBackoffMs);
+  });
+});
+
+
+/**
+ * The collapse in the captured session, and the two properties that stop it.
+ *
+ * A TURN/TCP relay reports `capacityKnown: false` forever, so `estimateBps`
+ * reaches this reducer as null for the whole share and the multiplicative
+ * decrease is the ONLY way down. That path compounds, which makes how often it
+ * is called part of its behaviour — and it was being called about twice per
+ * observation, because the effect driving it listed the uplink estimate (a
+ * separate three-second timer) alongside sender health.
+ */
+describe('nextBudget under a shortage with no trusted estimate', () => {
+  const POLL_MS = 3_000;
+
+  function sig(over: Partial<BudgetSignals> = {}): BudgetSignals {
+    return {
+      now: 0,
+      estimateBps: null,
+      health: 'under-served',
+      viewerUnhappy: false,
+      viewerStarved: false,
+      headroom: 0.85,
+      mode: 'motion',
+      ceiling: 'medium',
+      viewport: null,
+      capacityPixelsPerSecond: null,
+      ...over,
+    };
+  }
+
+  it('backs off exactly once per poll, however often it is called', () => {
+    // The captured session's opening numbers: 2 Mbps, motion, medium.
+    const start = initialBudgetState(2_000_000, 0);
+
+    const once = nextBudget(start, sig({ now: POLL_MS }));
+    expect(once.bps).toBeCloseTo(2_000_000 * BACKOFF_FACTOR, 0);
+
+    // A second call inside the same observation — the uplink poller firing the
+    // same effect a few hundred milliseconds later. It must change nothing.
+    const twice = nextBudget(once, sig({ now: POLL_MS + 400 }));
+    expect(twice).toBe(once);
+    expect(twice.bps).toBeCloseTo(2_000_000 * BACKOFF_FACTOR, 0);
+  });
+
+  it('descends at 0.85 per poll, not 0.72', () => {
+    // The tell in the report that identified this: consecutive budget samples
+    // three seconds apart sat at ratios of 0.72, which is BACKOFF_FACTOR
+    // squared. Eleven encoder steps across six polls.
+    let state = initialBudgetState(2_000_000, 0);
+    const seen: number[] = [];
+    // Two calls per poll, as the two independent timers produced.
+    for (let now = POLL_MS; now <= POLL_MS * 5; now += POLL_MS) {
+      state = nextBudget(state, sig({ now }));
+      state = nextBudget(state, sig({ now: now + 500 }));
+      seen.push(state.bps);
+    }
+    for (let i = 1; i < seen.length; i++) {
+      expect(seen[i] / seen[i - 1]).toBeCloseTo(BACKOFF_FACTOR, 3);
+    }
+  });
+
+  it('still lets a genuine shortage move on the very next poll', () => {
+    // The gate is a rate limit, not a cooldown: it must be strictly shorter
+    // than one poll or the descent halves and a link in real trouble waits.
+    expect(MIN_DECREASE_INTERVAL_MS).toBeLessThan(POLL_MS);
+  });
+
+  it('does not gate the exact revert of a failed probe', () => {
+    // Reverting goes to `baseBps` and cannot compound, so it must not be
+    // delayed — that is the property that makes probing safe to try at all.
+    const probing = { ...initialBudgetState(1_000_000, 0), bps: 1_500_000, probing: true };
+    const after = nextBudget(probing, sig({ now: 100 }));
+    expect(after.bps).toBe(1_000_000);
+    expect(after.probing).toBe(false);
+  });
+});
+
+/**
+ * Where to start on a path whose estimate will never mean anything.
+ *
+ * The captured collapse opened at 2 Mbps on a relay carrying well under one,
+ * and there was no measurement anywhere in the system able to say so: on a
+ * TCP/TLS relay `isCapacityMeasurable` is false for the life of the connection.
+ * An overshoot that cannot be corrected has to be avoided instead.
+ */
+describe('coldStartBudgetBps', () => {
+  it('opens lower where nothing can ever say the opening bid was too high', () => {
+    expect(coldStartBudgetBps(false)).toBe(RELAY_COLD_START_BUDGET_BPS);
+    expect(coldStartBudgetBps(false)).toBeLessThan(coldStartBudgetBps(true));
+  });
+
+  it('leaves a measurable path exactly as it was', () => {
+    expect(coldStartBudgetBps(true)).toBe(COLD_START_BUDGET_BPS);
+  });
+
+  it('still opens on a real picture, not a placeholder', () => {
+    // Starting low is only safe if low is watchable. 960x540 at target bpp is
+    // a picture; the probe ladder does the rest.
+    const point = chooseOperatingPoint(coldStartBudgetBps(false), 'motion', 'medium');
+    expect(point.width).toBe(960);
+    expect(point.height).toBe(540);
+    expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
+  });
+
+  it('climbs back to the generous start within a few probes', () => {
+    // The cost of guessing low is bounded by how fast probing undoes it.
+    let state = initialBudgetState(RELAY_COLD_START_BUDGET_BPS, 0);
+    let now = 0;
+    let probes = 0;
+    while (state.bps < COLD_START_BUDGET_BPS && probes < 10) {
+      now += PROBE_INTERVAL_MS + 1;
+      state = nextBudget(state, {
+        now,
+        estimateBps: null,
+        health: 'self-limited',
+        viewerUnhappy: false,
+        viewerStarved: false,
+        headroom: 0.85,
+        mode: 'motion',
+        ceiling: 'medium',
+        viewport: { width: 1920, height: 1080 },
+        capacityPixelsPerSecond: null,
+      });
+      // Bank it, the way a probe that draws no complaint is banked.
+      state = { ...state, baseBps: state.bps, probing: false };
+      probes++;
+    }
+    expect(state.bps).toBeGreaterThanOrEqual(COLD_START_BUDGET_BPS);
+    expect(probes).toBeLessThanOrEqual(4);
+  });
+});
+
+/**
+ * The receiver asking for MORE, which it could never do before.
+ *
+ * calculateQualityScore is a minimum over loss, jitter, RTT, frame rate and
+ * freezes — no term in it is a function of how many pixels arrived. A picture
+ * collapsed to 300x158 and painted into 2386x1358 scores 100 and reports
+ * 'excellent', so the only viewer signal the budget had said "everything is
+ * fine" at the exact moment the picture was unusable.
+ */
+describe('nextBudget and a starved viewer', () => {
+  function sig(over: Partial<BudgetSignals> = {}): BudgetSignals {
+    return {
+      now: PROBE_INTERVAL_MS + 1,
+      estimateBps: null,
+      health: 'unknown',
+      viewerUnhappy: false,
+      viewerStarved: false,
+      headroom: 0.85,
+      mode: 'motion',
+      ceiling: 'medium',
+      viewport: { width: 2386, height: 1358 },
+      capacityPixelsPerSecond: null,
+      ...over,
+    };
+  }
+
+  it('probes upward on a verdict sender health cannot reach', () => {
+    // 'unknown' is neither `shortage` nor `wantsMore`, so this state was
+    // completely inert — and it is where Firefox and Safari live permanently,
+    // since neither publishes targetBitrate.
+    const start = initialBudgetState(400_000, 0);
+    expect(nextBudget(start, sig())).toBe(start);
+
+    const probed = nextBudget(start, sig({ viewerStarved: true }));
+    expect(probed.bps).toBeGreaterThan(start.bps);
+    expect(probed.probing).toBe(true);
+    // The revert target is untouched, so a failed probe costs nothing.
+    expect(probed.baseBps).toBe(start.bps);
+  });
+
+  it('does not turn a small picture into a reason to send even less', () => {
+    // The signal is deliberately not folded into `viewerUnhappy`: answering
+    // "too small" with a back-off is the wrong direction, and it is the
+    // direction the loop was already stuck in.
+    const start = initialBudgetState(400_000, 0);
+    const after = nextBudget(start, sig({ viewerStarved: true }));
+    expect(after.bps).toBeGreaterThanOrEqual(start.bps);
+  });
+
+  it('still lets a genuine shortage win', () => {
+    // Both true at once is a link in trouble, and shortage is read first.
+    const start = initialBudgetState(1_000_000, 0);
+    const after = nextBudget(
+      start,
+      sig({ health: 'under-served', viewerStarved: true, now: 3_000 }),
+    );
+    expect(after.bps).toBeLessThan(start.bps);
+  });
+});
+
+
+/**
+ * The share is not alone on the wire.
+ *
+ * `budgetBps` is documented as the total available, and for a long time this
+ * file spent all of it on the share while `applyCameraEncoding` and the mic
+ * took another 88 kbps off the same uplink — so every point it chose was 88
+ * kbps optimistic and the encoder found out by being under-served. On a
+ * floor-level budget that is 27% unaccounted, and on a TCP-relayed path there
+ * is no HEADROOM_SELECT discount absorbing it either, because `estimateBps`
+ * arrives null and nothing gets multiplied.
+ */
+describe('chooseOperatingPoint and the rest of the call', () => {
+  const modes = [
+    { mode: 'film', fps: 24 },
+    { mode: 'motion', fps: 30 },
+    { mode: 'games', fps: 60 },
+  ] as const;
+
+  it('never asks for more than the budget, companion streams included', () => {
+    for (const { mode } of modes) {
+      for (const budget of [400_000, 800_000, 1_500_000, 2_000_000, 4_000_000]) {
+        const point = chooseOperatingPoint(budget, mode, 'medium', { width: 1920, height: 1080 });
+        const asked = point.videoBps + point.audioBps + COMPANION_STREAMS_BPS;
+        // At or below the floor the over-subscription is deliberate and
+        // documented; above it the sum has to fit.
+        if (budget >= minBudgetBps(point.fps)) {
+          expect(asked).toBeLessThanOrEqual(budget);
+        }
+      }
+    }
+  });
+
+  it('makes minBudgetBps mean what its name says', () => {
+    // It did not: it returned the SHARE's floor, so a budget of exactly this
+    // much left the encoder 88 kbps short of minVideoBps.
+    for (const { mode, fps } of modes) {
+      const point = chooseOperatingPoint(minBudgetBps(fps), mode, 'auto');
+      expect(point.videoBps).toBe(minVideoBps(fps));
+      expect(point.videoBps + point.audioBps + COMPANION_STREAMS_BPS).toBe(minBudgetBps(fps));
+    }
+  });
+
+  it('still defends the video floor below it, over-subscribing on purpose', () => {
+    // Unwatchable is worse than wasteful, and the pacer adapts underneath us.
+    const point = chooseOperatingPoint(100_000, 'motion', 'auto');
+    expect(point.videoBps).toBe(minVideoBps(30));
+  });
+
+  it('leaves a budget with real headroom picking the same picture as before', () => {
+    // The correction is 88 kbps. It has to matter at the floor and be invisible
+    // at the top, or it is a quality regression dressed as an accounting fix.
+    const point = chooseOperatingPoint(4_000_000, 'film', 'medium', { width: 1920, height: 1080 });
+    expect(point.width).toBe(1920);
+    expect(point.height).toBe(1080);
+  });
+
+  it('keeps budgetCeilingBps the budget at which the ceiling is reachable', () => {
+    // The cap and the chooser have to agree, or the budget probes toward a
+    // video bitrate it can never actually be given.
+    const viewport = { width: 1920, height: 1080 };
+    const cap = budgetCeilingBps('medium', 24, viewport);
+    const point = chooseOperatingPoint(cap, 'film', 'medium', viewport);
+    expect(point.videoBps).toBe(
+      Math.min(QUALITY_PRESETS.medium.video.bitrate, usefulVideoBps(viewport, 24)),
+    );
   });
 });

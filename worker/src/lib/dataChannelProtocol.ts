@@ -115,6 +115,24 @@ export interface QualityFeedback {
    * expiring on the same clock, cleared when the peer changes.
    */
   viewport?: Viewport;
+  /**
+   * How large the arriving picture actually IS, in device pixels — the
+   * decoder's frame size, not the space it is painted into.
+   *
+   * The companion to `viewport`, and the field without which `level` cannot be
+   * read honestly. `calculateQualityScore` is a minimum over loss, jitter, RTT,
+   * frame rate and freezes; not one of those terms is a function of how many
+   * pixels arrived. A 300x158 picture landing cleanly at 24 fps therefore
+   * scores 100 and reports 'excellent' — which is exactly what a captured
+   * session shows, with the viewer drawing that stamp at 2386x1358 and the
+   * sender reading the cheerful verdict as permission to stay collapsed.
+   *
+   * Deliberately NOT folded into `level`. A small picture is not a bad
+   * connection, and making it one would send `viewerUnhappy` true and drive the
+   * budget DOWN — the opposite of the answer. The sender compares this against
+   * `viewport` itself and reaches its own conclusion; see viewerIsStarved.
+   */
+  picture?: Viewport;
 }
 
 /**
@@ -278,6 +296,7 @@ function validateData(type: string, d: Record<string, unknown>): DataChannelMess
       // is JSON-encoded, and an explicit undefined would serialise the key away
       // anyway — but this keeps "absent" and "present" distinguishable in tests.
       const viewport = readViewport(feedback.viewport);
+      const picture = readViewport(feedback.picture);
       return {
         t: "quality",
         d: {
@@ -289,6 +308,7 @@ function validateData(type: string, d: Record<string, unknown>): DataChannelMess
             rttMs: feedback.rttMs,
             fps: feedback.fps,
             ...(viewport ? { viewport } : {}),
+            ...(picture ? { picture } : {}),
           },
         },
       };

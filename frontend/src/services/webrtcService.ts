@@ -9,7 +9,11 @@ import type {
   IceCandidateInfo,
   IceCandidatePairInfo,
 } from '../types';
-import type { OperatingPoint } from '../hooks/operatingPoint';
+import {
+  CAMERA_BPS_WHILE_SHARING,
+  MIC_BPS,
+  type OperatingPoint,
+} from '../hooks/operatingPoint';
 import { applyOpusOptions, SDP_WARN_LENGTH } from './opusFmtp';
 
 /**
@@ -27,7 +31,10 @@ import { applyOpusOptions, SDP_WARN_LENGTH } from './opusFmtp';
  * thing both people are actually watching, so the thumbnail yields to it.
  */
 const CAMERA_MAX_BITRATE_IDLE = 400_000;
-const CAMERA_MAX_BITRATE_WHILE_SHARING = 64_000;
+// The while-sharing figure is imported, not declared: chooseOperatingPoint has
+// to subtract exactly what this applies, and a duplicated literal is how those
+// two drift apart. See COMPANION_STREAMS_BPS.
+const CAMERA_MAX_BITRATE_WHILE_SHARING = CAMERA_BPS_WHILE_SHARING;
 
 /**
  * How far the camera is scaled down while a screen share is running.
@@ -67,8 +74,12 @@ const CAMERA_MAX_FRAMERATE_WHILE_SHARING = 8;
  * networkPriority 'high', not 'low': voice is the last thing that should break.
  * A call where the picture softens is still a call; a call where the other
  * person cuts out is not.
+ *
+ * "A known line item rather than an assumption" was true of this file and of
+ * nothing else for a long time — the budget never subtracted it. Imported from
+ * the place that now does, so the two cannot disagree.
  */
-const MIC_MAX_BITRATE = 24_000;
+const MIC_MAX_BITRATE = MIC_BPS;
 
 /**
  * Which codec the screen share is asking for.

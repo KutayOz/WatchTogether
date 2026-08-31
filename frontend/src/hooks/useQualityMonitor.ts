@@ -358,6 +358,19 @@ export function useQualityMonitor(
       if (onQualityChange && (newLevel !== prevLevelRef.current || due)) {
         lastSentAtRef.current = now;
         const total = newMetrics.packetsReceived + newMetrics.packetsLost;
+        // How big the picture actually is, alongside how well it arrived.
+        //
+        // `level` cannot express this and should not be made to: every term in
+        // calculateQualityScore is about delivery, so a tiny picture arriving
+        // perfectly is a perfect score. Reporting the size as its own fact lets
+        // the sender compare it against the viewport we send in the same
+        // message and draw the one conclusion the score cannot — see
+        // viewerIsStarved. Omitted rather than guessed when the browser has not
+        // published a frame size yet.
+        const picture =
+          typeof best.stats.frameWidth === 'number' && typeof best.stats.frameHeight === 'number'
+            ? { width: best.stats.frameWidth, height: best.stats.frameHeight }
+            : null;
         const feedback: QualityFeedback = {
           level: newLevel,
           score: Math.round(newScore),
@@ -365,6 +378,7 @@ export function useQualityMonitor(
           jitterMs: newMetrics.jitterMs,
           rttMs: newMetrics.rttMs,
           fps: newMetrics.fps,
+          ...(picture ? { picture } : {}),
         };
         onQualityChange(feedback);
       }

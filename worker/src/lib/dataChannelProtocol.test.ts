@@ -218,6 +218,56 @@ describe("data channel decoding", () => {
         .toBeUndefined();
     });
 
+    it("carries the size that actually arrived, beside the size it is drawn at", () => {
+      // The field without which `level` cannot be read honestly. Every term in
+      // calculateQualityScore is about delivery, so a picture collapsed to a
+      // stamp but arriving cleanly scores 100 and reports 'excellent' — which
+      // is exactly what a captured session shows, with 300x158 on the wire and
+      // 2386x1358 of window to paint it into. The sender needs both numbers to
+      // see the deficit; it gets neither from the verdict.
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({
+          t: "quality",
+          d: {
+            feedback: {
+              ...feedback,
+              viewport: { width: 2386, height: 1358 },
+              picture: { width: 300, height: 158 },
+            },
+          },
+        }),
+      );
+      expect(decoded).toBeTruthy();
+      const carried = decoded!.d as {
+        feedback: { viewport?: unknown; picture?: unknown };
+      };
+      expect(carried.feedback.viewport).toEqual({ width: 2386, height: 1358 });
+      expect(carried.feedback.picture).toEqual({ width: 300, height: 158 });
+    });
+
+    it("treats a malformed picture as no picture, and keeps the verdict", () => {
+      // Same discipline as the viewport beside it: viewerIsStarved is false
+      // whenever a term is missing, so a bad value costs a signal rather than a
+      // whole quality frame.
+      for (const picture of [{ width: 0, height: 158 }, { width: 99_999, height: 158 }, null, 42]) {
+        const decoded = decodeDataChannelMessage(
+          JSON.stringify({ t: "quality", d: { feedback: { ...feedback, picture } } }),
+        );
+        expect(decoded).toBeTruthy();
+        expect((decoded!.d as { feedback: { picture?: unknown } }).feedback.picture)
+          .toBeUndefined();
+      }
+    });
+
+    it("accepts a quality frame from a peer that sends no picture", () => {
+      const decoded = decodeDataChannelMessage(
+        JSON.stringify({ t: "quality", d: { feedback } }),
+      );
+      expect(decoded).toBeTruthy();
+      expect((decoded!.d as { feedback: { picture?: unknown } }).feedback.picture)
+        .toBeUndefined();
+    });
+
     it("drops unknown extra fields rather than passing them through", () => {
       const decoded = decodeDataChannelMessage(
         JSON.stringify({ t: "quality", d: { feedback: { ...feedback, evil: "payload" } } }),

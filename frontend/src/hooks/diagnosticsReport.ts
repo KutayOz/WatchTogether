@@ -53,6 +53,18 @@ export interface DiagnosticsSnapshot {
   /** What the far end says about the picture we are sending them. */
   viewerLevel: QualityLevel | null;
   viewerViewport: Viewport | null;
+  /**
+   * How big the picture actually IS over there, against the viewport above.
+   *
+   * Recorded because the deficit between the two is invisible in every other
+   * line of this report, and it is the one that explains a cheerful verdict on
+   * an unwatchable picture: the receiver's score has no resolution term, so
+   * `they say excellent` and `300x158 into 2386x1358` were both true at once
+   * and only one of them made it into the report.
+   */
+  viewerPicture: Viewport | null;
+  /** The sender's own reading of those two numbers. See viewerIsStarved. */
+  viewerStarved: boolean;
   /** What the far end says about the picture they are sending us. */
   peerShare: ShareStatus | null;
 }
@@ -275,7 +287,11 @@ function nowSection(last: DiagnosticsSnapshot | undefined): string[] {
       `they say    ${last.viewerLevel ?? 'nothing'}` +
         (last.viewerViewport
           ? ` · drawing it at ${last.viewerViewport.width}x${last.viewerViewport.height}`
-          : ' · no viewport reported'),
+          : ' · no viewport reported') +
+        (last.viewerPicture
+          ? ` · getting ${last.viewerPicture.width}x${last.viewerPicture.height}`
+          : '') +
+        (last.viewerStarved ? ' · STARVED' : ''),
     );
   }
   if (last.peerShare) {

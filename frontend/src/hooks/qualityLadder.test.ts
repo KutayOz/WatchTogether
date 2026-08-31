@@ -10,6 +10,7 @@ import {
   nextLadderState,
   stepDown,
   stepUp,
+  viewerIsStarved,
   viewerIsUnhappy,
   withUserChoice,
   type LadderSignals,
@@ -241,21 +242,21 @@ describe('currentViewerLevel', () => {
   });
 
   it('reports a fresh verdict', () => {
-    const report: ViewerReport = { level: 'poor', viewport: null, at: 1_000 };
+    const report: ViewerReport = { level: 'poor', viewport: null, picture: null, at: 1_000 };
     expect(currentViewerLevel(report, 1_000 + VIEWER_REPORT_TTL_MS)).toBe('poor');
   });
 
   it('expires a verdict nobody is repeating', () => {
     // The viewer re-sends every FEEDBACK_HEARTBEAT_MS, so silence past three
     // heartbeats means the reporter is gone rather than still unhappy.
-    const report: ViewerReport = { level: 'critical', viewport: null, at: 1_000 };
+    const report: ViewerReport = { level: 'critical', viewport: null, picture: null, at: 1_000 };
     expect(currentViewerLevel(report, 1_001 + VIEWER_REPORT_TTL_MS)).toBeNull();
   });
 
   it('expires a good verdict too, not just a bad one', () => {
     // Symmetry matters: a stale 'excellent' would let the budget keep probing
     // upward against a peer that stopped watching ten minutes ago.
-    const report: ViewerReport = { level: 'excellent', viewport: null, at: 0 };
+    const report: ViewerReport = { level: 'excellent', viewport: null, picture: null, at: 0 };
     expect(currentViewerLevel(report, VIEWER_REPORT_TTL_MS * 2)).toBeNull();
   });
 });
@@ -267,10 +268,10 @@ describe('a viewer verdict driving the budget', () => {
   /** Run the budget loop for `untilMs`, refreshing the report per `resend`. */
   function run(resend: (now: number) => boolean) {
     let budget = initialBudgetState(2_000_000, 0);
-    let report: ViewerReport = { level: 'poor', viewport: null, at: 0 };
+    let report: ViewerReport = { level: 'poor', viewport: null, picture: null, at: 0 };
 
     for (let now = POLL_MS; now <= 300_000; now += POLL_MS) {
-      if (resend(now)) report = { level: 'poor', viewport: null, at: now };
+      if (resend(now)) report = { level: 'poor', viewport: null, picture: null, at: now };
       budget = nextBudget(budget, {
         now,
         estimateBps: null,
@@ -278,6 +279,7 @@ describe('a viewer verdict driving the budget', () => {
         // deciding the outcome here is the viewer's verdict.
         health: 'self-limited',
         viewerUnhappy: viewerIsUnhappy(currentViewerLevel(report, now)),
+        viewerStarved: false,
         headroom: 0.85,
         mode: 'film',
         ceiling: 'auto',
@@ -316,6 +318,7 @@ describe('a viewer verdict against a healthy estimate', () => {
       estimateBps: 8_000_000,
       health: 'satisfied',
       viewerUnhappy: true,
+      viewerStarved: false,
       headroom: 0.85,
       mode: 'film',
       ceiling: 'auto',
@@ -333,6 +336,7 @@ describe('a viewer verdict against a healthy estimate', () => {
       estimateBps: 1_000_000,
       health: 'under-served',
       viewerUnhappy: true,
+      viewerStarved: false,
       headroom: 0.85,
       mode: 'film',
       ceiling: 'auto',
@@ -348,6 +352,7 @@ describe('currentViewerViewport', () => {
     const report: ViewerReport = {
       level: 'good',
       viewport: { width: 3840, height: 2160 },
+      picture: null,
       at: 1_000,
     };
     expect(currentViewerViewport(report, 2_000)).toEqual({ width: 3840, height: 2160 });
@@ -359,6 +364,7 @@ describe('currentViewerViewport', () => {
     const report: ViewerReport = {
       level: 'good',
       viewport: { width: 3840, height: 2160 },
+      picture: null,
       at: 0,
     };
     expect(currentViewerViewport(report, VIEWER_REPORT_TTL_MS + 1)).toBeNull();
@@ -366,7 +372,7 @@ describe('currentViewerViewport', () => {
 
   it('has no opinion when a peer reports quality but no size', () => {
     // An older build sends QualityFeedback without the viewport field.
-    const report: ViewerReport = { level: 'good', viewport: null, at: 0 };
+    const report: ViewerReport = { level: 'good', viewport: null, picture: null, at: 0 };
     expect(currentViewerViewport(report, 1_000)).toBeNull();
   });
 });
@@ -396,5 +402,67 @@ describe('nextLadderState and a still screen', () => {
     const held = run(start, { senderHealth: 'source-idle' }, 20);
     expect(held.consecutiveGood).toBe(0);
     expect(held.probing).toBe(false);
+  });
+});
+
+
+/**
+ * The half of the viewer's report that `level` cannot carry.
+ *
+ * Every term in calculateQualityScore is about DELIVERY — loss, jitter, RTT,
+ * frame rate, freezes — and the function takes their minimum. Not one of them
+ * is a function of how many pixels arrived, so a picture that has collapsed to
+ * a stamp but arrives cleanly scores 100. The captured session says it plainly:
+ * `they say excellent · drawing it at 2386x1358`, while 300x158 was on the
+ * wire. The sender read that as permission to stay where it was.
+ */
+describe('viewerIsStarved', () => {
+  const NOW = 10_000;
+  const report = (over: Partial<ViewerReport> = {}): ViewerReport => ({
+    level: 'excellent',
+    viewport: { width: 2386, height: 1358 },
+    picture: { width: 300, height: 158 },
+    at: NOW,
+    ...over,
+  });
+
+  it('catches the collapse the score reported as excellent', () => {
+    expect(viewerIsStarved(report(), NOW)).toBe(true);
+  });
+
+  it('leaves an ordinary constrained downscale alone', () => {
+    // 960x540 into 1920x1080 is a quarter of the area and a perfectly good
+    // answer on a slow link. A test that fired here would probe forever.
+    expect(
+      viewerIsStarved(
+        report({
+          viewport: { width: 1920, height: 1080 },
+          picture: { width: 960, height: 540 },
+        }),
+        NOW,
+      ),
+    ).toBe(false);
+    // And the rung the captured session was ASKING for, against its real window.
+    expect(viewerIsStarved(report({ picture: { width: 1280, height: 720 } }), NOW)).toBe(false);
+  });
+
+  it('defers to a complaint rather than arguing with it', () => {
+    // A viewer that is unhappy is describing a link in trouble, and
+    // `viewerUnhappy` already carries that to the budget as a reason to send
+    // LESS. One report must not drive the budget both ways at once.
+    expect(viewerIsStarved(report({ level: 'poor' }), NOW)).toBe(false);
+    expect(viewerIsStarved(report({ level: 'critical' }), NOW)).toBe(false);
+  });
+
+  it('has no opinion without both measurements', () => {
+    // An older peer sends neither field; a peer mid-negotiation may send one.
+    expect(viewerIsStarved(report({ picture: null }), NOW)).toBe(false);
+    expect(viewerIsStarved(report({ viewport: null }), NOW)).toBe(false);
+    expect(viewerIsStarved(null, NOW)).toBe(false);
+  });
+
+  it('expires on the same clock as the verdict it rides with', () => {
+    // A peer that stopped watching must not keep authorising upward probes.
+    expect(viewerIsStarved(report({ at: 0 }), VIEWER_REPORT_TTL_MS + 1)).toBe(false);
   });
 });
