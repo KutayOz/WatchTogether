@@ -150,13 +150,42 @@ export const LARGEST_RESOLUTION = RESOLUTIONS[0];
 const MIN_AUDIO_BPS = 64_000;
 
 /**
+ * What the REST of the call costs while a share is on the wire.
+ *
+ * The screen share is never alone on the connection, and until now this file
+ * behaved as though it were: `budgetBps` was documented as "total bits per
+ * second available to the share, audio included" and then spent entirely on the
+ * share, while `applyCameraEncoding` and the mic quietly took another 88 kbps
+ * off the same uplink. The mic's own comment claimed it was "now a known line
+ * item rather than an assumption"; it was known to webrtcService and to nothing
+ * else.
+ *
+ * A percentage allowance cannot cover this, which is why HEADROOM_SELECT's 15%
+ * was not already doing the job. The companion streams are a FIXED cost, so a
+ * proportional discount over-covers where it does not matter (300 kbps of slack
+ * at a 2 Mbps budget) and under-covers exactly where it does (60 kbps at 400).
+ * And on a TCP-relayed path there is no discount at all: `estimateBps` is null,
+ * `headroom` never multiplies anything, and the budget is a pure probe-and-
+ * backoff number. That is the path the captured collapse ran on, where 88 kbps
+ * unaccounted was 27% of a floor-level budget.
+ *
+ * These are the values webrtcService applies — imported from here rather than
+ * declared there, so the two cannot drift. Same reason MIN_AUDIO_BPS was
+ * extracted just above.
+ */
+export const CAMERA_BPS_WHILE_SHARING = 64_000;
+export const MIC_BPS = 24_000;
+export const COMPANION_STREAMS_BPS = CAMERA_BPS_WHILE_SHARING + MIC_BPS;
+
+/**
  * Ceiling on audio's share of the budget.
  *
- * At the film floor (264 kbps) the 64 kbps tier is 24.2% — so this cap is
- * exactly tangent to the floor and inert everywhere above it. It exists so that
- * no caller can reproduce the state this floor was written for, where a budget
- * that had collapsed to ~100 kbps handed 64% of itself to audio and left the
- * video encoder with scraps.
+ * Measured against what the SHARE has to divide, not against the whole budget —
+ * see minShareBps. At the film share floor (264 kbps) the 64 kbps tier is
+ * 24.2%, so this cap is exactly tangent to the floor and inert everywhere above
+ * it. It exists so that no caller can reproduce the state this floor was
+ * written for, where a budget that had collapsed to ~100 kbps handed 64% of
+ * itself to audio and left the video encoder with scraps.
  */
 const MAX_AUDIO_SHARE = 0.25;
 
@@ -176,9 +205,30 @@ export function minVideoBps(fps: number): number {
   return Math.ceil(exact / BITRATE_STEP) * BITRATE_STEP;
 }
 
-/** The least total budget that can actually fund minVideoBps plus audio. */
-export function minBudgetBps(fps: number): number {
+/**
+ * The least the SHARE itself needs: the video floor plus the cheapest audio.
+ *
+ * Split out from minBudgetBps because the two answer different questions now
+ * that the budget has to pay for more than the share. This is what audio and
+ * video divide between them; minBudgetBps is what has to be on the wire for
+ * this much to reach them.
+ */
+export function minShareBps(fps: number): number {
   return minVideoBps(fps) + MIN_AUDIO_BPS;
+}
+
+/**
+ * The least total budget that can actually fund minShareBps.
+ *
+ * Its own name was a promise this function did not keep: it returned the
+ * share's floor and called it the budget's, so a budget sitting exactly here
+ * left the video encoder 88 kbps short of the floor the rest of this file
+ * exists to defend. With the companion streams counted, a budget of exactly
+ * this much puts the chooser at exactly minVideoBps — which is what "the least
+ * total budget that can fund the floor" has to mean.
+ */
+export function minBudgetBps(fps: number): number {
+  return minShareBps(fps) + COMPANION_STREAMS_BPS;
 }
 
 /**
@@ -344,13 +394,26 @@ export function chooseOperatingPoint(
    * Below the floor we deliberately over-subscribe the link. That is the lesser
    * evil, because the alternative is not a smaller working stream — it is an
    * unwatchable one, and the pacer still adapts underneath us. A link genuinely
-   * under 264 kbps should be TOLD it cannot carry a screen share, which is the
-   * caller's job (see the floor toast in SessionRoom), not quietly served a
-   * slideshow.
+   * under minBudgetBps (352 kbps for film, once the camera and mic are counted)
+   * should be TOLD it cannot carry a screen share, which is the caller's job
+   * (see the floor toast in SessionRoom), not quietly served a slideshow.
    */
   const budget = Math.max(budgetBps, minBudgetBps(fps));
 
-  const audioBps = audioReserve(budget, preset.audio.bitrate);
+  /*
+   * What the SHARE has to divide, once the rest of the call is paid for.
+   *
+   * The camera thumbnail and the mic are on this uplink too, and this file used
+   * to spend the whole budget as though they were not — so every operating
+   * point it chose was 88 kbps optimistic, and the encoder discovered the
+   * shortfall by being under-served. See COMPANION_STREAMS_BPS.
+   *
+   * The max is defence-in-depth: `budget` is already floored at minBudgetBps
+   * above, so on that path this subtraction cannot reach below minShareBps.
+   */
+  const shareBudget = Math.max(minShareBps(fps), budget - COMPANION_STREAMS_BPS);
+
+  const audioBps = audioReserve(shareBudget, preset.audio.bitrate);
 
   // The largest picture we will send, and with it the most that can usefully be
   // spent on one. Four bounds meet here: the link's (budget), the user's
@@ -361,13 +424,21 @@ export function chooseOperatingPoint(
   // nothing. This is the line that removes the uncapped-encoder failure mode.
   const presetCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
   const videoCeiling = Math.min(presetCeiling, usefulVideoBps(box, fps));
-  const raw = Math.max(0, Math.min(budget - audioBps, videoCeiling));
+  const raw = Math.max(0, Math.min(shareBudget - audioBps, videoCeiling));
 
   // Quantised, so a bandwidth estimate that wanders by a few kbps every three
   // seconds does not produce a fresh setParameters + applyConstraints on every
   // poll. Encoder churn is not free, and a 25 kbps step is far below anything
   // visible.
-  const quantised = Math.round(raw / BITRATE_STEP) * BITRATE_STEP;
+  //
+  // DOWN, not to nearest, for the reason usefulVideoBps states two functions
+  // up: a floor rounds up so it stays achievable, a ceiling rounds down so it
+  // stays a ceiling. `raw` is bounded by the budget, so rounding it to nearest
+  // could hand out half a step more than the link was said to have — small
+  // against 2 Mbps, and 12.5 of the 88 kbps this function had just been taught
+  // to stop overspending. The floor below re-raises anything this pushes under
+  // minVideoBps, so nothing can be quantised into an unwatchable picture.
+  const quantised = Math.floor(raw / BITRATE_STEP) * BITRATE_STEP;
   // The floor again, now on the bitrate itself — quantisation and the preset's
   // audio reserve can both eat into a floored budget. Still under the ceiling:
   // every preset's video bitrate is comfortably above minVideoBps(60).
@@ -402,9 +473,9 @@ export function chooseOperatingPoint(
  *
  * Has to clear the measurement noise to be learnable: BITRATE_STEP is 12.5% of
  * the film floor, so 1.5x is four quantisation steps while 1.25x is two. It
- * also bounds recovery — ln(6.096M / 264k) / ln(1.5) is about eight probes, so
- * a link that collapsed to the floor is back at its ceiling in roughly a
- * minute and a half. The cost of overshooting is one bad ~9 s window, which
+ * also bounds recovery — from the film floor to a 6 Mbps ceiling is about
+ * seven probes at 1.5x, so a link that collapsed to the floor is back at its
+ * ceiling in roughly a minute. The cost of overshooting is one bad ~9 s window, which
  * the revert branch undoes exactly.
  */
 export const PROBE_FACTOR = 1.5;
@@ -440,6 +511,67 @@ export const MAX_BUDGET_PROBE_BACKOFF_MS = 120_000;
 export const BACKOFF_FACTOR = 0.85;
 
 /**
+ * Shortest gap between two multiplicative decreases.
+ *
+ * A rate limit on the only branch in this reducer that COMPOUNDS. Every other
+ * path is idempotent under repetition — following an estimate down is a `min`,
+ * reverting a probe goes to `baseBps` exactly, raising is clamped — so calling
+ * `nextBudget` twice with identical signals changes nothing anywhere else.
+ * Multiply by 0.85 twice and you have 0.72, and the difference compounds every
+ * poll for as long as the shortage lasts.
+ *
+ * That was not hypothetical. The budget effect keyed on `uplink` as well as on
+ * sender health, and those are two independent three-second timers, so the
+ * decrease ran about twice per observation: eleven steps across six polls in
+ * the captured session, 2.0 Mbps to the floor in twenty-one seconds. The caller
+ * is fixed (see SenderHealthState.tick), but a reducer whose correctness
+ * depends on a dependency array is a reducer waiting for the next caller to get
+ * it wrong. This makes the rate a property of the reducer instead.
+ *
+ * Below useSenderHealth's POLL_INTERVAL_MS of 3000 by enough that ordinary
+ * timer jitter cannot swallow a legitimate step, far above the near-zero gap
+ * between two effect runs in the same render pass.
+ */
+export const MIN_DECREASE_INTERVAL_MS = 2_500;
+
+/**
+ * What to assume a link can carry before anything has measured it.
+ *
+ * Two numbers, because the honest answer depends on something we DO know at
+ * share time: whether this path is one whose bandwidth estimate will ever mean
+ * anything. See isCapacityMeasurable — on a TURN/TCP or TURN/TLS relay it never
+ * will, so `estimateBps` reaches nextBudget as null for the entire session and
+ * the budget can only move by blind backoff and speculative probes.
+ *
+ * On such a path a generous cold start is not an optimistic guess that gets
+ * corrected; it is an overshoot with no measurement able to correct it. The
+ * captured session opened at 2 Mbps on a relay carrying well under one, and
+ * every step after that was the loop fighting its own opening bid: overshoot,
+ * standing queue in the pacer, sustained `under-served`, and a slide that only
+ * stopped at the floor.
+ *
+ * 800 kbps is where the chooser lands on 960x540@30 at 0.040 bpp — a real
+ * picture above TARGET_BPP, comfortably inside what a relayed path typically
+ * carries, and that is with the camera and mic already paid for. Starting
+ * there is cheap to be wrong about in the way that matters, because the
+ * recovery path is the one piece of this loop that works: 1.5x per probe puts
+ * it back at 2 Mbps in three probes, about half a minute, and a probe that
+ * overshoots reverts exactly.
+ */
+export const COLD_START_BUDGET_BPS = 2_000_000;
+export const RELAY_COLD_START_BUDGET_BPS = 800_000;
+
+/**
+ * The cold start for a path, given whether its estimate is worth anything.
+ *
+ * @param capacityMeasurable False on a TCP/TLS relay — i.e. exactly when
+ *   nothing downstream will ever be able to tell us we guessed too high.
+ */
+export function coldStartBudgetBps(capacityMeasurable: boolean): number {
+  return capacityMeasurable ? COLD_START_BUDGET_BPS : RELAY_COLD_START_BUDGET_BPS;
+}
+
+/**
  * Total bits per second a quality ceiling permits, video and audio together.
  *
  * Takes the same three bounds chooseOperatingPoint does, so the budget stops
@@ -459,7 +591,11 @@ export function budgetCeilingBps(
   const presetCeiling = preset.video.bitrate > 0 ? preset.video.bitrate : AUTO_MAX_BITRATE;
   const box = resolutionBox(quality, viewport, fps, capacityPixelsPerSecond);
   const video = Math.min(presetCeiling, usefulVideoBps(box, fps, bpp));
-  return video + preset.audio.bitrate;
+  // Companion streams included for the same reason chooseOperatingPoint
+  // subtracts them: this is a BUDGET, and the budget pays for the whole call.
+  // Without the term the budget could never climb high enough to fund `video`,
+  // so the cap would sit 88 kbps below the point it exists to mark.
+  return video + preset.audio.bitrate + COMPANION_STREAMS_BPS;
 }
 
 export interface BudgetState {
@@ -483,6 +619,25 @@ export interface BudgetSignals {
   health: SenderHealth;
   /** The receiver says this is not working. On `auto` this is its only route in. */
   viewerUnhappy: boolean;
+  /**
+   * The receiver is being sent far less picture than it has room to draw, and
+   * is NOT complaining about it.
+   *
+   * The other half of the viewer's report, and the half that was missing.
+   * `viewerUnhappy` can only ever push the budget down; nothing the far end
+   * could say was able to push it up, because `calculateQualityScore` has no
+   * resolution term at all — it is a minimum over loss, jitter, RTT, frame rate
+   * and freezes. A picture collapsed to 300x158 and painted into 2386x1358
+   * arrives clean and smooth, scores 100, and reports 'excellent'. The sender
+   * then reads that verdict as confirmation that nothing needs to change.
+   *
+   * So this is deliberately not folded into `viewerUnhappy`: it is not a
+   * complaint and must not be answered like one. It is evidence that the
+   * picture is too small, which is a reason to try SENDING MORE — see
+   * `wantsMore` below, where it earns a probe that sender health alone would
+   * not have asked for.
+   */
+  viewerStarved: boolean;
   headroom: number;
   /** Owns the frame rate, and through it the floor. */
   mode: ContentMode;
@@ -639,10 +794,12 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   if (shortage) {
     const byEstimate = target === null ? state.bps : Math.min(state.bps, target);
     const estimateSaysNothing = byEstimate >= state.bps;
-    const lowered =
-      target === null || (sig.viewerUnhappy && estimateSaysNothing)
-        ? state.bps * BACKOFF_FACTOR
-        : byEstimate;
+    const multiplicative = target === null || (sig.viewerUnhappy && estimateSaysNothing);
+    // The compounding path, and the only one that has to care how often it is
+    // called. Following an estimate down is a `min` and repeats harmlessly; a
+    // second 0.85 does not. See MIN_DECREASE_INTERVAL_MS.
+    if (multiplicative && sig.now - state.lastChangeAt < MIN_DECREASE_INTERVAL_MS) return state;
+    const lowered = multiplicative ? state.bps * BACKOFF_FACTOR : byEstimate;
     const bps = clamp(lowered);
     if (bps === state.bps) return state;
     return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
@@ -658,8 +815,22 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
     if (bps > state.bps) return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
   }
 
-  // Room to grow, with nothing measured to justify it. Probe.
-  const wantsMore = sig.health === 'satisfied' || sig.health === 'self-limited';
+  /*
+   * Room to grow, with nothing measured to justify it. Probe.
+   *
+   * `viewerStarved` is here rather than in `shortage` on purpose, and it is the
+   * only route by which the far end can ever ask for MORE. It also covers the
+   * case the two health verdicts cannot reach: a browser that publishes no
+   * `targetBitrate` reads 'unknown' forever, and 'unknown' is neither a
+   * shortage nor a reason to raise — so on Firefox and Safari a budget that
+   * collapsed had nothing at all able to lift it while the viewer sat watching
+   * a stamp. A probe is exactly the right instrument for that, because it is
+   * the one move that is safe to make on no evidence: it reverts to `baseBps`
+   * exactly if it fails, and its backoff doubles so a picture that genuinely
+   * cannot grow stops asking.
+   */
+  const wantsMore =
+    sig.health === 'satisfied' || sig.health === 'self-limited' || sig.viewerStarved;
   if (wantsMore && sig.now - state.lastChangeAt > state.probeBackoffMs) {
     const bps = raise(state.bps * PROBE_FACTOR);
     // Already at the ceiling. Returning here rather than marking `probing` is

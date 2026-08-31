@@ -115,8 +115,54 @@ export interface ViewerReport {
   level: QualityLevel;
   /** How big the picture is being drawn over there, or null if not reported. */
   viewport: Viewport | null;
+  /**
+   * How big the arriving picture actually is over there, or null if not
+   * reported. Against `viewport`, this is the deficit — see viewerIsStarved.
+   */
+  picture: Viewport | null;
   /** Arrival time, on the same clock the reducers are given through `now`. */
   at: number;
+}
+
+/**
+ * How small the arriving picture has to get, against the space it is drawn
+ * into, before the sender treats it as evidence rather than as normal downscale.
+ *
+ * An area ratio, so a ninth means "at most a third the size in each dimension".
+ * The line has to sit below every downscale a healthy constrained link produces
+ * and above the collapse this exists to catch, and those are not close together:
+ * 960x540 painted at 1920x1080 is a quarter, 1280x720 at 2386x1358 is 0.28, and
+ * the captured collapse — 300x158 at 2386x1358 — is 0.015. Nearly an order of
+ * magnitude of daylight on either side.
+ */
+export const VIEWER_STARVED_AREA_RATIO = 1 / 9;
+
+/**
+ * Is the far end being sent far less picture than it has room for, while
+ * reporting that the connection is fine?
+ *
+ * Both halves matter. The deficit alone is not actionable — a viewer that is
+ * ALSO complaining is describing a link in trouble, and `viewerUnhappy` already
+ * carries that to the budget as a reason to send less. This is the opposite
+ * case, and the one nothing could see: a clean, smooth, tiny picture. The
+ * receiver's own score cannot represent it, because every term in
+ * `calculateQualityScore` is about delivery rather than about size.
+ *
+ * Null-safe throughout, and false whenever a term is missing: a peer on an
+ * older build reports no picture size, and absence must not manufacture a
+ * verdict. Same discipline as estimateFromBitrate's capacityKnown.
+ */
+export function viewerIsStarved(report: ViewerReport | null, now: number): boolean {
+  const fresh = freshViewerReport(report, now);
+  if (!fresh || !fresh.viewport || !fresh.picture) return false;
+  // A complaint is a different signal with a different answer. Do not let one
+  // report drive the budget in both directions at once.
+  if (viewerIsUnhappy(fresh.level)) return false;
+
+  const room = fresh.viewport.width * fresh.viewport.height;
+  const arriving = fresh.picture.width * fresh.picture.height;
+  if (room <= 0 || arriving <= 0) return false;
+  return arriving < room * VIEWER_STARVED_AREA_RATIO;
 }
 
 /**
@@ -150,6 +196,11 @@ export function currentViewerViewport(
   now: number,
 ): Viewport | null {
   return freshViewerReport(report, now)?.viewport ?? null;
+}
+
+/** The size actually arriving over there, or null when there is no fresh one. */
+export function currentViewerPicture(report: ViewerReport | null, now: number): Viewport | null {
+  return freshViewerReport(report, now)?.picture ?? null;
 }
 
 /** A viewer report that means "this is working". */

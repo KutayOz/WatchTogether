@@ -74,6 +74,47 @@ describe('classifySenderHealth', () => {
     ).toBe('cpu-bound');
   });
 
+  it('leaves no band between under-served and self-limited', () => {
+    // The stall that outlived the collapse. 'under-served' needed ratio < 0.85
+    // and 'self-limited' needed ratio >= 0.95, so a bandwidth-limited encoder
+    // sitting at 0.90 of its ask — precisely where a SUCCESSFUL probe on a busy
+    // link lands — was classified 'unknown'. 'unknown' means hold to both
+    // consumers, so the budget stopped one step short of the link's real
+    // capacity and could never find the rest of it.
+    expect(
+      classifySenderHealth(
+        stats({ qualityLimitationReason: 'bandwidth', targetBitrate: 900_000 }),
+        1_000_000,
+      ),
+    ).toBe('self-limited');
+    // And the line itself, so the two verdicts stay back to back.
+    expect(
+      classifySenderHealth(
+        stats({ qualityLimitationReason: 'bandwidth', targetBitrate: 850_000 }),
+        1_000_000,
+      ),
+    ).toBe('self-limited');
+    expect(
+      classifySenderHealth(
+        stats({ qualityLimitationReason: 'bandwidth', targetBitrate: 849_000 }),
+        1_000_000,
+      ),
+    ).toBe('under-served');
+  });
+
+  it('treats an unlimited encoder that is under-spending as no news', () => {
+    // Nothing is holding it back and it is still not spending its ceiling, so
+    // the content simply does not need the bits. That is a statement about the
+    // picture, not about the link — raising would buy nothing and lowering
+    // would be answering a question nobody asked.
+    expect(
+      classifySenderHealth(
+        stats({ qualityLimitationReason: 'none', targetBitrate: 400_000 }),
+        1_000_000,
+      ),
+    ).toBe('unknown');
+  });
+
   it('has no opinion where the browser will not say', () => {
     // Firefox and Safari do not publish targetBitrate. A guess here would drive
     // the whole loop.

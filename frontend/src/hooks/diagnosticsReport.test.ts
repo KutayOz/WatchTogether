@@ -47,6 +47,8 @@ function sample(over: Partial<DiagnosticsSnapshot> = {}): DiagnosticsSnapshot {
     lossPercent: null,
     viewerLevel: null,
     viewerViewport: null,
+    viewerPicture: null,
+    viewerStarved: false,
     peerShare: null,
     ...over,
   };
@@ -197,5 +199,48 @@ describe('formatDiagnosticsReport', () => {
     });
     expect(text).toContain('warn [WebRTC] falling back to H.264');
     expect(text).toContain('ICE connected');
+  });
+});
+
+
+/**
+ * The line that was true and unhelpful.
+ *
+ * `they say excellent` was the whole of what the report knew about the far end,
+ * and it was the single most misleading line in it: the receiver's score has no
+ * resolution term, so a picture collapsed to a stamp reports perfect health.
+ * The deficit has to be printed beside the verdict or the next reader draws the
+ * same wrong conclusion.
+ */
+describe('the viewer readout', () => {
+  it('prints the picture beside the room it is drawn in', () => {
+    const report = formatDiagnosticsReport({
+      header,
+      samples: [
+        sample({
+          viewerLevel: 'excellent',
+          viewerViewport: { width: 2386, height: 1358 },
+          viewerPicture: { width: 300, height: 158 },
+          viewerStarved: true,
+        }),
+      ],
+      logs: [],
+      ice: null,
+    });
+    expect(report).toContain('drawing it at 2386x1358');
+    expect(report).toContain('getting 300x158');
+    expect(report).toContain('STARVED');
+  });
+
+  it('says nothing about a deficit it cannot measure', () => {
+    const report = formatDiagnosticsReport({
+      header,
+      samples: [sample({ viewerLevel: 'good', viewerViewport: { width: 1920, height: 1080 } })],
+      logs: [],
+      ice: null,
+    });
+    expect(report).toContain('drawing it at 1920x1080');
+    expect(report).not.toContain('getting');
+    expect(report).not.toContain('STARVED');
   });
 });
