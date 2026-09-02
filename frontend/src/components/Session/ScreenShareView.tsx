@@ -1,11 +1,16 @@
 import { logger } from '../../services/logger';
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { MediaControls } from '../Controls/MediaControls';
+import { MediaControls, type MediaControlsQualityProps } from '../Controls/MediaControls';
 import { QualityIndicator } from '../Quality/QualityIndicator';
 import { StickerButton, BurstSticker, Doodle, SFX } from '../manga';
 import type { QualityLevel, Viewport } from '../../types';
 
-interface ScreenShareViewProps {
+/**
+ * Extends the quality-and-voice props so the fullscreen control bar can be fed
+ * everything the windowed one gets. Passed through untouched: this component
+ * has no opinion about quality, it only owns the element that goes fullscreen.
+ */
+interface ScreenShareViewProps extends MediaControlsQualityProps {
   screenStream: MediaStream | null;
   isLocalSharing: boolean;
   sharerName: string | null;
@@ -79,6 +84,18 @@ export function ScreenShareView({
   onLocalCursor,
   onViewportChange,
   onDebugReport,
+  screenShareQuality,
+  onQualityChange,
+  uplink,
+  diagnostics,
+  appliedPoint,
+  atBudgetFloor,
+  inbound,
+  peerShare,
+  contentMode,
+  onContentModeChange,
+  peerVolume,
+  onPeerVolumeChange,
 }: ScreenShareViewProps) {
   /*
    * The screen <video> is tracked twice on purpose: a ref to write through,
@@ -861,6 +878,18 @@ export function ScreenShareView({
             screenAudioVolume={audioVolume}
             onScreenAudioVolumeChange={handleVolumeChange}
             onDebugReport={onDebugReport}
+            screenShareQuality={screenShareQuality}
+            onQualityChange={onQualityChange}
+            uplink={uplink}
+            diagnostics={diagnostics}
+            appliedPoint={appliedPoint}
+            atBudgetFloor={atBudgetFloor}
+            inbound={inbound}
+            peerShare={peerShare}
+            contentMode={contentMode}
+            onContentModeChange={onContentModeChange}
+            peerVolume={peerVolume}
+            onPeerVolumeChange={onPeerVolumeChange}
           />
           <button
             type="button"

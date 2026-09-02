@@ -15,7 +15,7 @@ import type { OperatingPoint } from '../../hooks/operatingPoint';
 import { jitterBufferMs, type InboundScreenStats } from '../../hooks/useQualityMonitor';
 import { SOURCE_IDLE_FPS_RATIO } from '../../hooks/useSenderHealth';
 
-interface MediaControlsProps {
+export interface MediaControlsProps {
   isMuted: boolean;
   isCameraOn: boolean;
   isScreenSharing: boolean;
@@ -72,6 +72,34 @@ interface MediaControlsProps {
    */
   onDebugReport?: () => void;
 }
+
+/**
+ * The quality and voice half of the props.
+ *
+ * MediaControls is rendered twice — in the windowed layout, and inside
+ * ScreenShareView's container so the fullscreen top layer has a control bar —
+ * and the fullscreen copy shipped without any of these for its whole life. The
+ * quality button still rendered there (it is gated on
+ * `isSharer || !isScreenSharing`) but its menu is gated on `onQualityChange`,
+ * so it was a dead button; and the VOICE menu opened empty, because the peer
+ * slider needs `onPeerVolumeChange`. One named type, so both call sites are
+ * fed from the same object and cannot drift apart again.
+ */
+export type MediaControlsQualityProps = Pick<
+  MediaControlsProps,
+  | 'screenShareQuality'
+  | 'onQualityChange'
+  | 'uplink'
+  | 'diagnostics'
+  | 'appliedPoint'
+  | 'atBudgetFloor'
+  | 'inbound'
+  | 'peerShare'
+  | 'contentMode'
+  | 'onContentModeChange'
+  | 'peerVolume'
+  | 'onPeerVolumeChange'
+>;
 
 export function MediaControls({
   isMuted,
