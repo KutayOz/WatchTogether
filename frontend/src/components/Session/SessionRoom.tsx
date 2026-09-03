@@ -49,6 +49,8 @@ import { api } from '../../services/api';
 import { Sidebar } from './Sidebar';
 import { ScreenShareView } from './ScreenShareView';
 import { ScreenShareRequest } from './ScreenShareRequest';
+import { FullscreenPortal } from '../common/FullscreenPortal';
+import type { MediaControlsQualityProps } from '../Controls/MediaControls';
 import { PreflightLobby, type PreflightInitialState } from './PreflightLobby';
 import { ConnectionQualityBadge } from './ConnectionQualityBadge';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
@@ -1807,6 +1809,28 @@ export function SessionRoom() {
     }
   })();
 
+  /*
+   * The quality and voice controls, built once and spread into BOTH control
+   * bars — the windowed one below, and the one ScreenShareView renders inside
+   * its fullscreen container. They used to be listed on the windowed bar only,
+   * which is why the fullscreen quality button was dead and its VOICE menu
+   * empty. See MediaControlsQualityProps.
+   */
+  const qualityControls: MediaControlsQualityProps = {
+    screenShareQuality,
+    onQualityChange: handleQualityChange,
+    uplink,
+    diagnostics,
+    appliedPoint: webrtc.isScreenSharing ? operatingPoint : null,
+    atBudgetFloor,
+    inbound: isWatchingRemoteScreen ? qualityMonitor.inbound : null,
+    peerShare: isWatchingRemoteScreen ? peerShareStatus : null,
+    contentMode,
+    onContentModeChange: handleContentModeChange,
+    peerVolume,
+    onPeerVolumeChange: setPeerVolume,
+  };
+
   return (
     <div
       style={{
@@ -1820,75 +1844,86 @@ export function SessionRoom() {
         zIndex: 1,
       }}
     >
-      {screenShareRequest && (
-        <ScreenShareRequest
-          requesterName={screenShareRequest.from}
-          onApprove={handleApproveScreenShare}
-          onDeny={handleDenyScreenShare}
+      {/*
+        Everything `position: fixed` at room level goes through FullscreenPortal.
+        ScreenShareView's container is what goes fullscreen, and the browser
+        paints nothing outside a fullscreen element — so without the portal an
+        incoming share request, a "reconnecting…" toast, or the `D` debug modal
+        (which also switches every keyboard shortcut off while it is open) all
+        kept happening where nobody could see them. Outside fullscreen the
+        portal renders inline and this tree is exactly what it was.
+      */}
+      <FullscreenPortal>
+        {screenShareRequest && (
+          <ScreenShareRequest
+            requesterName={screenShareRequest.from}
+            onApprove={handleApproveScreenShare}
+            onDeny={handleDenyScreenShare}
+          />
+        )}
+
+        {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+
+        <KeyboardShortcutsModal isOpen={showCheatSheet} onClose={() => setShowCheatSheet(false)} />
+
+        <DebugReportModal
+          isOpen={debugReport !== null}
+          onClose={() => setDebugReport(null)}
+          report={debugReport ?? ''}
         />
-      )}
 
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+        {/* Watch Together URL prompt */}
+        {showWatchPrompt && (
+          <WatchUrlPrompt
+            onSubmit={handleStartWatch}
+            onCancel={() => setShowWatchPrompt(false)}
+          />
+        )}
 
-      <KeyboardShortcutsModal isOpen={showCheatSheet} onClose={() => setShowCheatSheet(false)} />
+        {/* Reactions: floating emojis drifting up from the bottom-centre,
+            fading out. role="status" + aria-live="polite" so screen readers
+            get a brief mention without interrupting. */}
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: 'fixed',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            pointerEvents: 'none',
+            zIndex: 70,
+            display: 'flex',
+            justifyContent: 'center',
+          }}
+        >
+          {reactions.map((r) => (
+            <span
+              key={r.id}
+              aria-label={`${r.from} reacted with ${r.emoji}`}
+              style={{
+                position: 'absolute',
+                bottom: 80,
+                fontSize: 44,
+                animation: 'reactionFloat 2200ms ease-out forwards',
+                // Slight horizontal jitter per reaction so they don't stack —
+                // hash the id into a deterministic offset.
+                transform: `translateX(${((r.id % 9) - 4) * 16}px)`,
+                userSelect: 'none',
+              }}
+            >
+              {r.emoji}
+            </span>
+          ))}
+        </div>
 
-      <DebugReportModal
-        isOpen={debugReport !== null}
-        onClose={() => setDebugReport(null)}
-        report={debugReport ?? ''}
-      />
-
-      {/* Watch Together URL prompt */}
-      {showWatchPrompt && (
-        <WatchUrlPrompt
-          onSubmit={handleStartWatch}
-          onCancel={() => setShowWatchPrompt(false)}
-        />
-      )}
-
-      {/* Reactions: floating emojis drifting up from the bottom-centre,
-          fading out. role="status" + aria-live="polite" so screen readers
-          get a brief mention without interrupting. */}
-      <div
-        role="status"
-        aria-live="polite"
-        style={{
-          position: 'fixed',
-          left: 0,
-          right: 0,
-          bottom: 0,
-          pointerEvents: 'none',
-          zIndex: 70,
-          display: 'flex',
-          justifyContent: 'center',
-        }}
-      >
-        {reactions.map((r) => (
-          <span
-            key={r.id}
-            aria-label={`${r.from} reacted with ${r.emoji}`}
-            style={{
-              position: 'absolute',
-              bottom: 80,
-              fontSize: 44,
-              animation: 'reactionFloat 2200ms ease-out forwards',
-              // Slight horizontal jitter per reaction so they don't stack —
-              // hash the id into a deterministic offset.
-              transform: `translateX(${((r.id % 9) - 4) * 16}px)`,
-              userSelect: 'none',
-            }}
-          >
-            {r.emoji}
-          </span>
-        ))}
-      </div>
-
-      {/* Reactions palette — small floating cluster bottom-right, always
-          available when there's a peer. R keyboard shortcut also opens it
-          (via the keyboard hook below). */}
-      {isCallActive && (
-        <ReactionsPalette onPick={handleSendReaction} />
-      )}
+        {/* Reactions palette — small floating cluster bottom-right, always
+            available when there's a peer. R keyboard shortcut also opens it
+            (via the keyboard hook below). */}
+        {isCallActive && (
+          <ReactionsPalette onPick={handleSendReaction} />
+        )}
+      </FullscreenPortal>
 
       {/* Top header strip */}
       <div
@@ -2102,24 +2137,33 @@ export function SessionRoom() {
           }}
         >
           <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+            {/*
+              A sibling of ScreenShareView, not a child, so in fullscreen it was
+              painted underneath the share: an ICE drop looked like a picture
+              that had silently frozen, with the TRY AGAIN button unreachable.
+              Portaled into the fullscreen element it fills that element
+              instead — `inset: 0` against a `position: fixed` container.
+            */}
             {(uiConnState === 'reconnecting' || uiConnState === 'lost') && (
-              <ConnectionOverlay
-                state={uiConnState}
-                onIceRestart={
-                  uiConnState === 'lost'
-                    ? () => {
-                        // Manual nudge — fires the same ICE-restart path that
-                        // the 5 s auto-restart inside webrtcService would take.
-                        // Useful when the user notices a stale 'lost' state.
-                        webrtc.createIceRestartOffer().then((offer) => {
-                          if (sessionIdRef.current) {
-                            transport.sendRenegotiationOffer(sessionIdRef.current, offer);
-                          }
-                        });
-                      }
-                    : undefined
-                }
-              />
+              <FullscreenPortal>
+                <ConnectionOverlay
+                  state={uiConnState}
+                  onIceRestart={
+                    uiConnState === 'lost'
+                      ? () => {
+                          // Manual nudge — fires the same ICE-restart path that
+                          // the 5 s auto-restart inside webrtcService would take.
+                          // Useful when the user notices a stale 'lost' state.
+                          webrtc.createIceRestartOffer().then((offer) => {
+                            if (sessionIdRef.current) {
+                              transport.sendRenegotiationOffer(sessionIdRef.current, offer);
+                            }
+                          });
+                        }
+                      : undefined
+                  }
+                />
+              </FullscreenPortal>
             )}
             {watchVideoId ? (
               <WatchTogetherPlayer
@@ -2162,6 +2206,7 @@ export function SessionRoom() {
               onLocalCursor={handleLocalCursor}
               onViewportChange={handleViewportChange}
               onDebugReport={() => void openDebugReport()}
+              {...qualityControls}
             />
             )}
           </div>
@@ -2178,22 +2223,11 @@ export function SessionRoom() {
               }
               onLeave={handleLeave}
               canShare={canRequestShare || webrtc.isScreenSharing}
-              screenShareQuality={screenShareQuality}
-              onQualityChange={handleQualityChange}
-              uplink={uplink}
-              diagnostics={diagnostics}
-              appliedPoint={webrtc.isScreenSharing ? operatingPoint : null}
-              atBudgetFloor={atBudgetFloor}
-              inbound={isWatchingRemoteScreen ? qualityMonitor.inbound : null}
-              peerShare={isWatchingRemoteScreen ? peerShareStatus : null}
+              {...qualityControls}
               onDebugReport={() => void openDebugReport()}
-              contentMode={contentMode}
-              onContentModeChange={handleContentModeChange}
               isSharer={isLocalSharing}
               hasPeer={!!peerName}
               peerDisplayName={peerName ?? undefined}
-              peerVolume={peerVolume}
-              onPeerVolumeChange={setPeerVolume}
               hasScreenAudio={hasScreenAudio && !isLocalSharing}
               screenAudioVolume={screenAudioVolume}
               onScreenAudioVolumeChange={setScreenAudioVolume}
