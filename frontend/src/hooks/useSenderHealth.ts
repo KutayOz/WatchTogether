@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { webrtcService } from '../services/webrtcService';
 import type { OutboundScreenStats } from '../types';
 
@@ -151,11 +151,22 @@ export function sourceIsIdle(
   if (!stats) return false;
   if (!askedFps || askedFps <= 0 || !askedArea || askedArea <= 0) return false;
 
+  // Capture stats distinguish a paused source from a congested encoder that
+  // preserves resolution while dropping frames. Encoded FPS alone cannot.
+  if (typeof stats.sourceFramesPerSecond === 'number' &&
+      Number.isFinite(stats.sourceFramesPerSecond) && stats.sourceFramesPerSecond >= 0) {
+    return stats.sourceFramesPerSecond < askedFps * SOURCE_IDLE_FPS_RATIO;
+  }
+  // Without source stats, explicit bandwidth pressure wins over the heuristic.
+  if (stats.qualityLimitationReason !== 'none') return false;
   const { framesPerSecond, frameWidth, frameHeight } = stats;
   if (
     typeof framesPerSecond !== 'number' ||
     typeof frameWidth !== 'number' ||
-    typeof frameHeight !== 'number'
+    typeof frameHeight !== 'number' ||
+    !Number.isFinite(framesPerSecond) || framesPerSecond < 0 ||
+    !Number.isFinite(frameWidth) || frameWidth <= 0 ||
+    !Number.isFinite(frameHeight) || frameHeight <= 0
   ) {
     return false;
   }
@@ -197,7 +208,8 @@ export function classifySenderHealth(
 
   // Without both terms there is no ratio to judge, and a guess here would drive
   // the ladder. Firefox and Safari land in this branch.
-  if (typeof stats.targetBitrate !== 'number' || !configuredBps || configuredBps <= 0) {
+  if (typeof stats.targetBitrate !== 'number' || !Number.isFinite(stats.targetBitrate) ||
+      stats.targetBitrate < 0 || !configuredBps || !Number.isFinite(configuredBps) || configuredBps <= 0) {
     return 'unknown';
   }
 
@@ -230,6 +242,7 @@ export function classifySenderHealth(
    * got what we asked for and is still being held back — our ceiling is the
    * binding constraint, which is what 'self-limited' means.
    */
+  if (stats.qualityLimitationReason !== 'bandwidth') return 'unknown';
   return ratio < UNDER_SERVED_RATIO ? 'under-served' : 'self-limited';
 }
 
@@ -325,66 +338,52 @@ export function useSenderHealth(
     latest: null,
   });
 
-  // Refs, not state: the poller must read the *current* ceiling and streak
-  // without re-creating the interval every time either changes.
-  const configuredRef = useRef(configuredBps);
+  const configRef = useRef({ bps: configuredBps, area: asked?.area, fps: asked?.fps });
+  const runRef = useRef<{ verdict: SenderHealth; count: number }>({ verdict: 'unknown', count: 0 });
   useEffect(() => {
-    configuredRef.current = configuredBps;
-  }, [configuredBps]);
-
-  const askedRef = useRef(asked);
-  useEffect(() => {
-    askedRef.current = asked;
-  }, [asked]);
-
-  const runRef = useRef<{ verdict: SenderHealth; count: number }>({
-    verdict: 'unknown',
-    count: 0,
-  });
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const poll = useCallback(async () => {
-    const stats = await webrtcService.getOutboundScreenStats().catch(() => null);
-    const askedNow = askedRef.current;
-    const verdict = classifySenderHealth(
-      stats,
-      configuredRef.current,
-      askedNow?.area ?? null,
-      askedNow?.fps ?? null,
-    );
-
-    const run = runRef.current;
-    run.count = verdict === run.verdict ? run.count + 1 : 1;
-    run.verdict = verdict;
-
-    setState((prev) => ({
-      // Report the verdict only once it has held. A single bad 3-second window
-      // — a passing wifi dip, someone else on the link starting a download —
-      // must not move anyone's quality.
-      health: run.count >= SUSTAIN_POLLS ? verdict : 'unknown',
-      streak: run.count,
-      // The one place this is incremented. See the field's doc.
-      tick: prev.tick + 1,
-      latest: stats,
-    }));
-  }, []);
+    const old = configRef.current;
+    const config = { bps: configuredBps, area: asked?.area, fps: asked?.fps };
+    if (old.bps !== config.bps || old.area !== config.area || old.fps !== config.fps) {
+      // Evidence about the previous ceiling cannot immediately cut the new one.
+      runRef.current = { verdict: 'unknown', count: 0 };
+    }
+    configRef.current = config;
+  }, [configuredBps, asked?.area, asked?.fps]);
 
   useEffect(() => {
     if (!isActive) return;
-
+    let cancelled = false;
+    let pending = false;
+    const poll = async () => {
+      if (pending) return;
+      pending = true;
+      const config = configRef.current;
+      try {
+        const stats = await webrtcService.getOutboundScreenStats().catch(() => null);
+        if (cancelled || config !== configRef.current) return;
+        const verdict = classifySenderHealth(stats, config.bps, config.area ?? null, config.fps ?? null);
+        const run = runRef.current;
+        run.count = verdict === run.verdict ? run.count + 1 : 1;
+        run.verdict = verdict;
+        setState((prev) => ({
+          health: run.count >= SUSTAIN_POLLS ? verdict : 'unknown',
+          streak: run.count,
+          tick: prev.tick + 1,
+          latest: stats,
+        }));
+      } finally {
+        pending = false;
+      }
+    };
     void poll();
-    intervalRef.current = setInterval(() => void poll(), POLL_INTERVAL_MS);
-
+    const interval = setInterval(() => void poll(), POLL_INTERVAL_MS);
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      intervalRef.current = null;
+      cancelled = true;
+      clearInterval(interval);
       runRef.current = { verdict: 'unknown', count: 0 };
-      // `tick` restarts with the share it counts. A controller keyed on it sees
-      // the reset as one more observation and re-evaluates against the fresh
-      // cold-start budget, which is exactly right.
       setState({ health: 'unknown', streak: 0, tick: 0, latest: null });
     };
-  }, [isActive, poll]);
+  }, [isActive]);
 
   return state;
 }

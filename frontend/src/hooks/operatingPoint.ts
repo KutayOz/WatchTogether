@@ -35,73 +35,22 @@ import type { SenderHealth } from './useSenderHealth';
  * keeps its judgement testable (see estimateFromBitrate, calculateQualityScore).
  */
 
-/**
- * The bpp we try to stay at or above.
- *
- * Calibrated for VP9 on film-like motion content, which is what this app
- * carries. Roughly: >= 0.035 looks good, 0.025-0.035 is acceptable, below 0.02
- * is visibly soft. VP9's screen-content tools and the fact that captured film
- * is already denoised and grain-free both buy a little headroom over what these
- * numbers would mean for a camera feed.
- */
+/** Minimum bitrate density used when choosing a smaller picture under pressure. */
 export const TARGET_BPP = 0.035;
 
-/**
- * Hard ceiling for the `auto` preset, in bps.
- *
- * `auto` used to `delete enc.maxBitrate`, leaving the encoder unbounded. On a
- * link slower than the encoder's ambition that is the worst of both worlds: it
- * overshoots the path, the pacer builds a standing queue, the delay-based
- * controller sees the queue as congestion, and the picture goes soft and laggy
- * simultaneously. A finite ceiling is strictly better even when it is generous.
- *
- * Derived, not guessed: the largest picture `auto` will send is 4K, and 4K at
- * 24 fps needs 6.97 Mbps merely to REACH target bpp. The old 6 Mbps therefore
- * could not fund 4K at all — raising `auto` past 1080p without raising this
- * would have changed nothing. Ten gives 4K24 a comfortable 0.050 bpp, and at 60
- * fps it lands the chooser on 1440p, which is the honest answer at that frame
- * rate anyway.
- */
+/** Absolute encoder safety ceiling. The normal 1080p target is lower. */
 export const AUTO_MAX_BITRATE = 10_000_000;
 
-/**
- * Bits per pixel per frame past which more bits stop buying visible quality.
- *
- * Roughly three times TARGET_BPP. This exists because the budget measures what
- * the LINK can carry, not what the PICTURE can use, and the two came apart as
- * soon as the receiver's viewport started bounding resolution: someone watching
- * in a 1280x720 window on a fast link would otherwise be sent 720p at 0.45 bpp
- * — bits with nowhere to land, taken from a connection they are also using for
- * everything else.
- *
- * It is a ceiling on waste, not a target. Nothing is ever raised TO it — see
- * PROBE_CEILING_BPP, which is what actually bounds the climb. That sentence was
- * false for a while: `budgetCeilingBps` was built from this number and
- * `nextBudget` raised the budget TO its cap, so within about thirty seconds
- * every share on a link with headroom settled at 1080p24 / 4.98 Mbps — 0.100
- * bpp, three times TARGET_BPP. The invariant stated here was contradicted by
- * the reducer two hundred lines below it.
- */
-export const MAX_USEFUL_BPP = 0.1;
+/** Upper guard against spending unlimited bits on a small encoded picture. */
+export const MAX_USEFUL_BPP = 0.16;
 
 /**
- * The bpp an upward move is allowed to reach for.
- *
- * MAX_USEFUL_BPP is where more bits stop buying anything at all; this is where
- * they stop being worth ASKING for on speculation. About 1.4x TARGET_BPP: enough
- * headroom that a scene with more motion than the last one does not immediately
- * look soft, far short of the 3x the climb used to take.
- *
- * The distinction matters because the two numbers answer different questions. A
- * trusted estimate saying "the link has this much" is measurement, and
- * MAX_USEFUL_BPP still clamps it. A probe is a guess, and a guess that spends
- * three times what the picture needs costs the viewer twice: it oversubscribes
- * a home uplink, and it asks a software encoder for a bitrate that can push it
- * over its cliff — the state nothing in this system could recover from.
- *
- * 1080p24 lands at 2.49 Mbps here, against 4.98 before.
+ * Quality budget for motion, including hardware H.264. The old VP9-specific
+ * 0.05 cap limited 1080p24 to 2.49 Mbps even on a 30 Mbps uplink. About 6 Mbps
+ * at 1080p24 leaves space for difficult scenes without forcing 4K encoding.
+ * This is a policy target, not a claim that all content has a fixed bpp need.
  */
-export const PROBE_CEILING_BPP = 0.05;
+export const PROBE_CEILING_BPP = 0.12;
 
 /**
  * Resolutions we are willing to send, largest first.
@@ -241,16 +190,7 @@ export function minBudgetBps(fps: number): number {
  */
 const UNKNOWN_VIEWPORT: Viewport = { width: 1920, height: 1080 };
 
-/**
- * The largest picture we are willing to send: the preset's box, bounded by what
- * the far end can actually display.
- *
- * The asymmetry between `auto` and a fixed preset is deliberate. `auto` means
- * "you decide", so an absent viewport report falls back to the conservative
- * assumption above. A fixed preset means "I decided" — the same principle
- * withUserChoice already encodes, that an explicit choice is a statement of
- * intent — so a report that never arrived must not quietly overrule it.
- */
+/** Automatic mode follows the viewport; explicit presets preserve the chosen size. */
 export function resolutionBox(
   ceiling: ScreenShareQuality,
   viewport: Viewport | null,
@@ -258,7 +198,9 @@ export function resolutionBox(
   maxPixelsPerSecond: number | null = null,
 ): Viewport {
   const preset = QUALITY_PRESETS[ceiling] ?? QUALITY_PRESETS.auto;
-  const bound = viewport ?? (ceiling === 'auto' ? UNKNOWN_VIEWPORT : null);
+  // A fixed preset is an explicit quality choice. Resizing the receiver's
+  // browser must not silently overwrite it or repeatedly reconfigure capture.
+  const bound = ceiling === 'auto' ? (viewport ?? UNKNOWN_VIEWPORT) : null;
   const box = bound
     ? {
         width: Math.min(preset.video.width, bound.width),
@@ -535,38 +477,13 @@ export const BACKOFF_FACTOR = 0.85;
 export const MIN_DECREASE_INTERVAL_MS = 2_500;
 
 /**
- * What to assume a link can carry before anything has measured it.
- *
- * Two numbers, because the honest answer depends on something we DO know at
- * share time: whether this path is one whose bandwidth estimate will ever mean
- * anything. See isCapacityMeasurable — on a TURN/TCP or TURN/TLS relay it never
- * will, so `estimateBps` reaches nextBudget as null for the entire session and
- * the budget can only move by blind backoff and speculative probes.
- *
- * On such a path a generous cold start is not an optimistic guess that gets
- * corrected; it is an overshoot with no measurement able to correct it. The
- * captured session opened at 2 Mbps on a relay carrying well under one, and
- * every step after that was the loop fighting its own opening bid: overshoot,
- * standing queue in the pacer, sustained `under-served`, and a slide that only
- * stopped at the floor.
- *
- * 800 kbps is where the chooser lands on 960x540@30 at 0.040 bpp — a real
- * picture above TARGET_BPP, comfortably inside what a relayed path typically
- * carries, and that is with the camera and mic already paid for. Starting
- * there is cheap to be wrong about in the way that matters, because the
- * recovery path is the one piece of this loop that works: 1.5x per probe puts
- * it back at 2 Mbps in three probes, about half a minute, and a probe that
- * overshoots reverts exactly.
+ * Start direct paths with a useful 1080p movie budget. A relay has no inherent
+ * 800 kbps speed limit; start it at 2 Mbps and let the same measured feedback
+ * and probes adapt. These are initial ceilings, not minimum network demands.
  */
-export const COLD_START_BUDGET_BPS = 2_000_000;
-export const RELAY_COLD_START_BUDGET_BPS = 800_000;
+export const COLD_START_BUDGET_BPS = 4_000_000;
+export const RELAY_COLD_START_BUDGET_BPS = 2_000_000;
 
-/**
- * The cold start for a path, given whether its estimate is worth anything.
- *
- * @param capacityMeasurable False on a TCP/TLS relay — i.e. exactly when
- *   nothing downstream will ever be able to tell us we guessed too high.
- */
 export function coldStartBudgetBps(capacityMeasurable: boolean): number {
   return capacityMeasurable ? COLD_START_BUDGET_BPS : RELAY_COLD_START_BUDGET_BPS;
 }
@@ -638,6 +555,8 @@ export interface BudgetSignals {
    * not have asked for.
    */
   viewerStarved: boolean;
+  /** Fresh receiver evidence that delivery is healthy, including browsers without sender stats. */
+  viewerHealthy?: boolean;
   headroom: number;
   /** Owns the frame rate, and through it the floor. */
   mode: ContentMode;
@@ -697,17 +616,8 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   );
   const clamp = (bps: number) => Math.min(cap, Math.max(floor, bps));
 
-  /*
-   * Where an upward move may reach, as opposed to where the budget may sit.
-   *
-   * `cap` is MAX_USEFUL_BPP — the point past which more bits buy nothing — and
-   * for a long time it was also the target, because both upward branches
-   * clamped to it. Every share on a link with headroom therefore climbed to
-   * 0.100 bpp within half a minute, three times what TARGET_BPP calls good, and
-   * asked a software encoder for a bitrate that could put it over its cliff.
-   * Raising stops at PROBE_CEILING_BPP now; `cap` goes back to being the clamp
-   * its own comment says it is.
-   */
+  // A probe has a finite scene-quality target; native congestion control
+  // remains free to spend less than this ceiling on easy content.
   const raiseCap = Math.max(
     floor,
     Math.min(
@@ -774,10 +684,19 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
     };
   }
 
-  // A probe that held. Bank it, and reset the backoff — without the reset one
-  // early failure would permanently slow every later recovery.
-  if (state.probing && sig.now - state.lastChangeAt > PROBE_VERDICT_WINDOW_MS) {
-    return { ...state, baseBps: state.bps, probing: false, probeBackoffMs: PROBE_INTERVAL_MS };
+  // Never start a second probe while the first one is still being judged.
+  // Previously the 9 s retry could restart a probe before its 12 s verdict,
+  // losing the proven base and repeatedly increasing an unproven load.
+  if (state.probing) {
+    if (sig.now - state.lastChangeAt < PROBE_VERDICT_WINDOW_MS) return state;
+    const confirmed = sig.health === 'satisfied' || sig.health === 'self-limited' ||
+      sig.viewerHealthy === true || sig.viewerStarved;
+    if (confirmed) {
+      return { ...state, baseBps: state.bps, probing: false, probeBackoffMs: PROBE_INTERVAL_MS };
+    }
+    // Missing statistics are not proof that a trial succeeded. Restore the
+    // previous budget without penalising the path as a failed congestion probe.
+    return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
   }
 
   // Genuine shortage. Follow a trusted estimate down; without one, back off
@@ -830,7 +749,8 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
    * cannot grow stops asking.
    */
   const wantsMore =
-    sig.health === 'satisfied' || sig.health === 'self-limited' || sig.viewerStarved;
+    sig.health === 'satisfied' || sig.health === 'self-limited' ||
+    sig.viewerHealthy === true || sig.viewerStarved;
   if (wantsMore && sig.now - state.lastChangeAt > state.probeBackoffMs) {
     const bps = raise(state.bps * PROBE_FACTOR);
     // Already at the ceiling. Returning here rather than marking `probing` is

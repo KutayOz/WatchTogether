@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, createElement, useEffect } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { webrtcService } from '../services/webrtcService';
 import { budgetCeilingBps } from './operatingPoint';
 import {
   OVER_ESTIMATE_MARGIN,
@@ -9,6 +12,7 @@ import {
   shouldClamp,
   throughputBps,
   type UplinkSample,
+  useUplinkEstimate,
 } from './useUplinkEstimate';
 import { QUALITY_LADDER, QUALITY_PRESETS, type ScreenShareQuality } from '../types';
 
@@ -186,11 +190,28 @@ describe('reading the candidate pair', () => {
     expect(sample).toMatchObject({ pairId: 'live', bps: 30_000, relayProtocol: 'tcp' });
   });
 
+  it('uses the transport selection over an obsolete nominated pair', () => {
+    const sample = readUplinkSample(report([
+      { id: 'transport', type: 'transport', selectedCandidatePairId: 'selected' },
+      { id: 'selected', type: 'candidate-pair', state: 'succeeded', availableOutgoingBitrate: 9_000_000 },
+      { id: 'stale', type: 'candidate-pair', state: 'succeeded', nominated: true, availableOutgoingBitrate: 30_000 },
+    ]), 1000);
+    expect(sample).toMatchObject({ pairId: 'selected', bps: 9_000_000 });
+  });
+
+  it('keeps byte counters when capacity is absent and rejects invalid numbers', () => {
+    const sample = readUplinkSample(report([
+      { id: 'p', type: 'candidate-pair', state: 'succeeded', bytesSent: 1_000_000, availableOutgoingBitrate: NaN },
+    ]), 1000);
+    expect(sample).toMatchObject({ bps: null, bytesSent: 1_000_000 });
+    expect(reconcileEstimate(Infinity, 1_000_000, true)).toEqual({ bps: 1_000_000, capacityKnown: false });
+  });
+
   it('has no opinion when the browser publishes none', () => {
     // Firefox. Null must mean "do not clamp", never "clamp to the lowest".
     expect(
       readUplinkSample(report([{ id: 'p', type: 'candidate-pair', state: 'succeeded' }]), 0),
-    ).toBeNull();
+    ).toMatchObject({ bps: null });
   });
 
   it('does not trust a TCP or TLS relay to measure capacity', () => {
@@ -303,5 +324,67 @@ describe('withinEstimate is advice, not a lock', () => {
     expect(estimate.withinEstimate.high).toBe(false);
     expect(estimate.withinEstimate.ultra).toBe(false);
     expect(estimate.withinEstimate.extreme).toBe(false);
+  });
+});
+
+
+describe('uplink polling lifecycle', () => {
+  let root: Root;
+  let estimate: ReturnType<typeof useUplinkEstimate>;
+  const pair = (id: string, bps: number) => new Map([
+    [id, { id, type: 'candidate-pair', state: 'succeeded', nominated: true,
+      availableOutgoingBitrate: bps, bytesSent: 1000 }],
+  ]) as unknown as RTCStatsReport;
+  function Probe({ active = true, resetKey = 0 }: { active?: boolean; resetKey?: number }) {
+    const value = useUplinkEstimate(active, resetKey);
+    useEffect(() => { estimate = value; }, [value]);
+    return null;
+  }
+  beforeEach(() => {
+    vi.useFakeTimers();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    root = createRoot(document.createElement('div'));
+    estimate = null;
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('discards the old median when ICE switches to a different path', async () => {
+    const getStats = vi.spyOn(webrtcService, 'getStats').mockResolvedValue(pair('old', 500_000));
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(estimate?.uplinkBps).toBe(500_000);
+    getStats.mockResolvedValue(pair('new', 12_000_000));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(estimate).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(estimate?.uplinkBps).toBe(12_000_000);
+  });
+
+  it('does not allow an old pending read to populate a new share window', async () => {
+    let completeOld!: (stats: RTCStatsReport) => void;
+    vi.spyOn(webrtcService, 'getStats')
+      .mockImplementationOnce(() => new Promise((resolve) => { completeOld = resolve; }))
+      .mockResolvedValue(pair('new', 12_000_000));
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => root.render(createElement(Probe, { resetKey: 1 })));
+    await act(async () => completeOld(pair('old', 30_000)));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(estimate).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(estimate?.uplinkBps).toBe(12_000_000);
+  });
+
+  it('clears an estimate when stats fail instead of keeping stale capacity', async () => {
+    const getStats = vi.spyOn(webrtcService, 'getStats').mockResolvedValue(pair('p', 12_000_000));
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(estimate?.capacityKnown).toBe(true);
+    getStats.mockRejectedValue(new Error('connection closed'));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(estimate).toBeNull();
   });
 });

@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, createElement, useEffect } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { webrtcService } from '../services/webrtcService';
 import {
   classifySenderHealth,
   isSoftwareEncoder,
   shouldDowngradeCodec,
   sourceIsIdle,
+  useSenderHealth,
+  type SenderHealthState,
 } from './useSenderHealth';
 import type { OutboundScreenStats } from '../types';
 
@@ -113,6 +118,21 @@ describe('classifySenderHealth', () => {
         1_000_000,
       ),
     ).toBe('unknown');
+  });
+
+  it('does not interpret missing or other limitation reasons as bandwidth evidence', () => {
+    expect(classifySenderHealth(stats({ qualityLimitationReason: null }), 2_000_000)).toBe('unknown');
+    expect(classifySenderHealth(stats({ qualityLimitationReason: 'other' }), 2_000_000)).toBe('unknown');
+  });
+
+  it('does not mistake dropped encoded frames for an idle source', () => {
+    const congested = stats({
+      frameWidth: 1920, frameHeight: 1080, framesPerSecond: 2,
+      sourceFramesPerSecond: 30, targetBitrate: 300_000, qualityLimitationReason: 'bandwidth',
+    });
+    expect(classifySenderHealth(congested, 4_000_000, 1920 * 1080, 30)).toBe('under-served');
+    expect(classifySenderHealth({ ...congested, sourceFramesPerSecond: undefined },
+      4_000_000, 1920 * 1080, 30)).toBe('under-served');
   });
 
   it('has no opinion where the browser will not say', () => {
@@ -267,6 +287,7 @@ describe('classifySenderHealth and a still screen', () => {
       framesPerSecond: 1,
       qualityLimitationReason: 'bandwidth',
       targetBitrate: 300_000,
+      sourceFramesPerSecond: 1,
     });
     expect(classifySenderHealth(still, 410_000)).toBe('under-served');
     expect(classifySenderHealth(still, 410_000, 640 * 360, 30)).toBe('source-idle');
@@ -292,5 +313,55 @@ describe('classifySenderHealth and a still screen', () => {
     // was not given the evidence to alter.
     const sample = stats({ framesPerSecond: 1, qualityLimitationReason: 'none', targetBitrate: 400_000 });
     expect(classifySenderHealth(sample, 400_000)).toBe('satisfied');
+  });
+});
+
+
+describe('sender health polling lifecycle', () => {
+  let root: Root;
+  let state: SenderHealthState;
+  function Probe({ bps = 2_000_000, active = true }: { bps?: number; active?: boolean }) {
+    const value = useSenderHealth(active, bps, { area: 1920 * 1080, fps: 30 });
+    useEffect(() => { state = value; }, [value]);
+    return null;
+  }
+  beforeEach(() => {
+    vi.useFakeTimers();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    root = createRoot(document.createElement('div'));
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('requires fresh sustained evidence after changing the encoder budget', async () => {
+    vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({
+      qualityLimitationReason: 'bandwidth', targetBitrate: 400_000,
+    }));
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(state.health).toBe('under-served');
+    await act(async () => root.render(createElement(Probe, { bps: 1_000_000 })));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(state.health).toBe('unknown');
+    expect(state.streak).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(state.health).toBe('under-served');
+  });
+
+  it('never overlaps slow stats reads or publishes them after sharing ends', async () => {
+    let complete!: (sample: OutboundScreenStats) => void;
+    const read = vi.spyOn(webrtcService, 'getOutboundScreenStats').mockImplementation(
+      () => new Promise((resolve) => { complete = resolve; }),
+    );
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => vi.advanceTimersByTimeAsync(9000));
+    expect(read).toHaveBeenCalledTimes(1);
+    await act(async () => root.render(createElement(Probe, { active: false })));
+    await act(async () => complete(stats()));
+    expect(state.tick).toBe(0);
+    expect(state.latest).toBeNull();
   });
 });

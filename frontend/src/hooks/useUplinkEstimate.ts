@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { webrtcService } from '../services/webrtcService';
 import {
   QUALITY_LADDER,
@@ -157,7 +157,7 @@ interface CandidatePairStats {
 export interface UplinkSample {
   /** Pair identity. `bytesSent` restarts per pair, so deltas must not cross one. */
   pairId: string;
-  bps: number;
+  bps: number | null;
   bytesSent: number | null;
   /** How we reach the TURN server, when relayed: udp | tcp | tls. */
   relayProtocol?: string;
@@ -167,39 +167,45 @@ export interface UplinkSample {
 /**
  * Pull one sample off the active candidate pair.
  *
- * Returns null when the browser does not publish `availableOutgoingBitrate` —
- * Firefox does not — and null must mean "do not clamp", never "clamp to the
- * lowest". A guess is worse than no opinion here: it would silently cap quality
- * for every user of a browser that simply declines to answer the question.
+ * Missing capacity estimates stay null; byte counters can still provide a
+ * measured throughput lower bound. The selected ICE pair owns both counters.
  */
 export function readUplinkSample(stats: RTCStatsReport, atMs: number): UplinkSample | null {
-  let found: UplinkSample | null = null;
-  let foundNominated = false;
-
+  let selectedPairId: string | null = null;
   stats.forEach((report) => {
-    if (report.type !== 'candidate-pair') return;
-    const pair = report as RTCStats & CandidatePairStats;
-    if (pair.state !== 'succeeded') return;
-    if (typeof pair.availableOutgoingBitrate !== 'number') return;
-    // More than one pair can be in 'succeeded'; the nominated one carries the
-    // traffic. Prefer it, but take any succeeded pair over nothing.
-    if (found !== null && foundNominated && !pair.nominated) return;
-
-    const local = pair.localCandidateId
-      ? (stats.get(pair.localCandidateId) as (RTCStats & { relayProtocol?: string }) | undefined)
-      : undefined;
-
-    found = {
-      pairId: pair.id ?? report.id,
-      bps: pair.availableOutgoingBitrate,
-      bytesSent: typeof pair.bytesSent === 'number' ? pair.bytesSent : null,
-      relayProtocol: local?.relayProtocol,
-      atMs,
-    };
-    foundNominated = pair.nominated === true;
+    if (report.type === 'transport' && typeof report.selectedCandidatePairId === 'string') {
+      selectedPairId = report.selectedCandidatePairId;
+    }
   });
 
-  return found;
+  let found: (RTCStats & CandidatePairStats) | null = null;
+  stats.forEach((report) => {
+    if (report.type !== 'candidate-pair' || report.state !== 'succeeded') return;
+    const pair = report as RTCStats & CandidatePairStats;
+    // A nominated pair can remain in the report after ICE switches paths.
+    // The transport's selected ID is authoritative when the browser supplies it.
+    if (selectedPairId !== null) {
+      if (pair.id === selectedPairId) found = pair;
+      return;
+    }
+    if (found === null || (!found.nominated && pair.nominated)) found = pair;
+  });
+  if (found === null) return null;
+  const pair = found as RTCStats & CandidatePairStats;
+  const local = pair.localCandidateId
+    ? (stats.get(pair.localCandidateId) as (RTCStats & { relayProtocol?: string }) | undefined)
+    : undefined;
+  return {
+    pairId: pair.id,
+    bps: finiteNonnegative(pair.availableOutgoingBitrate),
+    bytesSent: finiteNonnegative(pair.bytesSent),
+    relayProtocol: local?.relayProtocol,
+    atMs,
+  };
+}
+
+function finiteNonnegative(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 /**
@@ -256,6 +262,8 @@ export function reconcileEstimate(
   observedBps: number | null,
   capacityMeasurable: boolean,
 ): { bps: number | null; capacityKnown: boolean } {
+  estimateBps = finiteNonnegative(estimateBps);
+  observedBps = finiteNonnegative(observedBps);
   if (!capacityMeasurable) return { bps: observedBps ?? estimateBps, capacityKnown: false };
   if (estimateBps === null) return { bps: observedBps, capacityKnown: false };
   if (observedBps !== null && observedBps > estimateBps * OVER_ESTIMATE_MARGIN) {
@@ -286,62 +294,55 @@ export function shouldClamp(current: ScreenShareQuality, estimateBps: number | n
  */
 export function useUplinkEstimate(isActive: boolean, resetKey?: unknown): UplinkEstimate | null {
   const [estimate, setEstimate] = useState<UplinkEstimate | null>(null);
-  const samplesRef = useRef<number[]>([]);
-  // Previous reading, for the bytesSent delta. Held separately from the median
-  // window because throughput is a difference, not a sample.
-  const lastSampleRef = useRef<UplinkSample | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const poll = useCallback(async () => {
-    const stats = await webrtcService.getStats();
-    if (!stats) return;
-
-    // performance.now() at read time, not Date.now(): the same monotonic clock
-    // useQualityMonitor uses for its own deltas, and immune to wall-clock jumps.
-    const sample = readUplinkSample(stats, performance.now());
-    if (sample === null) return;
-
-    const observed = throughputBps(lastSampleRef.current, sample);
-    lastSampleRef.current = sample;
-
-    const samples = [...samplesRef.current, sample.bps].slice(-WINDOW);
-    samplesRef.current = samples;
-    if (samples.length < MIN_SAMPLES) return;
-
-    // Median first, then reconcile: one outlier reading should not be able to
-    // declare the estimator contradicted.
-    const { bps, capacityKnown } = reconcileEstimate(
-      median(samples),
-      observed,
-      isCapacityMeasurable(sample),
-    );
-    if (bps === null) return;
-
-    setEstimate(estimateFromBitrate(bps, capacityKnown, observed));
-  }, []);
 
   useEffect(() => {
     if (!isActive) return;
+    let cancelled = false;
+    let pending = false;
+    let samples: number[] = [];
+    let previous: UplinkSample | null = null;
+
+    const poll = async () => {
+      // getStats may outlive both the interval and the share that requested it.
+      if (pending) return;
+      pending = true;
+      try {
+        const stats = await webrtcService.getStats().catch(() => null);
+        if (cancelled) return;
+        const sample = stats ? readUplinkSample(stats, performance.now()) : null;
+        if (!sample) {
+          samples = [];
+          previous = null;
+          setEstimate(null);
+          return;
+        }
+        if (previous && previous.pairId !== sample.pairId) {
+          samples = [];
+          setEstimate(null);
+        }
+        const observed = throughputBps(previous, sample);
+        previous = sample;
+        samples = sample.bps === null ? [] : [...samples, sample.bps].slice(-WINDOW);
+        if (sample.bps !== null && samples.length < MIN_SAMPLES) return;
+        const { bps, capacityKnown } = reconcileEstimate(
+          samples.length ? median(samples) : null,
+          observed,
+          isCapacityMeasurable(sample),
+        );
+        setEstimate(bps === null ? null : estimateFromBitrate(bps, capacityKnown, observed));
+      } finally {
+        pending = false;
+      }
+    };
 
     void poll();
-    intervalRef.current = setInterval(() => void poll(), POLL_INTERVAL_MS);
-
-    // Teardown rather than an `else` branch: clearing on the way out means the
-    // next call starts from nothing, without a synchronous setState in the
-    // effect body on every render where isActive is already false.
-    //
-    // Samples belong to one connection — carrying them forward would judge a
-    // new link by the old one's behaviour — and the estimate goes with them,
-    // because a stale number is what would clamp the next call before its own
-    // window has filled.
+    const interval = setInterval(() => void poll(), POLL_INTERVAL_MS);
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      intervalRef.current = null;
-      samplesRef.current = [];
-      lastSampleRef.current = null;
+      cancelled = true;
+      clearInterval(interval);
       setEstimate(null);
     };
-  }, [isActive, poll, resetKey]);
+  }, [isActive, resetKey]);
 
   return estimate;
 }

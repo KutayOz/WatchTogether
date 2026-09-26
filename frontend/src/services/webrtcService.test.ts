@@ -131,7 +131,7 @@ describe('webrtcService uplink budget', () => {
     // Told to shrink, the encoder spends it on a clean small picture.
     expect(senderFor(pc, 'cam-v').scaleResolutionDownBy).toBeGreaterThan(1);
     // The screen share must NOT be pinned — it needs to pick its own resolution.
-    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBeUndefined();
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1);
   });
 });
 
@@ -154,7 +154,7 @@ describe('webrtcService screen share codec', () => {
     });
   }
 
-  it('offers VP9 ahead of VP8 for the screen share', async () => {
+  it('offers H.264 first for predictable 1080p encoding', async () => {
     stubCodecs(['video/VP8', 'video/rtx', 'video/VP9', 'video/H264']);
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
 
@@ -164,18 +164,19 @@ describe('webrtcService screen share codec', () => {
     );
 
     const offered = pc.transceiverFor('scr-v').codecPreferences;
-    expect(offered?.[0]?.mimeType).toBe('video/VP9');
+    expect(offered?.[0]?.mimeType).toBe('video/H264');
     // Promote-only: everything else keeps its original relative order, so RTX
     // and friends are not reshuffled behind our backs.
     expect(offered?.map((c) => c.mimeType)).toEqual([
-      'video/VP9',
+      'video/H264',
       'video/VP8',
       'video/rtx',
-      'video/H264',
+      'video/VP9',
     ]);
   });
 
   it('falls back to H.264 once the VP9 encode cannot keep up', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'vp9' });
     // The revert the original comment on preferVp9 nominated — "if this flips
     // the limitation from 'bandwidth' to 'cpu', this is the change to revert" —
     // performed by the session on itself. H.264 because it is the one codec
@@ -195,6 +196,7 @@ describe('webrtcService screen share codec', () => {
   });
 
   it('will not switch codec twice in one share', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'vp9' });
     // A codec that oscillates is worse than a suboptimal one: every switch
     // costs the viewer a decoder teardown and a keyframe. The caller reads the
     // false and skips the renegotiation.
@@ -214,7 +216,8 @@ describe('webrtcService screen share codec', () => {
     expect(webrtcService.downgradeScreenCodec()).toBe(false);
   });
 
-  it('starts the next share from VP9 again', async () => {
+  it('re-reads an explicit codec preference for the next share', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'vp9' });
     // A 720p window may run in VP9 on the very machine where a 4K one could
     // not, so the downgrade is a fact about one share, not about the machine.
     stubCodecs(['video/VP8', 'video/VP9', 'video/H264']);
@@ -226,6 +229,7 @@ describe('webrtcService screen share codec', () => {
     expect(webrtcService.getScreenCodec()).toBe('h264');
 
     await webrtcService.stopScreenShare();
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
     expect(webrtcService.getScreenCodec()).toBe('vp9');
   });
 
@@ -253,8 +257,8 @@ describe('webrtcService screen share codec', () => {
     expect(offered?.[0]?.sdpFmtpLine).toContain('packetization-mode=1');
   });
 
-  it('leaves the codec order alone when VP9 is unavailable', async () => {
-    stubCodecs(['video/VP8', 'video/H264']);
+  it('leaves the codec order alone when neither preferred codec is available', async () => {
+    stubCodecs(['video/VP8', 'video/rtx']);
     webrtcService.attachLocalStream(cameraStream() as unknown as MediaStream);
 
     await webrtcService.addScreenShareTracks(
@@ -449,6 +453,7 @@ describe('webrtcService capture geometry', () => {
     expect(track.constraints).toHaveLength(0);
     // The encoder ceiling still came down, which is the part that matters.
     expect(senderFor(pc, 'scr-v').maxBitrate).toBe(small.videoBps);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1.5);
   });
 
   it('measures a raise against what is CAPTURED, not against the last ask', async () => {
@@ -498,10 +503,7 @@ describe('webrtcService capture geometry', () => {
       expect(track.constraints).toHaveLength(1);
 
       // Once the window has passed, it is.
-      vi.advanceTimersByTime(30_001);
-      await webrtcService.updateScreenShareQuality(
-        chooseOperatingPoint(15_000_000, 'film', 'extreme'),
-      );
+      await vi.advanceTimersByTimeAsync(30_001);
       expect(track.constraints).toHaveLength(2);
     } finally {
       vi.useRealTimers();
@@ -521,9 +523,7 @@ describe('webrtcService capture geometry', () => {
     // surfaceSwitching lets the user change what they share mid-stream; the new
     // surface arrives with the browser's own settings and our pinning gone.
     track.emit('configurationchange');
-    await Promise.resolve();
-
-    expect(track.lastConstraints).toMatchObject({ width: { max: 1920 } });
+    await vi.waitFor(() => expect(track.lastConstraints).toMatchObject({ width: { max: 1920 } }));
     expect(track.contentHint).toBe('motion');
   });
 
@@ -745,6 +745,21 @@ describe('webrtcService outbound screen stats', () => {
     const stats = await webrtcService.getOutboundScreenStats();
 
     expect(stats?.frameHeight).toBe(1078);
+  });
+
+  it('does not mistake camera-only startup statistics for screen-share output', async () => {
+    pc.stats = fakeStatsReport([cameraRtp, ...sources]);
+    expect(await webrtcService.getOutboundScreenStats()).toBeNull();
+  });
+
+  it('exposes the capture frame rate separately from encoded frames', async () => {
+    senderFor(pc, 'scr-v').stats = fakeStatsReport([
+      { ...screenRtp, framesPerSecond: 5, timestamp: 1234 },
+      { ...sources[0], framesPerSecond: 24 },
+    ]);
+    expect(await webrtcService.getOutboundScreenStats()).toMatchObject({
+      framesPerSecond: 5, sourceFramesPerSecond: 24, statsId: screenRtp.id, timestamp: 1234,
+    });
   });
 
   it('reports nothing rather than guessing when there is no video at all', async () => {
@@ -1033,5 +1048,113 @@ describe('ICE restart', () => {
     iceStateBecomes('failed');
     await vi.advanceTimersByTimeAsync(0);
     expect(onIceRestart).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('screen quality update lifecycle', () => {
+  afterEach(() => {
+    webrtcService.close();
+    vi.useRealTimers();
+  });
+
+  it('serializes parameter transactions and finishes at the latest request', async () => {
+    const pc = await freshService();
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+    const sender = senderFor(pc, 'scr-v');
+    const original = sender.setParameters.bind(sender);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const set = vi.spyOn(sender, 'setParameters').mockImplementationOnce(async (params) => {
+      await gate;
+      await original(params);
+    });
+    const first = webrtcService.updateScreenShareQuality({ ...POINT, videoBps: 2_000_000 });
+    await Promise.resolve();
+    const last = webrtcService.updateScreenShareQuality({ ...POINT, videoBps: 6_000_000 });
+    await Promise.resolve();
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(webrtcService.getAppliedScreenPoint()?.videoBps).toBe(POINT.videoBps);
+    release();
+    await Promise.all([first, last]);
+    expect(sender.maxBitrate).toBe(6_000_000);
+    expect(webrtcService.getAppliedScreenPoint()?.videoBps).toBe(6_000_000);
+  });
+
+  it('does not apply an old update to a new share after an await', async () => {
+    const pc = await freshService();
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+    const sender = senderFor(pc, 'scr-v');
+    let release!: () => void;
+    vi.spyOn(sender, 'setParameters').mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    const stale = webrtcService.updateScreenShareQuality({ ...POINT, width: 640, height: 360, videoBps: 300_000 });
+    await Promise.resolve();
+    await webrtcService.stopScreenShare();
+    const next = new FakeMediaStream([new FakeMediaStreamTrack('video', 'next-video'), new FakeMediaStreamTrack('audio', 'next-audio')]);
+    await webrtcService.addScreenShareTracks(next as unknown as MediaStream, POINT);
+    release();
+    expect(await stale).toBe(false);
+    expect(senderFor(pc, 'next-video').maxBitrate).toBe(POINT.videoBps);
+    expect(next.getVideoTracks()[0].constraints).toHaveLength(0);
+    expect(webrtcService.getAppliedScreenPoint()).toEqual(POINT);
+  });
+
+  it('does not acknowledge a rejected encoder update', async () => {
+    const pc = await freshService();
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+    vi.spyOn(senderFor(pc, 'scr-v'), 'setParameters').mockRejectedValue(new Error('rejected'));
+    await webrtcService.updateScreenShareQuality({ ...POINT, videoBps: 6_000_000 });
+    expect(webrtcService.getAppliedScreenPoint()).toEqual(POINT);
+  });
+
+  it('cancels a deferred capture resize when sharing stops', async () => {
+    vi.useFakeTimers();
+    await freshService();
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+    const small = chooseOperatingPoint(1_000_000, 'film');
+    const { stream: captured } = await webrtcService.captureScreen(small);
+    await webrtcService.addScreenShareTracks(captured, small);
+    await webrtcService.updateScreenShareQuality(POINT);
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 3840, height: 2160 });
+    const count = stream.getVideoTracks()[0].constraints.length;
+    await webrtcService.stopScreenShare();
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(stream.getVideoTracks()[0].constraints).toHaveLength(count);
+    expect(webrtcService.getAppliedScreenPoint()).toBeNull();
+  });
+
+  it('recomputes relative scale after switching the captured surface', async () => {
+    const pc = await freshService();
+    const stream = screenStream();
+    stubDisplayMedia(stream);
+    const point = chooseOperatingPoint(4_000_000, 'film', 'high');
+    const { stream: captured } = await webrtcService.captureScreen(point);
+    await webrtcService.addScreenShareTracks(captured, point);
+    const small = { ...point, width: 1280, height: 720 };
+    await webrtcService.updateScreenShareQuality(small);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1.5);
+    stream.getVideoTracks()[0].emit('configurationchange');
+    await vi.waitFor(() => expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1));
+    expect(stream.getVideoTracks()[0].lastConstraints?.width).toEqual({ ideal: 1280, max: 1280 });
+  });
+
+  it('allows an explicit AV1 experiment to actually fall back to H.264', async () => {
+    const pc = await freshService();
+    vi.stubGlobal('localStorage', { getItem: () => 'av1' });
+    vi.stubGlobal('RTCRtpSender', { getCapabilities: () => ({ codecs: [
+      { mimeType: 'video/VP8' }, { mimeType: 'video/AV1' }, { mimeType: 'video/H264' },
+    ] }) });
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+    expect(pc.transceiverFor('scr-v').codecPreferences?.[0].mimeType).toBe('video/AV1');
+    expect(webrtcService.downgradeScreenCodec()).toBe(true);
+    expect(pc.transceiverFor('scr-v').codecPreferences?.[0].mimeType).toBe('video/H264');
+  });
+
+  it('does not request a codec renegotiation when H.264 is unavailable', async () => {
+    await freshService();
+    vi.stubGlobal('RTCRtpSender', { getCapabilities: () => ({ codecs: [{ mimeType: 'video/VP9' }] }) });
+    await webrtcService.addScreenShareTracks(screenStream() as unknown as MediaStream, POINT);
+    expect(webrtcService.downgradeScreenCodec()).toBe(false);
   });
 });
