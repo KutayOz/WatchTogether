@@ -53,12 +53,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      testIgnore: '**/stream-quality.spec.ts',
+      testIgnore: ['**/stream-quality.spec.ts', '**/stream-controller.spec.ts'],
       use: { ...devices['Desktop Chrome'] },
     },
     {
       name: 'media',
-      testMatch: '**/stream-quality.spec.ts',
+      testMatch: ['**/stream-quality.spec.ts', '**/stream-controller.spec.ts'],
       dependencies: ['chromium'],
       workers: 1,
       use: {

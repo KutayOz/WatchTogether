@@ -18,16 +18,17 @@ Motion requests 30 fps. Bitrates are encoder ceilings, not guaranteed network co
 
 ## Validation on this isolated branch
 
-- Frontend unit/hook suite after the capture-recovery follow-up: 443 tests passed (including 7 new recovery regressions).
+- Frontend unit/hook suite after the capture-recovery follow-up: 445 tests passed (including 9 capture-recovery/configuration-event regressions).
 - Production frontend build: passed.
-- Native Chromium two-peer media suite on the initial package: 2 tests passed, 1080p24/30 with zero dropped frames. Run with `cd frontend && npm run e2e:media`.
+- Native Chromium two-peer media suite: 3 tests cover 1080p24/30 and the full SessionRoom sharing/approval flow with active quality feedback. Run with `cd frontend && npm run e2e:media`.
   It checks 1080p24/30, microphone/camera/screen soundtrack coexistence, ICE restart,
   live bitrate changes, 1080→720→1080 recovery, and share stop/start.
 
 The browser media tests use a synthetic moving source and local ICE. They do not establish
 WAN/TURN performance or perceptual quality on the users' actual movie and hardware.
-The media suite was not rerun during the active live session after the recovery follow-up;
-that follow-up passed the full unit/hook suite, production build, and targeted ESLint.
+The release candidate passed the full unit/hook suite, production build, and targeted ESLint.
+The full application test sustained 1920x1080 for 35 seconds at 29.7 decoded fps with zero dropped frames
+and verified actual viewer-feedback messages over the native DataChannel.
 
 ## Release isolation
 
@@ -35,8 +36,8 @@ Base: `e6f8d24bb733a51f9ebb456a5b022fd57f6a8405`.
 Branch: `codex/streaming-quality`.
 
 The repository's production workflow triggers on pushes to `main` or manual dispatch.
-This feature-branch push does not match that trigger. No merge or deploy is included
-in this packaging operation. Review and release separately after the active session.
+The initial feature-branch pushes did not match that trigger. The user subsequently authorized
+production deployment; release through the normal main-branch workflow after final checks.
 
 ## Follow-up from the live session
 
@@ -63,3 +64,6 @@ capture restarts. Small native sources and different aspect ratios remain valid.
 This follow-up is not a claim that the revised build has fixed the users' live call.
 The revised build has not been deployed to that call. Raw reports, session identifiers,
 and track identifiers are intentionally excluded from this package.
+
+The final review also closes a delayed configuration-event loop: matching track constraints
+preserve the capture request and cooldown, while the sender scale still follows actual geometry.

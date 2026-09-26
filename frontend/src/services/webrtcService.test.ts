@@ -1214,6 +1214,32 @@ describe('bounded capture-constraint recovery', () => {
     expect(apply).toHaveBeenCalledTimes(1);
   });
 
+  it('does not reconfigure again when applyConstraints queues its own change event', async () => {
+    const { apply, track } = await beginCapture({ width: 478, height: 268 }, staleLimits);
+    const applyNormally = apply.getMockImplementation()!;
+    apply.mockImplementation(async (constraints) => {
+      await applyNormally(constraints);
+      // Runs after the promise and the service's synchronous guard finish.
+      setTimeout(() => track.emit('configurationchange'), 0);
+    });
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(apply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('updates sender scaling without resizing capture when constraints still match', async () => {
+    const pc = await freshService();
+    const { apply, track } = await beginCapture({ width: 1920, height: 1080 }, {
+      ...fullLimits, frameRate: { ideal: POINT.fps, max: POINT.fps },
+    });
+    Object.assign(track, { getSettings: () => ({ width: 3840, height: 2160 }) });
+    track.emit('configurationchange');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(2);
+    expect(apply).not.toHaveBeenCalled();
+  });
+
   it('does not fight native adaptation when low pixels already have permissive constraints', async () => {
     const { apply } = await beginCapture({ width: 478, height: 268 }, fullLimits);
     await vi.advanceTimersByTimeAsync(120_000);

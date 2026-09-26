@@ -661,10 +661,26 @@ class WebRTCService {
         const current = this.currentPoint;
         if (!current || this.applyingCaptureConstraints ||
             !this.screenStream?.getVideoTracks().includes(track)) return;
-        // A switched surface invalidates both capture geometry and the
-        // sender's relative scale. Reapply through the same serialized path.
-        this.capturedPoint = null;
-        this.lastCaptureReconfigAt = 0;
+        // Our own applyConstraints can queue this event after its promise
+        // resolves. Matching constraints must preserve the capture request and
+        // cooldown, or that event would recursively restart capture forever.
+        let matchingConstraints = false;
+        try {
+          const constraints = track.getConstraints?.();
+          const matches = (value: ConstrainULong | ConstrainDouble | undefined, expected: number) =>
+            typeof value === 'object' && value !== null && value.max === expected &&
+            (value.ideal === undefined || value.ideal === expected) &&
+            (value.exact === undefined || value.exact === expected);
+          matchingConstraints = matches(constraints?.width, current.width) &&
+            matches(constraints?.height, current.height) &&
+            matches(constraints?.frameRate, current.fps);
+        } catch { /* Unsupported inspection falls back to surface reapplication. */ }
+        if (!matchingConstraints) {
+          this.capturedPoint = null;
+          this.lastCaptureReconfigAt = 0;
+        }
+        // Sender scaling still follows actual geometry, even when constraints
+        // are unchanged. The update remains serialized with other requests.
         // Keep retry history for this track: an event may also arrive after
         // our own constraints resolve. A bitrate change or such an event must
         // not replenish the bounded repair allowance.
