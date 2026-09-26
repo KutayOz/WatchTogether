@@ -30,12 +30,8 @@ import {
   currentViewerLevel,
   currentViewerPicture,
   currentViewerViewport,
-  initialLadderState,
-  nextLadderState,
   viewerIsStarved,
   viewerIsUnhappy,
-  withUserChoice,
-  type LadderState,
   type ViewerReport,
 } from '../../hooks/qualityLadder';
 import { useQualityMonitor } from '../../hooks/useQualityMonitor';
@@ -169,11 +165,6 @@ export function SessionRoom() {
     return isContentMode(saved) ? saved : 'film';
   });
 
-  // Where automatic quality movement currently stands. `ceiling` is the user's
-  // pick; `current` is what the link has earned underneath it.
-  const [ladder, setLadder] = useState<LadderState>(() =>
-    initialLadderState(screenShareQuality, Date.now()),
-  );
   const [peerQualityFeedback, setPeerQualityFeedback] = useState<QualityFeedback | null>(null);
 
   const [hasScreenAudio, setHasScreenAudio] = useState(false);
@@ -235,12 +226,8 @@ export function SessionRoom() {
   const sessionIdRef = useRef<string | null>(null);
   const transportRef = useRef<ReturnType<typeof useTransport> | null>(null);
   const peerNameRef = useRef<string | null>(null);
-  const screenShareQualityRef = useRef<ScreenShareQuality>(screenShareQuality);
   const localScreenStreamIdRef = useRef<string | null>(null);
-  // True once the user manually picks a quality this session — suppresses the
-  // automatic speed-test clamp so we never override a deliberate choice.
-  const userOverrodeQualityRef = useRef(false);
-  // Latest viewer verdict, fed into both the budget and the ladder. A ref
+  // Latest viewer verdict, fed into the bandwidth controller. A ref
   // because it arrives on the data channel between renders and must not itself
   // trigger one. Stamped, and read through currentViewerLevel, so a peer that
   // stops reporting cannot hold quality down for the rest of the session.
@@ -858,10 +845,8 @@ export function SessionRoom() {
           type: 'warning',
         });
       }
-      // The viewer's verdict is one of two inputs to the ladder; the other is
-      // our own encoder's health. Recorded here, acted on in the ladder effect
-      // below, so both signals go through one policy rather than two racing
-      // ad-hoc branches that could only ever move quality downward.
+      // Feedback and sender health feed one bandwidth controller. A second
+      // preset ladder used to cut the quality again from the same bad sample.
       viewerReportRef.current = {
         level: feedback.level,
         // Absent from an older peer's build, which is why resolutionBox has a
@@ -915,6 +900,7 @@ export function SessionRoom() {
     isWatchingRemoteScreen
       ? (peerShareStatus?.sentFps ?? peerShareStatus?.fps)
       : undefined,
+    isWatchingRemoteScreen ? webrtc.remoteScreenStream?.getVideoTracks()[0]?.id : undefined,
   );
 
   /*
@@ -976,7 +962,7 @@ export function SessionRoom() {
           role: webrtc.isScreenSharing ? 'sharer' : isWatchingRemoteScreen ? 'viewer' : 'idle',
           userAgent: navigator.userAgent,
           devicePixelRatio: window.devicePixelRatio || 1,
-          quality: ladder.applied,
+          quality: screenShareQuality,
           contentMode,
           codec: webrtcService.getScreenCodec(),
           viewport: myViewportRef.current,
@@ -986,7 +972,7 @@ export function SessionRoom() {
         ice,
       }),
     );
-  }, [recorder, webrtc.isScreenSharing, isWatchingRemoteScreen, ladder.applied, contentMode]);
+  }, [recorder, webrtc.isScreenSharing, isWatchingRemoteScreen, screenShareQuality, contentMode]);
 
   // Samples reset when sharing starts: eighteen seconds of camera-only readings
   // describe a completely different load than the one a share is about to place.
@@ -1039,11 +1025,11 @@ export function SessionRoom() {
       chooseOperatingPoint(
         budgetBps,
         contentMode,
-        ladder.applied,
+        screenShareQuality,
         viewerViewport,
         capacityPixelsPerSecond,
       ),
-    [budgetBps, contentMode, ladder.applied, viewerViewport, capacityPixelsPerSecond],
+    [budgetBps, contentMode, screenShareQuality, viewerViewport, capacityPixelsPerSecond],
   );
 
   /*
@@ -1054,7 +1040,7 @@ export function SessionRoom() {
    */
   const atBudgetFloor = operatingPoint.videoBps <= minVideoBps(operatingPoint.fps);
 
-  // Sender health is the control input for BOTH the budget and the ladder.
+  // Sender health controls the budget and encode-capacity limits.
   // Judged against the ceiling we actually set, so "is it getting its ask" is a
   // real question rather than a restatement of what we chose to send.
   //
@@ -1062,16 +1048,17 @@ export function SessionRoom() {
   // from a shortage: a frame rate far under the ask, at a picture that is still
   // full size, is a capture with nothing to capture rather than a link with
   // nothing to spare.
+  const [appliedPoint, setAppliedPoint] = useState<OperatingPoint | null>(null);
   const askedGeometry = useMemo(
     () =>
-      webrtc.isScreenSharing
-        ? { area: operatingPoint.width * operatingPoint.height, fps: operatingPoint.fps }
+      webrtc.isScreenSharing && appliedPoint
+        ? { area: appliedPoint.width * appliedPoint.height, fps: appliedPoint.fps }
         : null,
-    [webrtc.isScreenSharing, operatingPoint.width, operatingPoint.height, operatingPoint.fps],
+    [webrtc.isScreenSharing, appliedPoint],
   );
   const senderHealth = useSenderHealth(
     webrtc.isScreenSharing,
-    operatingPoint.videoBps,
+    appliedPoint?.videoBps ?? null,
     askedGeometry,
   );
 
@@ -1115,7 +1102,10 @@ export function SessionRoom() {
    * bound, not a capacity measurement, and nextBudget's contract is that null
    * means "no opinion" rather than "no bandwidth".
    */
+  const lastBudgetTickRef = useRef(-1);
   useEffect(() => {
+    if (!webrtc.isScreenSharing || lastBudgetTickRef.current === senderHealth.tick) return;
+    lastBudgetTickRef.current = senderHealth.tick;
     const now = Date.now();
     const uplink = uplinkRef.current;
     // Same freshness rule as the verdict: a viewport nobody has confirmed in
@@ -1128,13 +1118,10 @@ export function SessionRoom() {
         viewport,
         estimateBps: uplink?.capacityKnown ? uplink.uplinkBps : null,
         health: senderHealth.health,
-        // The only path by which the receiver's verdict reaches anything at all
-        // on `auto`, where the preset ladder is inert (`auto` is not a rung) —
-        // and the only one at all when the path is TCP-relayed, since that is
-        // exactly when the uplink estimate stops being a capacity measurement.
-        // Read through currentViewerLevel so a report that stopped arriving
-        // expires instead of pinning `shortage` true forever.
+        // Receiver feedback also works when the transport has no capacity estimate.
+        // Expire old reports instead of pinning a past failure forever.
         viewerUnhappy: viewerIsUnhappy(currentViewerLevel(viewerReportRef.current, now)),
+        viewerHealthy: ['good', 'excellent'].includes(currentViewerLevel(viewerReportRef.current, now) ?? ''),
         // The other direction, and until now there was no other direction: the
         // receiver could ask for less and never for more, because its score has
         // no resolution term and a collapsed picture arriving cleanly reports
@@ -1143,7 +1130,7 @@ export function SessionRoom() {
         viewerStarved: viewerIsStarved(viewerReportRef.current, now),
         headroom: HEADROOM_SELECT,
         mode: contentMode,
-        ceiling: ladder.applied,
+        ceiling: screenShareQuality,
         // The cap has to see every bound the chooser sees, or the budget spends
         // its probe cycles climbing toward a picture the encoder will not run.
         capacityPixelsPerSecond,
@@ -1152,7 +1139,7 @@ export function SessionRoom() {
     // `health` rides along for the linter's benefit and costs nothing: it is
     // set in the same update as `tick`, so the two can never change on separate
     // renders. `tick` is the one that means "a new sample exists".
-  }, [senderHealth.tick, senderHealth.health, contentMode, ladder.applied, capacityPixelsPerSecond]);
+  }, [senderHealth.tick, senderHealth.health, contentMode, screenShareQuality, capacityPixelsPerSecond, webrtc.isScreenSharing]);
 
   // A new share is a new load; carrying the old budget across would judge it by
   // the previous one's behaviour. The viewer's verdict goes with it, for the
@@ -1167,6 +1154,7 @@ export function SessionRoom() {
       // `capacityMeasurable` is a dependency so this re-seeds the instant the
       // path reveals itself, while still idle. The share that starts a moment
       // later then reads an operating point that already fits.
+      lastBudgetTickRef.current = -1;
       setBudget(initialBudgetState(coldStartBudgetBps(capacityMeasurable), Date.now()));
       viewerReportRef.current = null;
       // A new share is a new encode. Carrying a ceiling learned from the last
@@ -1192,13 +1180,20 @@ export function SessionRoom() {
   useEffect(() => {
     if (!webrtc.isScreenSharing) {
       appliedPointRef.current = null;
+      setAppliedPoint(null);
       return;
     }
     if (sameOperatingPoint(appliedPointRef.current, operatingPoint)) return;
-    appliedPointRef.current = operatingPoint;
-    webrtc.updateScreenShareQuality(operatingPoint).catch(() => {});
+    let active = true;
+    void webrtc.updateScreenShareQuality(operatingPoint).then(() => {
+      if (!active) return;
+      const acknowledged = webrtcService.getAppliedScreenPoint();
+      appliedPointRef.current = acknowledged;
+      setAppliedPoint((previous) => sameOperatingPoint(previous, acknowledged) ? previous : acknowledged);
+    }).catch((err) => logger.debug('[Quality] Could not apply operating point:', err));
+    return () => { active = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [operatingPoint, webrtc.isScreenSharing]);
+  }, [operatingPoint, webrtc.isScreenSharing, senderHealth.tick]);
 
   /*
    * Advance the encode ceiling on every sender-health observation.
@@ -1287,34 +1282,6 @@ export function SessionRoom() {
     if (!isWatchingRemoteScreen) setPeerShareStatus(null);
   }, [isWatchingRemoteScreen]);
 
-  /**
-   * Advance the ladder on every sender-health observation.
-   *
-   * Both directions, unlike everything this replaces. The old design only ever
-   * stepped down and persisted the result, so one bad three-second window
-   * pinned a user at the floor for every future session.
-   */
-  useEffect(() => {
-    if (!webrtc.isScreenSharing) return;
-    const now = Date.now();
-    setLadder((prev) => {
-      const next = nextLadderState(prev, {
-        now,
-        isSharing: true,
-        senderHealth: senderHealth.health,
-        viewerLevel: currentViewerLevel(viewerReportRef.current, now),
-      });
-      if (next.applied !== prev.applied) {
-        // Deliberately NOT persisted. Only an explicit human pick is written to
-        // storage; an automatic move is a response to this moment's link, not a
-        // statement about what the user wants next week.
-        screenShareQualityRef.current = next.applied;
-        setScreenShareQuality(next.applied);
-      }
-      return next;
-    });
-  }, [senderHealth.health, senderHealth.tick, webrtc.isScreenSharing]);
-
   /*
    * CPU pressure needs a different answer than bandwidth pressure, and now it
    * gets one.
@@ -1352,6 +1319,9 @@ export function SessionRoom() {
     if (webrtc.getSignalingState() !== 'stable') return;
 
     if (!webrtc.downgradeScreenCodec()) return;
+    // Capacity learned from the old software codec says nothing about the new encoder.
+    setCapacity(initialCapacityState());
+    previousSenderSampleRef.current = null;
 
     setToast({
       message: 'Switching to a codec this machine can encode — one moment',
@@ -1545,10 +1515,7 @@ export function SessionRoom() {
     // An explicit pick is a CEILING and a fresh statement of intent: it moves
     // quality now, bounds every later automatic step, and resets the probe
     // backoff. It is also the ONLY thing in this component that writes storage.
-    userOverrodeQualityRef.current = true;
     setScreenShareQuality(quality);
-    screenShareQualityRef.current = quality;
-    setLadder(withUserChoice(quality, Date.now()));
     localStorage.setItem('wt:screenShareQuality', quality);
 
     // No direct call to updateScreenShareQuality here. Changing the ceiling
@@ -1569,7 +1536,7 @@ export function SessionRoom() {
 
   /**
    * Content mode is a user preference, so it persists — unlike anything the
-   * ladder does on its own. The live share picks the new frame rate up through
+   * controller does on its own. The live share picks the new frame rate up through
    * the operating-point effect; no renegotiation, no re-prompt.
    */
   const handleContentModeChange = (mode: ContentMode) => {

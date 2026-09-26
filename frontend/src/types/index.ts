@@ -217,6 +217,10 @@ export interface OutboundScreenStats {
   /** Seconds of encode time across `framesEncoded`; the CPU-cliff detector. */
   totalEncodeTime: number | null;
   framesEncoded: number | null;
+  /** Capture rate before encoding; distinguishes a paused source from a slow encoder. */
+  sourceFramesPerSecond?: number | null;
+  statsId?: string;
+  timestamp?: number;
 }
 
 /**
@@ -315,12 +319,8 @@ export interface QualityPreset {
 export const QUALITY_PRESETS: Record<ScreenShareQuality, QualityPreset> = {
   auto: {
     label: 'Auto',
-    description: 'up to 4K • follows your link and their screen',
-    // 4K is the BOX, not the target. `auto` only reaches past 1080p when the
-    // receiver has reported a viewport that large AND the link has proven it
-    // can fund the picture; with no report, resolutionBox() holds it at 1080p,
-    // which is what `auto` meant before it could be told otherwise.
-    video: { width: 3840, height: 2160, frameRate: 60, bitrate: 0 }, // 0 = budget decides
+    description: 'up to 1080p • adapts to your connection',
+    video: { width: 1920, height: 1080, frameRate: 60, bitrate: 0 }, // 0 = budget decides
     audio: { bitrate: 96000 },
   },
   low: {

@@ -11,10 +11,11 @@ import { defineConfig, devices } from '@playwright/test';
  *   - Lazy chunks (from the route-splitting refactor) are verified by
  *     observing network requests.
  *
+ *   - Real two-peer WebRTC encoding/decoding using a synthetic 1080p source.
+ *
  * What we're explicitly NOT testing here:
- *   - WebRTC and the signalling socket — a real call needs two peers and a
- *     TURN server. The Durable Object's side of the protocol is covered in
- *     worker/src/do/SessionRoom.test.ts, against the real runtime.
+ *   - WAN/TURN delivery or the OS display picker. The media tests relay SDP/ICE
+ *     locally; Worker signalling is covered in worker/src/do/SessionRoom.test.ts.
  *   - Real authentication round-trips. The passkey ceremony is stubbed at
  *     navigator.credentials here; it runs against real crypto in
  *     worker/src/routes/passkey.test.ts.
@@ -52,7 +53,21 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testIgnore: ['**/stream-quality.spec.ts', '**/stream-controller.spec.ts'],
       use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'media',
+      testMatch: ['**/stream-quality.spec.ts', '**/stream-controller.spec.ts'],
+      dependencies: ['chromium'],
+      workers: 1,
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
+        },
+        permissions: ['camera', 'microphone'],
+      },
     },
   ],
 });

@@ -102,7 +102,7 @@ describe('overEncodeCliff', () => {
     const over = overEncodeCliff(
       sig({
         previous: stats({ totalEncodeTime: 10, framesEncoded: 240 }),
-        latest: stats({ totalEncodeTime: 12.45, framesEncoded: 310 }),
+        latest: stats({ totalEncodeTime: 12.45, framesEncoded: 310, framesPerSecond: 12 }),
       }),
     );
     expect(over).toBe(true);
@@ -233,7 +233,88 @@ describe('overEncodeCliff and a still screen', () => {
     };
     // 0.1 s over 2 frames is 50 ms each, well past the 23 ms a 30 fps budget
     // allows — so the encode-time witness on its own would say yes.
-    expect(overEncodeCliff({ ...idle, health: 'unknown' })).toBe(true);
+    expect(overEncodeCliff({ ...idle, health: 'unknown' })).toBe(false);
     expect(overEncodeCliff(idle)).toBe(false);
+  });
+});
+
+
+describe('encode evidence boundaries', () => {
+  it('does not cut a parallel encoder that still delivers the requested frame rate', () => {
+    expect(overEncodeCliff(sig({
+      previous: stats({ totalEncodeTime: 10, framesEncoded: 240 }),
+      latest: stats({ totalEncodeTime: 14, framesEncoded: 310, framesPerSecond: 24 }),
+    }))).toBe(false);
+  });
+
+  it('never differences counters from separate outbound streams', () => {
+    expect(encodeCostPerFrame(
+      stats({ statsId: 'old', framesEncoded: 100, totalEncodeTime: 1 }),
+      stats({ statsId: 'new', framesEncoded: 200, totalEncodeTime: 20 }),
+    )).toBeNull();
+  });
+
+  it('does not relax a CPU bound using silence or idle frames as evidence', () => {
+    const cut = nextCapacity(initialCapacityState(), sig({ health: 'cpu-bound' }));
+    for (const health of ['unknown', 'source-idle', 'under-served'] as const) {
+      expect(nextCapacity(cut, sig({ now: CAPACITY_RETRY_MS + 1, health }))).toBe(cut);
+    }
+  });
+});
+
+
+describe('CPU recovery without targetBitrate', () => {
+  const recoveredSamples: Partial<CapacitySignals> = {
+    health: 'unknown',
+    previous: stats({ framesEncoded: 100, totalEncodeTime: 1, targetBitrate: null }),
+    latest: stats({ framesEncoded: 172, totalEncodeTime: 1.72, framesPerSecond: 24,
+      sourceFramesPerSecond: 24, targetBitrate: null }),
+  };
+
+  it('relaxes after full-rate, inexpensive encoding even when sender health is unknown', () => {
+    const cut = nextCapacity(initialCapacityState(), sig({ health: 'cpu-bound' }));
+    expect(nextCapacity(cut, sig({ ...recoveredSamples, now: CAPACITY_RETRY_MS }))).toBe(cut);
+    const recovered = nextCapacity(cut, sig({ ...recoveredSamples, now: CAPACITY_RETRY_MS + 1 }));
+    expect(recovered.maxPixelsPerSecond).toBeGreaterThan(cut.maxPixelsPerSecond!);
+  });
+
+  it('requires both frame delivery and encode cost, and never overrides an idle source', () => {
+    const cut = nextCapacity(initialCapacityState(), sig({ health: 'cpu-bound' }));
+    const quiet = sig({ ...recoveredSamples, now: CAPACITY_RETRY_MS + 1 });
+    for (const latest of [
+      { ...quiet.latest!, framesPerSecond: 5 },
+      { ...quiet.latest!, totalEncodeTime: null },
+      { ...quiet.latest!, sourceFramesPerSecond: 1 },
+      { ...quiet.latest!, totalEncodeTime: 4 },
+    ]) {
+      expect(nextCapacity(cut, { ...quiet, latest })).toBe(cut);
+    }
+    expect(nextCapacity(cut, { ...quiet, health: 'source-idle' })).toBe(cut);
+  });
+});
+
+
+describe('encoding slower content in a high-frame-rate mode', () => {
+  const filmInGamesMode: Partial<CapacitySignals> = {
+    health: 'unknown', fps: 60, askedPixelsPerSecond: 1920 * 1080 * 60,
+    previous: stats({ framesEncoded: 100, totalEncodeTime: 1, targetBitrate: null }),
+    latest: stats({ framesEncoded: 172, totalEncodeTime: 2.08, framesPerSecond: 24,
+      sourceFramesPerSecond: 24, targetBitrate: null }),
+  };
+
+  it('does not mistake a healthy 24 fps movie for a failing 60 fps encode', () => {
+    // 15 ms per frame exceeds 70% of a 60 fps interval but easily sustains
+    // every frame that this 24 fps capture can actually deliver.
+    expect(overEncodeCliff(sig(filmInGamesMode))).toBe(false);
+    expect(overEncodeCliff(sig({ ...filmInGamesMode, health: 'cpu-bound' }))).toBe(true);
+  });
+
+  it('recognizes recovery at the captured frame rate while keeping the idle gate', () => {
+    const cut = nextCapacity(initialCapacityState(), sig({ ...filmInGamesMode, health: 'cpu-bound' }));
+    const recovered = nextCapacity(cut, sig({ ...filmInGamesMode, now: CAPACITY_RETRY_MS + 1 }));
+    expect(recovered.maxPixelsPerSecond).toBeGreaterThan(cut.maxPixelsPerSecond!);
+    expect(nextCapacity(cut, sig({ ...filmInGamesMode, now: CAPACITY_RETRY_MS + 1,
+      latest: { ...filmInGamesMode.latest!, sourceFramesPerSecond: 1, framesPerSecond: 1 },
+    }))).toBe(cut);
   });
 });

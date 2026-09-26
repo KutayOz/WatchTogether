@@ -1,7 +1,6 @@
 import { FLOOR_RESOLUTION, LARGEST_RESOLUTION } from './operatingPoint';
 import type { OutboundScreenStats } from '../types';
-// Type-only, so this stays a compile-time reference in both directions.
-import type { SenderHealth } from './useSenderHealth';
+import { SOURCE_IDLE_FPS_RATIO, type SenderHealth } from './useSenderHealth';
 
 /**
  * What the sender's encoder can actually produce, as opposed to what the link
@@ -119,15 +118,27 @@ export function encodeCostPerFrame(
   next: OutboundScreenStats | null,
 ): number | null {
   if (!prev || !next) return null;
+  if (prev.statsId && next.statsId && prev.statsId !== next.statsId) return null;
+  if (typeof prev.timestamp === 'number' && typeof next.timestamp === 'number' &&
+      next.timestamp <= prev.timestamp) return null;
   const { totalEncodeTime: t0, framesEncoded: f0 } = prev;
   const { totalEncodeTime: t1, framesEncoded: f1 } = next;
-  if (typeof t0 !== 'number' || typeof t1 !== 'number') return null;
-  if (typeof f0 !== 'number' || typeof f1 !== 'number') return null;
+  if (typeof t0 !== 'number' || typeof t1 !== 'number' ||
+      !Number.isFinite(t0) || !Number.isFinite(t1)) return null;
+  if (typeof f0 !== 'number' || typeof f1 !== 'number' ||
+      !Number.isFinite(f0) || !Number.isFinite(f1)) return null;
 
   const frames = f1 - f0;
   const seconds = t1 - t0;
   if (frames <= 0 || seconds < 0) return null;
   return seconds / frames;
+}
+
+/** A 24 fps source cannot make a 60 fps request a 60 fps encode workload. */
+function inputFrameRate(sig: CapacitySignals): number {
+  const sourceFps = sig.latest?.sourceFramesPerSecond;
+  return typeof sourceFps === 'number' && Number.isFinite(sourceFps) && sourceFps > 0
+    ? Math.min(sig.fps, sourceFps) : sig.fps;
 }
 
 /**
@@ -152,9 +163,18 @@ export function overEncodeCliff(sig: CapacitySignals): boolean {
   if (sig.health === 'source-idle') return false;
 
   if (sig.fps <= 0) return false;
+  // Aggregate encode time can exceed a frame interval for parallel encoders.
+  // If frames still arrive at the requested rate there is no realtime cliff.
+  const effectiveFps = inputFrameRate(sig);
+  const produced = sig.latest?.framesPerSecond;
+  if (typeof produced === 'number' && produced >= effectiveFps * 0.9) return false;
+  const encoded = (sig.latest?.framesEncoded ?? 0) - (sig.previous?.framesEncoded ?? 0);
+  // A few expensive keyframes from an otherwise idle capture are not a
+  // representative workload, even before the health sustain window completes.
+  if (encoded < Math.max(8, effectiveFps / 2)) return false;
   const cost = encodeCostPerFrame(sig.previous, sig.latest);
   if (cost === null) return false;
-  return cost > (1 / sig.fps) * ENCODE_BUDGET_FRACTION;
+  return cost > (1 / effectiveFps) * ENCODE_BUDGET_FRACTION;
 }
 
 /**
@@ -193,6 +213,22 @@ export function nextCapacity(state: CapacityState, sig: CapacitySignals): Capaci
   if (state.maxPixelsPerSecond === null) return state;
 
   if (sig.now - state.lastChangeAt <= CAPACITY_RETRY_MS) return state;
+  // Missing targetBitrate can keep sender health unknown even while encoding
+  // has recovered. Full delivered FPS and a representative, cheap encode
+  // interval are independent positive evidence; silence and idle frames are not.
+  const cost = encodeCostPerFrame(sig.previous, sig.latest);
+  const effectiveFps = inputFrameRate(sig);
+  const produced = sig.latest?.framesPerSecond ?? 0;
+  const sourceFps = sig.latest?.sourceFramesPerSecond;
+  const encoded = (sig.latest?.framesEncoded ?? 0) - (sig.previous?.framesEncoded ?? 0);
+  const measuredRecovery = sig.health === 'unknown' &&
+    sig.latest?.qualityLimitationReason !== 'cpu' &&
+    sig.latest?.qualityLimitationReason !== 'bandwidth' &&
+    produced >= effectiveFps * 0.9 &&
+    (sourceFps == null || sourceFps >= sig.fps * SOURCE_IDLE_FPS_RATIO) &&
+    encoded >= Math.max(8, effectiveFps / 2) &&
+    cost !== null && cost <= ENCODE_BUDGET_FRACTION / effectiveFps;
+  if (sig.health !== 'satisfied' && sig.health !== 'self-limited' && !measuredRecovery) return state;
 
   const relaxed = state.maxPixelsPerSecond * CAPACITY_RECOVER;
   // Past the largest picture we would ever send, the bound stops being a bound.

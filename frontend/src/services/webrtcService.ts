@@ -89,7 +89,7 @@ const MIC_MAX_BITRATE = MIC_BPS;
  * has to still be there when that offer is built, and it has to stay there for
  * any later renegotiation the peer starts.
  */
-export type ScreenCodec = 'vp9' | 'h264';
+export type ScreenCodec = 'vp9' | 'h264' | 'av1';
 
 /**
  * Shortest wait between two capture reconfigurations.
@@ -102,6 +102,7 @@ export type ScreenCodec = 'vp9' | 'h264';
  * that stutters every nine seconds.
  */
 const CAPTURE_RECONFIG_MIN_MS = 30_000;
+const MAX_CAPTURE_REPAIR_ATTEMPTS = 2;
 
 /**
  * How much smaller the ask must get before the capturer follows it down.
@@ -293,6 +294,7 @@ class WebRTCService {
   // 'configurationchange' handler can re-assert geometry after a surface swap
   // without the caller having to remember what it asked for.
   private currentPoint: OperatingPoint | null = null;
+  private appliedScreenPoint: OperatingPoint | null = null;
 
   /**
    * The codec this share is asking for, and whether we have already given up
@@ -303,22 +305,20 @@ class WebRTCService {
    * oscillates is worse than a suboptimal one: every switch costs the viewer a
    * decoder teardown and a keyframe.
    */
-  private screenCodec: ScreenCodec = 'vp9';
+  private screenCodec: ScreenCodec = 'h264';
 
-  /**
-   * What the capturer is actually producing, as opposed to what we last ASKED
-   * the encoder for.
-   *
-   * `currentPoint` conflated the two, which made "has the geometry changed?"
-   * the wrong question: a picture that shrank and then grew back to a size we
-   * had never stopped capturing still counted as a change, and every
-   * applyConstraints on a live getDisplayMedia track restarts Chrome's capture
-   * pipeline — a keyframe and a decoder re-init for the viewer, for nothing.
-   */
+  /** Last successfully requested capture geometry; actual pixels come from getSettings(). */
   private capturedPoint: OperatingPoint | null = null;
 
   /** When the capturer was last reconfigured. Drives the hysteresis below. */
   private lastCaptureReconfigAt = 0;
+  private captureReconfigTimer: ReturnType<typeof setTimeout> | null = null;
+  private captureRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+  private captureRepairAttempts = new Map<string, number>();
+  private failedCaptureGeometry: string | null = null;
+  private captureRecoveryPending = false;
+  private applyingCaptureConstraints = false;
+  private qualityUpdateChain: Promise<boolean> = Promise.resolve(false);
   private handlers: WebRTCEventHandlers = {};
   // The config we were initialized with. Kept so the ICE diagnostic can report
   // which servers were OFFERED, which is a different question from which
@@ -617,93 +617,108 @@ class WebRTCService {
 
   // Capture screen WITHOUT adding to peer connection (for permission flow)
   async captureScreen(point: OperatingPoint): Promise<{ stream: MediaStream; streamId: string; hasAudio: boolean }> {
-    try {
-      // Screen share audio should NOT have voice processing.
-      const constraints: DisplayMediaStreamOptions = {
-        video: displayConstraintsFor(point),
-        audio: true, // Simple audio request - let browser handle details
-        // Never offer this app's own tab as a share target: picking it is a
-        // hall of mirrors and is never what anyone meant.
-        selfBrowserSurface: 'exclude',
-        // Let the user switch which window/tab they are sharing without a fresh
-        // permission prompt. Handled below via 'configurationchange'.
-        surfaceSwitching: 'include',
-        // NOTE: displaySurface is deliberately NOT set. Biasing toward
-        // 'browser' would give better quality for tab-captured video, but DRM
-        // content (Netflix, Disney+) renders black on the protected path under
-        // tab capture — which would break the app's primary use case.
-      } as DisplayMediaStreamOptions;
+    // Screen share audio should NOT have voice processing.
+    const constraints: DisplayMediaStreamOptions = {
+      video: displayConstraintsFor(point),
+      audio: true, // Simple audio request - let browser handle details
+      // Never offer this app's own tab as a share target: picking it is a
+      // hall of mirrors and is never what anyone meant.
+      selfBrowserSurface: 'exclude',
+      // Let the user switch which window/tab they are sharing without a fresh
+      // permission prompt. Handled below via 'configurationchange'.
+      surfaceSwitching: 'include',
+      // NOTE: displaySurface is deliberately NOT set. Biasing toward
+      // 'browser' would give better quality for tab-captured video, but DRM
+      // content (Netflix, Disney+) renders black on the protected path under
+      // tab capture — which would break the app's primary use case.
+    } as DisplayMediaStreamOptions;
 
-      const stream = await navigator.mediaDevices.getDisplayMedia(constraints);
-      // What we asked the capturer for is what it is now producing. Left at 0
-      // deliberately: the first genuine raise after a capture is always allowed.
-      this.capturedPoint = point;
-      this.lastCaptureReconfigAt = 0;
+    const stream = await navigator.mediaDevices.getDisplayMedia(constraints);
+    // Remember the request, not a claim about the source's actual dimensions.
+    // The first genuine raise after a capture is always allowed.
+    this.capturedPoint = point;
+    this.lastCaptureReconfigAt = 0;
 
-      // Mark video tracks as screen share using contentHint (W3C standard)
-      // This allows the receiving peer to identify screen share tracks reliably
-      const videoTracks = stream.getVideoTracks();
-      for (const track of videoTracks) {
-        if ('contentHint' in track) {
-          // 'motion' tells the encoder to prioritize a steady frame rate over
-          // per-frame sharpness — correct for film/dizi/oyun (moving content).
-          // The old 'detail' did the opposite: it held resolution and starved
-          // the frame rate under load, which is what made playback kesik kesik.
-          // NOTE: contentHint is a LOCAL encoder hint and is NOT signaled to
-          // the remote peer, so the receiver's screen-vs-camera routing relies
-          // on the SignalR stream-id notification, not on this value.
-          track.contentHint = 'motion';
-        }
-
-        // surfaceSwitching means the user can change what they are sharing
-        // mid-stream, and the new surface arrives with the browser's own
-        // settings — our pinned geometry and the contentHint are both gone.
-        // Re-assert them rather than silently reverting to an unpinned 4K grab.
-        track.addEventListener('configurationchange', () => {
-          const current = this.currentPoint;
-          if (!current) return;
-          void track.applyConstraints(displayConstraintsFor(current)).catch(() => {
-            /* best effort — the encoder ceiling still holds the line */
-          });
-          // The new surface is being captured at `current`, whatever the old
-          // one was. Without this the next raise would be measured against a
-          // size that no longer exists.
-          this.capturedPoint = current;
-          if ('contentHint' in track) track.contentHint = 'motion';
-        });
+    // Local motion hint; the receiver identifies screen tracks by signalled stream ID.
+    const videoTracks = stream.getVideoTracks();
+    for (const track of videoTracks) {
+      if ('contentHint' in track) {
+        // 'motion' tells the encoder to prioritize a steady frame rate over
+        // per-frame sharpness — correct for film/dizi/oyun (moving content).
+        // The old 'detail' did the opposite: it held resolution and starved
+        // the frame rate under load, which is what made playback kesik kesik.
+        // NOTE: contentHint is a LOCAL encoder hint and is NOT signaled to
+        // the remote peer, so the receiver's screen-vs-camera routing relies
+        // on the SignalR stream-id notification, not on this value.
+        track.contentHint = 'motion';
       }
 
-      // Surface whether the browser actually captured audio. Safari is the usual
-      // offender: getDisplayMedia({audio:true}) silently returns 0 audio tracks
-      // when the user picks a window or full-screen share (Safari only captures
-      // audio for *tab* shares, and only if "Share audio" was checked). Without
-      // this signal, the caller has no way to tell the user why their friend
-      // can't hear them — they just see a black-hole bug.
-      const audioTracks = stream.getAudioTracks();
-      const hasAudio = audioTracks.length > 0;
-      logger.debug(
-        `[ScreenShare] Captured ${videoTracks.length} video track(s), ` +
-        `${audioTracks.length} audio track(s). ` +
-        (hasAudio ? '✓ audio will reach peer.' : '⚠ no audio — peer will see video only.')
-      );
-
-      // Try to disable audio processing for cleaner sound (optional, may fail on some browsers)
-      for (const track of audioTracks) {
+      // surfaceSwitching means the user can change what they are sharing
+      // mid-stream, and the new surface arrives with the browser's own
+      // settings — our pinned geometry and the contentHint are both gone.
+      // Re-assert them rather than silently reverting to an unpinned 4K grab.
+      track.addEventListener('configurationchange', () => {
+        const current = this.currentPoint;
+        if (!current || this.applyingCaptureConstraints ||
+            !this.screenStream?.getVideoTracks().includes(track)) return;
+        // Our own applyConstraints can queue this event after its promise
+        // resolves. Matching constraints must preserve the capture request and
+        // cooldown, or that event would recursively restart capture forever.
+        let matchingConstraints = false;
         try {
-          await track.applyConstraints({
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          });
-        } catch {
-          // Ignore - some browsers don't support these constraints for display audio
+          const constraints = track.getConstraints?.();
+          const matches = (value: ConstrainULong | ConstrainDouble | undefined, expected: number) =>
+            typeof value === 'object' && value !== null && value.max === expected &&
+            (value.ideal === undefined || value.ideal === expected) &&
+            (value.exact === undefined || value.exact === expected);
+          matchingConstraints = matches(constraints?.width, current.width) &&
+            matches(constraints?.height, current.height) &&
+            matches(constraints?.frameRate, current.fps);
+        } catch { /* Unsupported inspection falls back to surface reapplication. */ }
+        if (!matchingConstraints) {
+          this.capturedPoint = null;
+          this.lastCaptureReconfigAt = 0;
         }
-      }
-
-      return { stream, streamId: stream.id, hasAudio };
-    } catch (err) {
-      throw err;
+        // Sender scaling still follows actual geometry, even when constraints
+        // are unchanged. The update remains serialized with other requests.
+        // Keep retry history for this track: an event may also arrive after
+        // our own constraints resolve. A bitrate change or such an event must
+        // not replenish the bounded repair allowance.
+        if ('contentHint' in track) track.contentHint = 'motion';
+        void this.updateScreenShareQuality(current).catch((err) => {
+          logger.debug('[WebRTC] Surface change update failed:', err);
+        });
+      });
     }
+
+    // Surface whether the browser actually captured audio. Safari is the usual
+    // offender: getDisplayMedia({audio:true}) silently returns 0 audio tracks
+    // when the user picks a window or full-screen share (Safari only captures
+    // audio for *tab* shares, and only if "Share audio" was checked). Without
+    // this signal, the caller has no way to tell the user why their friend
+    // can't hear them — they just see a black-hole bug.
+    const audioTracks = stream.getAudioTracks();
+    const hasAudio = audioTracks.length > 0;
+    logger.debug(
+      `[ScreenShare] Captured ${videoTracks.length} video track(s), ` +
+      `${audioTracks.length} audio track(s). ` +
+      (hasAudio ? '✓ audio will reach peer.' : '⚠ no audio — peer will see video only.')
+    );
+
+    // Try to disable audio processing for cleaner sound (optional, may fail on some browsers)
+    for (const track of audioTracks) {
+      try {
+        await track.applyConstraints({
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        });
+      } catch {
+        // Ignore - some browsers don't support these constraints for display audio
+      }
+    }
+
+    return { stream, streamId: stream.id, hasAudio };
   }
 
   /**
@@ -758,7 +773,10 @@ class WebRTCService {
     const enc = params.encodings?.[0] as
       | (RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType })
       | undefined;
-    if (enc) delete enc.networkPriority;
+    if (enc) {
+      delete enc.networkPriority;
+      delete (enc as RTCRtpEncodingParameters & { priority?: RTCPriorityType }).priority;
+    }
 
     try {
       await sender.setParameters(params);
@@ -796,6 +814,8 @@ class WebRTCService {
     };
     enc.maxBitrate = isSharing ? CAMERA_MAX_BITRATE_WHILE_SHARING : CAMERA_MAX_BITRATE_IDLE;
     enc.networkPriority = isSharing ? 'low' : 'medium';
+    // priority controls the local bitrate allocator; networkPriority is only DSCP.
+    (enc as RTCRtpEncodingParameters & { priority?: RTCPriorityType }).priority = isSharing ? 'low' : 'medium';
     if (isSharing) {
       enc.scaleResolutionDownBy = CAMERA_SCALE_DOWN_WHILE_SHARING;
       // Trade temporal detail, not more spatial detail. See the constant.
@@ -810,123 +830,37 @@ class WebRTCService {
     }
   }
 
-  /**
-   * Choose the screen share's video codec.
-   *
-   * The measured session encoded with `libvpx` — VP8 — and the picture was the
-   * complaint. VP9 carries roughly the same quality in 30-50% fewer bits, and
-   * on a link that is bandwidth-limited every hour of the day, fewer bits per
-   * frame converts directly into resolution: the encoder stops having to choose
-   * 318x178 to stay inside its ceiling. This is the only lever here that
-   * improves the picture without taking bandwidth from something else.
-   *
-   * Promote-only, rather than sorting the whole list: RTX, RED and FEC entries
-   * keep their original relative order, and a browser without VP9 is left
-   * exactly as it was. setCodecPreferences also only reorders *our* offer — the
-   * answerer still picks from the intersection — so a peer that cannot do VP9
-   * negotiates VP8 as before rather than failing.
-   *
-   * The trade is CPU: VP9 encode costs more than VP8. The measured session had
-   * `qualityLimitationDurations.cpu` at 0, so there was headroom, but that was
-   * headroom at 318x178. The original note here said "if this flips the
-   * limitation from 'bandwidth' to 'cpu', this is the change to revert" — and
-   * it did, on a machine with no hardware VP9 encoder at all. So the revert is
-   * now something the session can perform on itself: see downgradeScreenCodec.
-   *
-   * H.264 is the fallback rather than VP8 because it is the one codec with
-   * hardware encode essentially everywhere, which is the entire point of
-   * falling back. It costs roughly 30-50% more bits for the same quality; a
-   * slightly softer picture that runs at the frame rate it promised beats a
-   * sharp one that stops and starts.
-   */
+  /** Prefer H.264 for predictable 1080p encode cost; retain negotiated fallbacks. */
   private applyCodecPreference(
     sender: RTCRtpSender,
     codec: ScreenCodec = this.screenCodec,
-  ): void {
-    if (!this.peerConnection) return;
-
-    const transceiver = this.peerConnection
-      .getTransceivers()
-      .find((t) => t.sender === sender);
-    if (!transceiver?.setCodecPreferences) return;
-
-    // typeof, not a bare reference: this runs inside addScreenShareTracks'
-    // per-track try block, and a ReferenceError here would be swallowed by it
-    // *after* skipping the setParameters call that applies the bitrate ceiling.
-    if (typeof RTCRtpSender === 'undefined') return;
+  ): boolean {
+    const transceiver = this.peerConnection?.getTransceivers().find((t) => t.sender === sender);
+    if (!transceiver?.setCodecPreferences || typeof RTCRtpSender === 'undefined') return false;
     const codecs = RTCRtpSender.getCapabilities?.('video')?.codecs;
-    if (!codecs?.length) return;
+    if (!codecs?.length) return false;
 
-    /**
-     * AV1 is worth roughly 30% over VP9 and is the largest codec lever there
-     * is — but only where the encoder is in hardware. Apple Silicon has AV1
-     * DECODE only, so on this machine choosing AV1 means software libaom in
-     * realtime at 1080p, which trades a bandwidth limit for a CPU limit and
-     * makes the picture worse, not better. Opt-in, so it can be measured before
-     * it is trusted; useSenderHealth reports 'cpu-bound' if it goes wrong.
-     */
-    const wantsAv1 = readSetting('wt:codec') === 'av1';
-
-    // The opt-in still wins over everything: someone who set it is measuring.
-    const rank = (mime: string): number => {
-      if (wantsAv1 && /\/av01?$/i.test(mime)) return 0;
-      const wanted = codec === 'h264' ? /\/h264$/i : /\/vp9$/i;
-      return wanted.test(mime) ? 1 : 2;
-    };
-
-    /**
-     * The right variant of whichever codec we picked, ahead of the rest.
-     *
-     * VP9: profile 0. The old filter promoted every VP9 entry while preserving
-     * the browser's own relative order, so a profile-2 entry (10-bit 4:2:0)
-     * listed first was what actually got offered — more CPU and more bits to
-     * carry content that is 8-bit anyway. A missing sdpFmtpLine is treated as
-     * profile 0, which is what browsers that omit it mean.
-     *
-     * H.264: packetization-mode=1. Mode 0 cannot fragment a NAL unit across
-     * RTP packets, so every large frame has to fit an MTU — exactly the frames
-     * a screen share produces most of. Constrained baseline (42e01f) alongside
-     * it, for the same reason VP9 profile 0 is preferred: it is the profile
-     * every decoder has, and the content is 8-bit 4:2:0 regardless.
-     */
-    const isPreferredProfile = (c: RTCRtpCodec): boolean => {
-      const fmtp = c.sdpFmtpLine;
-      if (codec === 'h264' && /\/h264$/i.test(c.mimeType)) {
-        if (!fmtp) return false;
-        return /packetization-mode=1/.test(fmtp) && /profile-level-id=42e01f/i.test(fmtp);
+    const wanted = codec === 'h264' ? /\/h264$/i : codec === 'vp9' ? /\/vp9$/i : /\/av0?1$/i;
+    if (!codecs.some((c) => wanted.test(c.mimeType))) return false;
+    const profileRank = (c: RTCRtpCodec): number => {
+      if (!wanted.test(c.mimeType)) return 3;
+      const fmtp = c.sdpFmtpLine ?? '';
+      if (codec === 'h264') {
+        if (!/packetization-mode=1(?:;|$)/i.test(fmtp)) return 2;
+        return /profile-level-id=42e0/i.test(fmtp) ? 0 : 1;
       }
-      if (!fmtp) return true;
-      const match = /profile-id=(\d+)/.exec(fmtp);
-      return !match || match[1] === '0';
+      return /profile-id=[1-9]/.test(fmtp) ? 1 : 0;
     };
-
-    // Stable sort by rank, then profile — everything we are not promoting (RTX,
-    // RED, FEC, and whichever of VP9/H.264 was not chosen) keeps its original
-    // relative order, so a browser without the preferred codec is left exactly
-    // as it was.
-    const reordered = codecs
-      .map((codec, index) => ({ codec, index }))
-      .sort((a, b) => {
-        const byRank = rank(a.codec.mimeType) - rank(b.codec.mimeType);
-        if (byRank !== 0) return byRank;
-        const byProfile =
-          Number(isPreferredProfile(b.codec)) - Number(isPreferredProfile(a.codec));
-        if (byProfile !== 0) return byProfile;
-        return a.index - b.index;
-      })
-      .map((entry) => entry.codec);
-
-    // Nothing worth promoting — leave the order alone rather than reshuffling
-    // into some guess at a preference.
-    if (reordered.every((c, i) => c === codecs[i])) return;
-
+    const reordered = codecs.map((codec, index) => ({ codec, index }))
+      .sort((a, b) => profileRank(a.codec) - profileRank(b.codec) || a.index - b.index)
+      .map(({ codec }) => codec);
     try {
       transceiver.setCodecPreferences(reordered);
       logger.debug('[WebRTC] Screen share codec order:', reordered[0]?.mimeType);
+      return true;
     } catch (err) {
-      // Not fatal in any way: we simply negotiate whatever the browser would
-      // have negotiated on its own.
       logger.debug('[WebRTC] setCodecPreferences rejected:', err);
+      return false;
     }
   }
 
@@ -942,9 +876,8 @@ class WebRTCService {
    *    instead. The old setup inherited 'maintain-resolution' (from
    *    contentHint='detail') and did the reverse — holding resolution while
    *    dropping frames. That is the root cause of the choppy playback.
-   *  - We deliberately do NOT pin scaleResolutionDownBy: maintain-framerate
-   *    can only do its job if the encoder is allowed to scale resolution
-   *    down. The old `scaleResolutionDownBy = 1.0` forbade exactly that.
+   *  - scaleResolutionDownBy fits the requested picture into the capture;
+   *    maintain-framerate may reduce it further when the encoder needs to.
    *  - maxFramerate gives the encoder an explicit target instead of guessing.
    */
   private applyVideoEncoding(params: RTCRtpSendParameters, point: OperatingPoint): void {
@@ -960,8 +893,13 @@ class WebRTCService {
     // AUTO_MAX_BITRATE instead, so there is nothing left to special-case here.
     enc.maxBitrate = point.videoBps;
     enc.maxFramerate = point.fps;
-    // Allow the encoder to drop resolution to protect the frame rate.
-    delete enc.scaleResolutionDownBy;
+    // Apply the controller's geometry even before the capturer can resize.
+    // An omitted scale defaults to 1; it does not implement our chosen size.
+    // Native CPU/bandwidth adaptation can still reduce resolution further.
+    const settings = this.screenStream?.getVideoTracks()[0]?.getSettings?.();
+    const width = settings?.width ?? this.capturedPoint?.width ?? point.width;
+    const height = settings?.height ?? this.capturedPoint?.height ?? point.height;
+    enc.scaleResolutionDownBy = Math.max(1, width / point.width, height / point.height);
     // Unconditional: the old `'networkPriority' in enc` guard meant this only
     // applied on browsers that happened to echo the key back from
     // getParameters(), so the priority boost the screen share is supposed to
@@ -970,6 +908,7 @@ class WebRTCService {
       'high';
 
     // Whole-sender preference (not per-encoding): smoothness over sharpness.
+    (enc as RTCRtpEncodingParameters & { priority?: RTCPriorityType }).priority = 'high';
     params.degradationPreference = 'maintain-framerate';
   }
 
@@ -1000,79 +939,89 @@ class WebRTCService {
     const sender = this.resolveScreenVideoSender();
     if (!sender) return false;
 
+    if (!this.applyCodecPreference(sender, 'h264')) return false;
     this.screenCodec = 'h264';
-    this.applyCodecPreference(sender, 'h264');
-    logger.warn('[WebRTC] screen share falling back to H.264 — VP9 encode could not keep up');
+    logger.warn('[WebRTC] screen share falling back to H.264 — software encode could not keep up');
     return true;
   }
 
   /** Which codec the screen share is currently asking for. For diagnostics. */
+  getAppliedScreenPoint(): OperatingPoint | null {
+    return this.appliedScreenPoint;
+  }
+
   getScreenCodec(): ScreenCodec {
     return this.screenCodec;
   }
 
   // Add screen share tracks to peer connection (after permission granted)
   async addScreenShareTracks(stream: MediaStream, point: OperatingPoint): Promise<void> {
-    try {
-      this.screenStream = stream;
-      this.screenStreamId = stream.id;
-      this.currentPoint = point;
+    this.clearCaptureRecovery();
+    this.screenStream = stream;
+    this.screenStreamId = stream.id;
+    this.currentPoint = point;
+    this.appliedScreenPoint = null;
+    const preference = readSetting('wt:codec');
+    this.screenCodec = preference === 'vp9' || preference === 'av1' ? preference : 'h264';
 
-      // ADD screen share tracks as new transceivers (do NOT replace camera)
-      if (this.peerConnection) {
-        const tracks = this.screenStream.getTracks();
+    // ADD screen share tracks as new transceivers (do NOT replace camera)
+    if (this.peerConnection) {
+      const tracks = this.screenStream.getTracks();
 
-        for (const track of tracks) {
-          try {
-            const sender = this.peerConnection.addTrack(track, this.screenStream!);
-            if (track.kind === 'video') this.screenVideoSender = sender;
-            else if (track.kind === 'audio') this.screenAudioSender = sender;
+      for (const track of tracks) {
+        try {
+          const sender = this.peerConnection.addTrack(track, this.screenStream!);
+          if (track.kind === 'video') this.screenVideoSender = sender;
+          else if (track.kind === 'audio') this.screenAudioSender = sender;
 
-            // Configure encoding based on quality preset
-            if (sender) {
-              const params = sender.getParameters();
-              if (!params.encodings || params.encodings.length === 0) {
-                params.encodings = [{}];
-              }
+          // Configure encoding based on quality preset
+          if (sender) {
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+              params.encodings = [{}];
+            }
 
-              if (track.kind === 'video') {
-                // Motion-optimized: maintain-framerate + maxFramerate, and
-                // crucially NO scaleResolutionDownBy pin (see applyVideoEncoding).
-                this.applyVideoEncoding(params, point);
-                // Before the renegotiation this addTrack triggers, so the codec
-                // order lands in the offer rather than needing a second one.
+            if (track.kind === 'video') {
+              // Motion-optimized: maintain-framerate + maxFramerate, and
+              // explicit geometry (see applyVideoEncoding).
+              this.applyVideoEncoding(params, point);
+              // Before the renegotiation this addTrack triggers, so the codec
+              // order lands in the offer rather than needing a second one.
+              if (!this.applyCodecPreference(sender) && this.screenCodec === 'h264') {
+                this.screenCodec = 'vp9';
                 this.applyCodecPreference(sender);
-              } else if (track.kind === 'audio') {
-                if (point.audioBps > 0) {
-                  params.encodings[0].maxBitrate = point.audioBps;
-                }
               }
-
-              if (await this.setParametersSafely(sender, params, `screen ${track.kind}`)) {
-                logger.debug(`[WebRTC] Set ${track.kind} encoding:`, params.encodings[0]);
+            } else if (track.kind === 'audio') {
+              if (point.audioBps > 0) {
+                params.encodings[0].maxBitrate = point.audioBps;
               }
             }
-          } catch {
-            // Error adding track - continue with others
+
+            if (await this.setParametersSafely(sender, params, `screen ${track.kind}`)) {
+              if (track.kind === 'video' && this.screenStream === stream) this.appliedScreenPoint = point;
+              logger.debug(`[WebRTC] Set ${track.kind} encoding:`, params.encodings[0]);
+            }
           }
+        } catch {
+          // Error adding track - continue with others
         }
       }
+    }
 
-      // The screen is now the thing worth spending uplink on — stand the camera
-      // down before the encoder has a chance to settle at its old ceiling.
-      await this.applyCameraEncoding(true);
+    // The screen is now the thing worth spending uplink on — stand the camera
+    // down before the encoder has a chance to settle at its old ceiling.
+    await this.applyCameraEncoding(true);
 
-      const videoTrack = this.screenStream.getVideoTracks()[0];
-      if (videoTrack) {
-        // Hand it up rather than tearing down here — see onScreenShareEnded.
-        // The caller routes it into the same stop path the in-app button uses,
-        // so both endings tell the peer and both leave one consistent state.
-        videoTrack.onended = () => {
-          this.handlers.onScreenShareEnded?.();
-        };
-      }
-    } catch (err) {
-      throw err;
+    if (this.screenStream !== stream) return;
+    this.startCaptureRecovery(stream);
+    const videoTrack = this.screenStream.getVideoTracks()[0];
+    if (videoTrack) {
+      // Hand it up rather than tearing down here — see onScreenShareEnded.
+      // The caller routes it into the same stop path the in-app button uses,
+      // so both endings tell the peer and both leave one consistent state.
+      videoTrack.onended = () => {
+        this.handlers.onScreenShareEnded?.();
+      };
     }
   }
 
@@ -1097,13 +1046,107 @@ class WebRTCService {
    * justified solely when the captured *surface* changes — never for a
    * bitrate/framerate tweak (that re-prompts for permission and freezes the peer).
    */
-  async updateScreenShareQuality(point: OperatingPoint): Promise<boolean> {
-    if (!this.peerConnection || !this.screenStream) return false;
+  updateScreenShareQuality(point: OperatingPoint): Promise<boolean> {
+    const stream = this.screenStream;
+    if (stream) this.currentPoint = point;
+    // getParameters transactions must not overlap or finish in reverse order.
+    const update = () => stream && stream === this.screenStream
+      ? this.applyScreenShareQuality(point) : Promise.resolve(false);
+    const result = this.qualityUpdateChain.then(update, update);
+    this.qualityUpdateChain = result.catch(() => false);
+    return result;
+  }
+
+  private captureGeometryKey(track: MediaStreamTrack, point: OperatingPoint): string {
+    return `${track.id}:${point.width}x${point.height}@${point.fps}`;
+  }
+
+  private clearCaptureRecovery(): void {
+    if (this.captureRecoveryTimer) clearInterval(this.captureRecoveryTimer);
+    this.captureRecoveryTimer = null;
+    this.captureRepairAttempts.clear();
+    this.failedCaptureGeometry = null;
+    this.captureRecoveryPending = false;
+  }
+
+  /**
+   * Low output alone is not a capture bug: WebRTC may adapt pixels upstream,
+   * and a small shared window may have no more pixels. Only a failed request
+   * or a demonstrably stale capture constraint warrants a bounded retry.
+   */
+  private captureNeedsRepair(track: MediaStreamTrack, point: OperatingPoint): boolean {
+    const key = this.captureGeometryKey(track, point);
+    const failed = this.failedCaptureGeometry === key;
+    // A rejected frame-rate change or small resize is also known pending work.
+    // The retry allowance, rather than a size-deficit heuristic, bounds it.
+    if (failed) return true;
+    try {
+      const settings = track.getSettings?.();
+      if (!settings?.width || !settings.height) return failed;
+      const capabilities = track.getCapabilities?.();
+      const positive = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0;
+      if (!positive(settings.width) || !positive(settings.height)) return false;
+      const maxWidth = capabilities?.width?.max;
+      const maxHeight = capabilities?.height?.max;
+      const width = Math.min(point.width, positive(maxWidth) ? maxWidth : point.width);
+      const height = Math.min(point.height, positive(maxHeight) ? maxHeight : point.height);
+      // Preserve the source aspect: 1920x1040 is a full-size movie, not a
+      // failed 1920x1080 capture. Capability bounds also protect small windows.
+      const aspect = positive(settings.aspectRatio) ? settings.aspectRatio : settings.width / settings.height;
+      const fittedWidth = Math.min(width, height * aspect);
+      const fittedHeight = Math.min(height, width / aspect);
+      if (settings.width >= fittedWidth * 0.8 && settings.height >= fittedHeight * 0.8) return false;
+      const constraints = track.getConstraints?.();
+      const hardLimit = (constraint: ConstrainULong | undefined): number | null => {
+        if (!constraint || typeof constraint !== 'object') return null;
+        const limit = constraint.max ?? constraint.exact;
+        return positive(limit) ? limit : null;
+      };
+      const widthLimit = hardLimit(constraints?.width);
+      const heightLimit = hardLimit(constraints?.height);
+      return (widthLimit !== null && widthLimit < fittedWidth * 0.9) ||
+        (heightLimit !== null && heightLimit < fittedHeight * 0.9);
+    } catch {
+      return failed;
+    }
+  }
+
+  private startCaptureRecovery(stream: MediaStream): void {
+    this.clearCaptureRecovery();
+    this.captureRecoveryTimer = setInterval(() => {
+      if (stream !== this.screenStream || this.captureRecoveryPending) return;
+      this.captureRecoveryPending = true;
+      const repair = async (): Promise<boolean> => {
+        const point = this.currentPoint;
+        const track = stream.getVideoTracks()[0];
+        if (stream !== this.screenStream || !point || !track || track.readyState === 'ended') return false;
+        // A known geometry update already has its own deadline. Do not race it.
+        if (this.captureReconfigTimer || Date.now() - this.lastCaptureReconfigAt < CAPTURE_RECONFIG_MIN_MS) return false;
+        const key = this.captureGeometryKey(track, point);
+        const attempts = this.captureRepairAttempts.get(key) ?? 0;
+        if (attempts >= MAX_CAPTURE_REPAIR_ATTEMPTS || !this.captureNeedsRepair(track, point)) return false;
+        this.captureRepairAttempts.set(key, attempts + 1);
+        logger.debug('[WebRTC] Retrying capture geometry after stale constraints or failed application:', key);
+        return this.applyScreenShareQuality(point, true);
+      };
+      const result = this.qualityUpdateChain.then(repair, repair);
+      this.qualityUpdateChain = result.catch(() => false);
+      void result.catch(() => {}).finally(() => {
+        if (stream === this.screenStream) this.captureRecoveryPending = false;
+      });
+    }, CAPTURE_RECONFIG_MIN_MS);
+  }
+
+  private async applyScreenShareQuality(point: OperatingPoint, repairCapture = false): Promise<boolean> {
+    const stream = this.screenStream;
+    const connection = this.peerConnection;
+    if (!connection || !stream) return false;
+    const isCurrent = () => stream === this.screenStream && connection === this.peerConnection;
 
     // What we are asking for. The capturer's own geometry is tracked separately
     // in `capturedPoint`, because the two answer different questions and
     // conflating them is what made every rung change restart the capture.
-    this.currentPoint = point;
+    // currentPoint is the latest queued request; do not overwrite it here.
 
     // Shared with getOutboundScreenStats: one resolver, so a stale reference
     // cannot be handled in one place and ignored in the other. Wrongly
@@ -1121,8 +1164,10 @@ class WebRTCService {
     // and freezes the viewer. setParametersSafely swallows the failure; the
     // stream keeps running, we just didn't move the cap.
     if (await this.setParametersSafely(videoSender, params, 'screen video')) {
+      if (isCurrent()) this.appliedScreenPoint = point;
       logger.debug('[WebRTC] updateScreenShareQuality video →', params.encodings[0]);
     }
+    if (!isCurrent()) return false;
 
     // Geometry AND frame rate, in ONE call.
     //
@@ -1139,20 +1184,14 @@ class WebRTCService {
     // Growing always counts: the capturer is the only thing that can deliver a
     // bigger picture, so nothing else can satisfy the ask.
     //
-    // Shrinking counts only past CAPTURE_SHRINK_RATIO. Small downward moves
-    // still belong to the encoder's own scaler, which is why applyVideoEncoding
-    // leaves scaleResolutionDownBy unpinned and asks for 'maintain-framerate' —
-    // and every applyConstraints on a live getDisplayMedia track restarts
-    // Chrome's capture pipeline, so the viewer pays a keyframe and a decoder
-    // re-init for a change that was going to happen inside the encoder anyway.
-    // A rung and a half is the case where it was NOT going to happen inside the
-    // encoder; see the constant.
+    // Small downward moves use the explicit sender scale; only large sustained
+    // changes resize the capture too. Keep capture restarts out of bitrate probes.
     //
     // A frame-rate change counts either way. It comes from the content mode,
     // which is a deliberate human action rather than the controller breathing.
     const captured = this.capturedPoint;
     const mustGrow =
-      !captured ||
+      repairCapture || !captured ||
       point.width > captured.width ||
       point.height > captured.height ||
       point.fps !== captured.fps;
@@ -1167,16 +1206,43 @@ class WebRTCService {
     const sinceReconfig = Date.now() - this.lastCaptureReconfigAt;
     const settled = this.lastCaptureReconfigAt === 0 || sinceReconfig >= CAPTURE_RECONFIG_MIN_MS;
 
-    const videoTrack = this.screenStream.getVideoTracks()[0];
-    if (videoTrack && (mustGrow || mustShrink) && settled) {
+    const videoTrack = stream.getVideoTracks()[0];
+    if (this.captureReconfigTimer) clearTimeout(this.captureReconfigTimer);
+    this.captureReconfigTimer = null;
+    if (videoTrack && (mustGrow || mustShrink) && !settled) {
+      const stream = this.screenStream;
+      this.captureReconfigTimer = setTimeout(() => {
+        this.captureReconfigTimer = null;
+        if (stream === this.screenStream && this.currentPoint) {
+          void this.updateScreenShareQuality(this.currentPoint).catch((err) => {
+            logger.debug('[WebRTC] Deferred quality update failed:', err);
+          });
+        }
+      }, Math.max(1, CAPTURE_RECONFIG_MIN_MS - sinceReconfig));
+    }
+    const geometryKey = videoTrack ? this.captureGeometryKey(videoTrack, point) : null;
+    if (videoTrack && (mustGrow || mustShrink) && settled &&
+        (repairCapture || this.failedCaptureGeometry !== geometryKey)) {
+      this.lastCaptureReconfigAt = Date.now();
+      this.applyingCaptureConstraints = true;
       try {
         await videoTrack.applyConstraints(displayConstraintsFor(point));
+        if (!isCurrent()) return false;
         this.capturedPoint = point;
-        this.lastCaptureReconfigAt = Date.now();
+        this.failedCaptureGeometry = null;
+        // Capture geometry changed, so recompute the sender's relative scale.
+        const resizedParams = videoSender.getParameters();
+        this.applyVideoEncoding(resizedParams, point);
+        await this.setParametersSafely(videoSender, resizedParams, 'resized screen video');
       } catch (err) {
+        if (isCurrent()) this.failedCaptureGeometry = geometryKey;
         logger.debug('[WebRTC] applyConstraints(geometry) not supported here:', err);
+      } finally {
+        this.applyingCaptureConstraints = false;
       }
     }
+
+    if (!isCurrent()) return false;
 
     // Match the audio encoder cap if there's a screen-share audio track.
     const audioSender = this.screenAudioSender;
@@ -1199,6 +1265,11 @@ class WebRTCService {
   }
 
   async stopScreenShare(): Promise<boolean> {
+    this.clearCaptureRecovery();
+    if (this.captureReconfigTimer) clearTimeout(this.captureReconfigTimer);
+    this.captureReconfigTimer = null;
+    this.currentPoint = null;
+    this.appliedScreenPoint = null;
     try {
       if (this.screenStream) {
         const screenTracks = this.screenStream.getTracks();
@@ -1232,10 +1303,8 @@ class WebRTCService {
         this.screenAudioSender = null;
         this.capturedPoint = null;
         this.lastCaptureReconfigAt = 0;
-        // A new share is a new encode: a 720p window may run in VP9 on the very
-        // machine where a 4K one could not. Starting from the better codec each
-        // time is what keeps the downgrade a response to evidence.
-        this.screenCodec = 'vp9';
+        // The next share re-reads the codec preference, defaulting to H.264.
+        this.screenCodec = 'h264';
 
         // Nothing left to yield to — give the camera its full ceiling back.
         await this.applyCameraEncoding(false);
@@ -1715,14 +1784,13 @@ class WebRTCService {
     report: RTCStatsReport,
     track: MediaStreamTrack | null,
   ): OutboundReport | null {
-    const candidates: OutboundReport[] = [];
+    let candidates: OutboundReport[] = [];
     report.forEach((r) => {
       if (r.type === 'outbound-rtp' && (r as OutboundReport).kind === 'video') {
         candidates.push(r as OutboundReport);
       }
     });
     if (candidates.length === 0) return null;
-    if (candidates.length === 1) return candidates[0];
 
     if (track) {
       for (const c of candidates) {
@@ -1730,6 +1798,12 @@ class WebRTCService {
         const src = report.get(c.mediaSourceId) as { trackIdentifier?: string } | undefined;
         if (src?.trackIdentifier === track.id) return c;
       }
+      // Never substitute a known camera stream while the screen is starting.
+      candidates = candidates.filter((c) => {
+        const source = c.mediaSourceId ? report.get(c.mediaSourceId) as { trackIdentifier?: string } | undefined : undefined;
+        return !source?.trackIdentifier;
+      });
+      if (candidates.length === 0) return null;
     }
 
     const area = (o: OutboundReport) => (o.frameWidth ?? 0) * (o.frameHeight ?? 0);
@@ -1747,11 +1821,14 @@ class WebRTCService {
     const sender = this.resolveScreenVideoSender();
     const track = this.screenStream?.getVideoTracks()[0] ?? null;
 
+    if (!track) return null;
+    let report: RTCStatsReport | null = null;
     let found: OutboundReport | null = null;
 
     if (sender && typeof sender.getStats === 'function') {
       try {
-        found = this.pickOutboundVideo(await sender.getStats(), track);
+        report = await sender.getStats();
+        found = this.pickOutboundVideo(report, track);
       } catch {
         found = null;
       }
@@ -1759,17 +1836,22 @@ class WebRTCService {
 
     if (!found && this.peerConnection) {
       try {
-        found = this.pickOutboundVideo(await this.peerConnection.getStats(), track);
+        report = await this.peerConnection.getStats();
+        found = this.pickOutboundVideo(report, track);
       } catch {
         found = null;
       }
     }
 
-    if (!found) return null;
+    if (!found || track !== this.screenStream?.getVideoTracks()[0]) return null;
 
     const o: OutboundReport = found;
     const reason = o.qualityLimitationReason;
+    const source = o.mediaSourceId ? report?.get(o.mediaSourceId) as { framesPerSecond?: number } | undefined : undefined;
     return {
+      sourceFramesPerSecond: source?.framesPerSecond ?? null,
+      statsId: o.id,
+      timestamp: o.timestamp,
       frameWidth: o.frameWidth ?? null,
       frameHeight: o.frameHeight ?? null,
       framesPerSecond: o.framesPerSecond ?? null,
@@ -1785,6 +1867,11 @@ class WebRTCService {
   }
 
   close(): void {
+    this.clearCaptureRecovery();
+    if (this.captureReconfigTimer) clearTimeout(this.captureReconfigTimer);
+    this.captureReconfigTimer = null;
+    this.currentPoint = null;
+    this.appliedScreenPoint = null;
     if (this.disconnectTimer) {
       clearTimeout(this.disconnectTimer);
       this.disconnectTimer = null;
@@ -1805,7 +1892,7 @@ class WebRTCService {
     // The codec fallback and the captured geometry are facts about one share on
     // one connection. A new peer connection renegotiates from scratch, so
     // carrying them across would apply a verdict from a session that is over.
-    this.screenCodec = 'vp9';
+    this.screenCodec = 'h264';
     this.capturedPoint = null;
     this.lastCaptureReconfigAt = 0;
     this.peerConnection = null;

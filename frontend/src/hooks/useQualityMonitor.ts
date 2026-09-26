@@ -1,5 +1,5 @@
 import { logger } from '../services/logger';
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { webrtcService } from '../services/webrtcService';
 import type { QualityLevel, QualityFeedback } from '../types';
 
@@ -39,6 +39,8 @@ export interface QualityMetrics {
   rttMs: number;
   /** Frames per second the decoder is currently producing. */
   fps: number;
+  /** False only when neither decoder counters nor instantaneous FPS exist. */
+  fpsMeasured?: boolean;
   /** Seconds of the interval the picture spent frozen. */
   freezeSeconds: number;
   /** Length of the interval, in seconds. */
@@ -49,8 +51,13 @@ export interface QualityMetrics {
 // typed as `any` by the DOM lib, so we cast to these for checked field access
 // instead of reaching through `any` at every property.
 interface InboundRtpVideoStats {
+  id?: string;
+  timestamp?: number;
   type?: string;
   kind?: string;
+  mediaType?: string;
+  trackIdentifier?: string;
+  transportId?: string;
   ssrc?: number;
   packetsLost?: number;
   packetsReceived?: number;
@@ -137,7 +144,10 @@ function readInbound(r: InboundRtpVideoStats): InboundScreenStats {
 }
 
 interface CandidatePairStats {
+  id?: string;
   state?: string;
+  selected?: boolean;
+  nominated?: boolean;
   currentRoundTripTime?: number;
 }
 
@@ -191,13 +201,18 @@ export function calculateQualityScore(metrics: QualityMetrics, expectedFps = 30)
   const jitterScore = ramp(metrics.jitterMs, 20, 100);
   const rttScore = ramp(metrics.rttMs, 150, 500);
 
+  // At one frame per second or less, independent sender/receiver windows
+  // routinely straddle a still-frame update. Absence in this window is idle.
   const fpsScore =
-    expectedFps > 0 ? Math.min(100, (metrics.fps / (expectedFps * FPS_SLACK)) * 100) : 100;
+    expectedFps > 1 && metrics.fpsMeasured !== false
+      ? Math.min(100, (metrics.fps / (expectedFps * FPS_SLACK)) * 100) : 100;
 
   // A quarter of the window spent frozen is unusable, whatever else is true.
   const frozenFraction =
     metrics.intervalSeconds > 0 ? metrics.freezeSeconds / metrics.intervalSeconds : 0;
-  const freezeScore = ramp(frozenFraction, 0, 0.25);
+  // A still/paused capture legitimately stops producing frames. Browsers can
+  // count that gap as a freeze even though every transmitted frame arrived.
+  const freezeScore = expectedFps <= 1 ? 100 : ramp(frozenFraction, 0, 0.25);
 
   return Math.max(0, Math.min(lossScore, jitterScore, rttScore, fpsScore, freezeScore));
 }
@@ -210,13 +225,59 @@ export function scoreToLevel(score: number): QualityLevel {
   return 'critical';
 }
 
-/** Per-stream counters carried between polls so we can difference them. */
+/** Counters from the selected track, never a blend of camera and screen. */
 interface StreamSample {
+  key: string;
   packetsLost: number;
   packetsReceived: number;
   bytesReceived: number;
+  framesDecoded: number | undefined;
   freezeDuration: number;
+  expectedFps: number | undefined;
   at: number;
+}
+
+function streamKey(r: InboundRtpVideoStats): string {
+  return `${r.id ?? ''}:${r.ssrc ?? ''}:${r.trackIdentifier ?? ''}`;
+}
+
+/** Follow the receiver's track identity, including when its traffic stops. */
+function selectVideo(
+  stats: RTCStatsReport,
+  trackId: string | undefined,
+  previousKey: string | undefined,
+): InboundRtpVideoStats | undefined {
+  const videos: InboundRtpVideoStats[] = [];
+  stats.forEach((r: InboundRtpVideoStats) => {
+    if (r.type === 'inbound-rtp' && (r.kind ?? r.mediaType) === 'video') videos.push(r);
+  });
+  const matching = trackId ? videos.filter((r) => r.trackIdentifier === trackId) : videos;
+  // When identity is published, absence of the requested track is absence of
+  // evidence. A camera report must never substitute for a missing screen.
+  if (trackId && matching.length === 0 && videos.some((r) => r.trackIdentifier)) return;
+  const candidates = matching.length ? matching : videos;
+  const previous = candidates.find((r) => streamKey(r) === previousKey);
+  if (previous) return previous;
+  // Compatibility for browsers without trackIdentifier: choose the largest
+  // picture once and keep following it, even while a camera sends more bytes.
+  return candidates.sort((a, b) =>
+    ((b.frameWidth ?? 0) * (b.frameHeight ?? 0) - (a.frameWidth ?? 0) * (a.frameHeight ?? 0)) ||
+    ((b.bytesReceived ?? 0) - (a.bytesReceived ?? 0)),
+  )[0];
+}
+
+function selectedRtt(stats: RTCStatsReport, transportId: string | undefined): number {
+  let selectedPairId: string | undefined;
+  let fallback: CandidatePairStats | undefined;
+  stats.forEach((r) => {
+    if (r.type === 'transport' && (!transportId || r.id === transportId)) {
+      selectedPairId = r.selectedCandidatePairId ?? selectedPairId;
+    } else if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.selected || r.nominated)) {
+      fallback = r;
+    }
+  });
+  const selected = selectedPairId ? stats.get(selectedPairId) as CandidatePairStats | undefined : undefined;
+  return ((selected ?? fallback)?.currentRoundTripTime ?? 0) * 1000;
 }
 
 /**
@@ -243,183 +304,139 @@ export function useQualityMonitor(
   isWatching: boolean,
   onQualityChange?: (feedback: QualityFeedback) => void,
   expectedFps?: number,
+  trackId?: string,
 ) {
   const [quality, setQuality] = useState<QualityLevel | null>(null);
   const [score, setScore] = useState<number | null>(null);
   const [metrics, setMetrics] = useState<QualityMetrics | null>(null);
   const [inbound, setInbound] = useState<InboundScreenStats | null>(null);
-
-  // A ref, not a dependency: the sender's target arrives on its own heartbeat
-  // and must not tear down and rebuild the polling interval when it does.
-  const expectedFpsRef = useRef(expectedFps);
+  // Telemetry/callback changes must not restart the sampling interval. Track
+  // changes do: counters and in-flight promises belong to that exact stream.
+  const inputs = useRef({ expectedFps, onQualityChange });
   useEffect(() => {
-    expectedFpsRef.current = expectedFps;
-  }, [expectedFps]);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prevLevelRef = useRef<QualityLevel | null>(null);
-  // -Infinity so the first scoreable poll always reports, rather than starting
-  // the share with up to a heartbeat of silence.
-  const lastSentAtRef = useRef(-Infinity);
-  const samplesRef = useRef<Map<number, StreamSample>>(new Map());
+    inputs.current = { expectedFps, onQualityChange };
+  }, [expectedFps, onQualityChange]);
 
-  const pollStats = useCallback(async () => {
-    try {
-      const stats = await webrtcService.getStats();
-      if (!stats) return;
+  useEffect(() => {
+    setQuality(null);
+    setScore(null);
+    setMetrics(null);
+    setInbound(null);
+    if (!isWatching) return;
 
-      let rttMs = 0;
-      const inbound: InboundRtpVideoStats[] = [];
+    let active = true;
+    let pending = false;
+    let previous: StreamSample | undefined;
+    let previousLevel: QualityLevel | null = null;
+    let lastSentAt = -Infinity;
 
-      stats.forEach((report) => {
-        const r = report as InboundRtpVideoStats;
-        if (r.type === 'inbound-rtp' && r.kind === 'video') inbound.push(r);
-        if (
-          report.type === 'candidate-pair' &&
-          (report as CandidatePairStats).state === 'succeeded'
-        ) {
-          rttMs = ((report as CandidatePairStats).currentRoundTripTime ?? 0) * 1000;
+    async function pollStats() {
+      // Slow getStats calls must not overlap and complete out of order.
+      if (pending) return;
+      pending = true;
+      try {
+        const stats = await webrtcService.getStats();
+        if (!active || !stats) return;
+        const report = selectVideo(stats, trackId, previous?.key);
+        if (!report) {
+          previous = undefined;
+          setQuality(null);
+          setScore(null);
+          setMetrics(null);
+          setInbound(null);
+          return;
         }
-      });
-
-      const now = performance.now();
-      const prev = samplesRef.current;
-      const next = new Map<number, StreamSample>();
-
-      // Score the stream carrying the most traffic *right now*.
-      //
-      // Watching a screen share means two inbound video streams — the share and
-      // the peer's camera — and the old code overwrote fps and jitter with
-      // whichever the iterator happened to reach last, while summing the packet
-      // counters across both. It could report the 640x480 camera's frame rate as
-      // the health of a screen share, or blend the two into a number describing
-      // neither. The share is the bigger stream by a wide margin, so "most bytes
-      // this interval" picks it out without needing to know which is which.
-      let best: {
-        stats: InboundRtpVideoStats;
-        sample: StreamSample;
-        prior: StreamSample;
-      } | null = null;
-      let bestDelta = 0;
-
-      for (const r of inbound) {
-        if (r.ssrc === undefined) continue;
+        const now = performance.now();
+        const { expectedFps: expected, onQualityChange: notify } = inputs.current;
         const sample: StreamSample = {
-          packetsLost: r.packetsLost ?? 0,
-          packetsReceived: r.packetsReceived ?? 0,
-          bytesReceived: r.bytesReceived ?? 0,
-          freezeDuration: r.totalFreezesDuration ?? 0,
-          at: now,
+          key: streamKey(report),
+          packetsLost: report.packetsLost ?? 0,
+          packetsReceived: report.packetsReceived ?? 0,
+          bytesReceived: report.bytesReceived ?? 0,
+          framesDecoded: report.framesDecoded,
+          freezeDuration: report.totalFreezesDuration ?? 0,
+          expectedFps: expected,
+          at: report.timestamp ?? now,
         };
-        next.set(r.ssrc, sample);
-
-        const prior = prev.get(r.ssrc);
-        if (!prior) continue;
-
-        const delta = sample.bytesReceived - prior.bytesReceived;
-        if (delta > bestDelta) {
-          bestDelta = delta;
-          best = { stats: r, sample, prior };
+        const prior = previous;
+        if (prior?.key === sample.key && sample.at <= prior.at) return;
+        previous = sample;
+        setInbound(readInbound(report));
+        // A restarted receiver may reuse an SSRC. Never interpret a counter
+        // reset (or a new report id with that SSRC) as zero delivery.
+        if (!prior || sample.key !== prior.key ||
+          sample.bytesReceived < prior.bytesReceived ||
+          sample.packetsReceived < prior.packetsReceived ||
+          sample.freezeDuration < prior.freezeDuration ||
+          (sample.framesDecoded !== undefined && prior.framesDecoded !== undefined &&
+            sample.framesDecoded < prior.framesDecoded)) {
+          setQuality(null);
+          setScore(null);
+          setMetrics(null);
+          previousLevel = null;
+          lastSentAt = -Infinity;
+          return;
         }
-      }
-
-      samplesRef.current = next;
-
-      // First poll of a connection, or nothing actually arriving. No opinion —
-      // the same discipline as useUplinkEstimate, and for the same reason: a
-      // guess here is worse than silence, because 'critical' is wired to an
-      // action.
-      if (!best) return;
-
-      const intervalSeconds = Math.max((best.sample.at - best.prior.at) / 1000, 0.001);
-      const newMetrics: QualityMetrics = {
-        packetsLost: Math.max(0, best.sample.packetsLost - best.prior.packetsLost),
-        packetsReceived: Math.max(0, best.sample.packetsReceived - best.prior.packetsReceived),
-        jitterMs: (best.stats.jitter ?? 0) * 1000,
-        rttMs,
-        fps: best.stats.framesPerSecond ?? 0,
-        freezeSeconds: Math.max(0, best.sample.freezeDuration - best.prior.freezeDuration),
-        intervalSeconds,
-      };
-
-      setMetrics(newMetrics);
-      setInbound(readInbound(best.stats));
-
-      // Undefined falls through to the function's own default, so a peer on an
-      // older build behaves exactly as before.
-      const newScore = calculateQualityScore(newMetrics, expectedFpsRef.current);
-      const newLevel = scoreToLevel(newScore);
-
-      setScore(Math.round(newScore));
-      setQuality(newLevel);
-
-      // Notify the streamer on level change, and on a heartbeat so that a
-      // steady verdict keeps proving it is still being observed.
-      const due = now - lastSentAtRef.current >= FEEDBACK_HEARTBEAT_MS;
-      if (onQualityChange && (newLevel !== prevLevelRef.current || due)) {
-        lastSentAtRef.current = now;
-        const total = newMetrics.packetsReceived + newMetrics.packetsLost;
-        // How big the picture actually is, alongside how well it arrived.
-        //
-        // `level` cannot express this and should not be made to: every term in
-        // calculateQualityScore is about delivery, so a tiny picture arriving
-        // perfectly is a perfect score. Reporting the size as its own fact lets
-        // the sender compare it against the viewport we send in the same
-        // message and draw the one conclusion the score cannot — see
-        // viewerIsStarved. Omitted rather than guessed when the browser has not
-        // published a frame size yet.
-        const picture =
-          typeof best.stats.frameWidth === 'number' && typeof best.stats.frameHeight === 'number'
-            ? { width: best.stats.frameWidth, height: best.stats.frameHeight }
-            : null;
-        const feedback: QualityFeedback = {
-          level: newLevel,
-          score: Math.round(newScore),
-          packetLossPercent: total > 0 ? (newMetrics.packetsLost / total) * 100 : 0,
-          jitterMs: newMetrics.jitterMs,
-          rttMs: newMetrics.rttMs,
-          fps: newMetrics.fps,
-          ...(picture ? { picture } : {}),
+        const intervalSeconds = (sample.at - prior.at) / 1000;
+        const measuredFps = sample.framesDecoded !== undefined && prior.framesDecoded !== undefined
+          ? (sample.framesDecoded - prior.framesDecoded) / intervalSeconds
+          : report.framesPerSecond;
+        // A freeze duration can be published only when playback resumes. Do
+        // not blame a just-ended, intentionally paused source on the network.
+        const resumedFromIdle = prior.expectedFps !== undefined && prior.expectedFps <= 1;
+        const newMetrics: QualityMetrics = {
+          packetsLost: Math.max(0, sample.packetsLost - prior.packetsLost),
+          packetsReceived: sample.packetsReceived - prior.packetsReceived,
+          jitterMs: (report.jitter ?? 0) * 1000,
+          rttMs: selectedRtt(stats, report.transportId),
+          fps: measuredFps ?? 0,
+          ...(measuredFps === undefined ? { fpsMeasured: false } : {}),
+          freezeSeconds: resumedFromIdle ? 0 : Math.max(0, sample.freezeDuration - prior.freezeDuration),
+          intervalSeconds,
         };
-        onQualityChange(feedback);
+        // Missing FPS is unknown, not a zero-frame decoder. Counter-derived
+        // FPS works on browsers that omit the instantaneous framesPerSecond.
+        const newScore = calculateQualityScore(newMetrics, expected);
+        const newLevel = scoreToLevel(newScore);
+        setMetrics(newMetrics);
+        setScore(Math.round(newScore));
+        setQuality(newLevel);
+        if (report.framesPerSecond === undefined && measuredFps !== undefined) {
+          setInbound({ ...readInbound(report), framesPerSecond: measuredFps });
+        }
+
+        const due = now - lastSentAt >= FEEDBACK_HEARTBEAT_MS;
+        if (notify && (newLevel !== previousLevel || due)) {
+          lastSentAt = now;
+          const total = newMetrics.packetsReceived + newMetrics.packetsLost;
+          const picture = typeof report.frameWidth === 'number' && report.frameWidth > 0 &&
+            typeof report.frameHeight === 'number' && report.frameHeight > 0
+            ? { width: report.frameWidth, height: report.frameHeight } : null;
+          notify({
+            level: newLevel,
+            score: Math.round(newScore),
+            packetLossPercent: total > 0 ? (newMetrics.packetsLost / total) * 100 : 0,
+            jitterMs: newMetrics.jitterMs,
+            rttMs: newMetrics.rttMs,
+            fps: newMetrics.fps,
+            ...(picture ? { picture } : {}),
+          });
+        }
+        previousLevel = newLevel;
+      } catch (err) {
+        if (active) logger.error('[QualityMonitor] Error polling stats:', err);
+      } finally {
+        pending = false;
       }
-
-      prevLevelRef.current = newLevel;
-    } catch (err) {
-      logger.error('[QualityMonitor] Error polling stats:', err);
-    }
-  }, [onQualityChange]);
-
-  useEffect(() => {
-    if (isWatching) {
-      pollStats(); // Initial poll — seeds the counters, reports nothing
-      intervalRef.current = setInterval(pollStats, POLL_INTERVAL_MS);
-    } else {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      setQuality(null);
-      setScore(null);
-      setMetrics(null);
-      setInbound(null);
-      prevLevelRef.current = null;
-      lastSentAtRef.current = -Infinity;
-      // Counters belong to one connection. Carrying them into the next call
-      // would difference against a stream that no longer exists.
-      samplesRef.current.clear();
     }
 
+    void pollStats();
+    const interval = setInterval(() => { void pollStats(); }, POLL_INTERVAL_MS);
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
+      active = false;
+      clearInterval(interval);
     };
-  }, [isWatching, pollStats]);
+  }, [isWatching, trackId]);
 
-  return {
-    quality,
-    score,
-    metrics,
-    inbound,
-  };
+  return { quality, score, metrics, inbound };
 }

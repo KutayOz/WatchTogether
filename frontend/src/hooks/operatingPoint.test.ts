@@ -213,36 +213,53 @@ describe('nextBudget', () => {
     expect(state.bps).toBe(1_020_000);
   });
 
-  it('climbs when the link proves it has more, but only as far as it is worth', () => {
-    // 4 Mbps of measured capacity times HEADROOM_SELECT would be 3.4 Mbps, and
-    // that is what this used to become. Raising now stops at PROBE_CEILING_BPP:
-    // 0.05 x 1920 x 1080 x 24 = 2.488 Mbps of video, quantised down, plus the
-    // 96 kbps audio tier and the camera and mic the same uplink is carrying.
-    // The link having more is not by itself a reason to spend more on a picture
-    // that is already past the point of visible return.
+  it('uses measured capacity rather than a VP9-only low bitrate cap', () => {
     const state = nextBudget(
       initialBudgetState(1_000_000, 0),
       sig({ now: 3000, estimateBps: 4_000_000 }),
     );
-    expect(state.bps).toBe(2_475_000 + 96_000 + COMPANION_STREAMS_BPS);
-    expect(state.bps).toBeLessThan(3_400_000);
+    expect(state.bps).toBe(3_400_000);
   });
 
-  it('stops the climb at 1.4x TARGET_BPP rather than 3x', () => {
-    // The failure this guards: `budgetCeilingBps` was built from MAX_USEFUL_BPP
-    // and both upward branches clamped to it, so within about thirty seconds
-    // every share on a link with headroom settled at 0.100 bpp — three times
-    // what TARGET_BPP calls good — and asked a software encoder for a bitrate
-    // that could put it over its cliff. MAX_USEFUL_BPP's own comment says
-    // "Nothing is ever raised TO it"; this is the test that makes that true.
-    let state = initialBudgetState(minBudgetBps(24), 0);
-    for (let i = 1; i <= 40; i++) {
-      state = nextBudget(state, sig({ now: i * PROBE_INTERVAL_MS * 2, health: 'satisfied' }));
+  it('funds 1080p movie scenes on a fast link without escalating to 4K', () => {
+    let state = initialBudgetState(COLD_START_BUDGET_BPS, 0);
+    for (let now = 3000; now <= 120_000; now += 3000) {
+      state = nextBudget(state, sig({
+        now, estimateBps: 30_000_000, health: 'satisfied',
+        viewport: { width: 3840, height: 2160 },
+      }));
     }
-    const point = chooseOperatingPoint(state.bps, 'film');
-    expect(point.bpp).toBeGreaterThan(TARGET_BPP);
+    const point = chooseOperatingPoint(state.bps, 'film', 'auto', { width: 3840, height: 2160 });
+    expect(point).toMatchObject({ width: 1920, height: 1080, fps: 24 });
+    expect(point.videoBps).toBeGreaterThanOrEqual(5_500_000);
+    expect(point.videoBps).toBeLessThanOrEqual(6_500_000);
     expect(point.bpp).toBeLessThanOrEqual(PROBE_CEILING_BPP);
     expect(point.bpp).toBeLessThan(MAX_USEFUL_BPP);
+  });
+
+  it('does not overlap probes before the first trial can be judged', () => {
+    const trial = nextBudget(initialBudgetState(1_000_000, 0), sig({ now: 10_000, health: 'satisfied' }));
+    const pending = nextBudget(trial, sig({ now: 20_000, health: 'satisfied' }));
+    expect(pending).toBe(trial);
+    const confirmed = nextBudget(pending, sig({ now: 22_000, health: 'satisfied' }));
+    expect(confirmed.probing).toBe(false);
+    expect(confirmed.bps).toBe(1_500_000);
+    expect(confirmed.baseBps).toBe(1_500_000);
+  });
+
+  it('does not bank a probe when statistics disappear', () => {
+    const trial = nextBudget(initialBudgetState(1_000_000, 0), sig({ now: 10_000, health: 'satisfied' }));
+    const unknown = nextBudget(trial, sig({ now: 25_000 }));
+    expect(unknown.bps).toBe(1_000_000);
+    expect(unknown.probing).toBe(false);
+  });
+
+  it('can recover from receiver evidence without targetBitrate support', () => {
+    let state = initialBudgetState(2_000_000, 0);
+    for (let now = 3000; now <= 120_000; now += 3000) {
+      state = nextBudget(state, sig({ now, viewerHealthy: true }));
+    }
+    expect(chooseOperatingPoint(state.bps, 'film').videoBps).toBeGreaterThan(5_500_000);
   });
 
   it('holds steady when the browser publishes no estimate', () => {
@@ -395,10 +412,10 @@ describe('resolutionBox', () => {
     expect(resolutionBox('auto', null)).toEqual({ width: 1920, height: 1080 });
   });
 
-  it('lets auto past 1080p once the receiver reports a screen that large', () => {
+  it('keeps auto at 1080p on a Retina or 4K receiver', () => {
     expect(resolutionBox('auto', { width: 3840, height: 2160 })).toEqual({
-      width: 3840,
-      height: 2160,
+      width: 1920,
+      height: 1080,
     });
   });
 
@@ -407,6 +424,12 @@ describe('resolutionBox', () => {
       width: 1280,
       height: 720,
     });
+  });
+
+  it('preserves an explicit 1080p choice when the viewer resizes the window', () => {
+    const point = chooseOperatingPoint(6_000_000, 'film', 'high', { width: 640, height: 360 });
+    expect(point).toMatchObject({ width: 1920, height: 1080 });
+    expect(point.videoBps).toBeGreaterThan(5_000_000);
   });
 
   it('does not narrow an explicit pick just because nothing was reported', () => {
@@ -418,12 +441,12 @@ describe('resolutionBox', () => {
 });
 
 describe('chooseOperatingPoint and the receiver', () => {
-  it('reaches 4K on a fast link once the receiver reports a 4K viewport', () => {
+  it('keeps automatic movie capture at 1080p on a fast 4K receiver', () => {
     const point = chooseOperatingPoint(10_000_000, 'film', 'auto', {
       width: 3840,
       height: 2160,
     });
-    expect(point.width).toBe(3840);
+    expect(point.width).toBe(1920);
     expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
   });
 
@@ -460,7 +483,7 @@ describe('budgetCeilingBps and the receiver', () => {
     expect(small).toBeLessThan(large);
     // Video ceiling, the audio tier, and the rest of the call — a budget number
     // has to cover everything the budget pays for.
-    expect(large).toBe(AUTO_MAX_BITRATE + 96_000 + COMPANION_STREAMS_BPS);
+    expect(large).toBe(budgetCeilingBps('auto', 24, null));
   });
 });
 
@@ -700,8 +723,8 @@ describe('coldStartBudgetBps', () => {
     // Starting low is only safe if low is watchable. 960x540 at target bpp is
     // a picture; the probe ladder does the rest.
     const point = chooseOperatingPoint(coldStartBudgetBps(false), 'motion', 'medium');
-    expect(point.width).toBe(960);
-    expect(point.height).toBe(540);
+    expect(point.width).toBe(1600);
+    expect(point.height).toBe(900);
     expect(point.bpp).toBeGreaterThanOrEqual(TARGET_BPP);
   });
 
