@@ -1158,3 +1158,134 @@ describe('screen quality update lifecycle', () => {
     expect(webrtcService.downgradeScreenCodec()).toBe(false);
   });
 });
+
+
+describe('bounded capture-constraint recovery', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    await freshService();
+  });
+  afterEach(() => {
+    webrtcService.close();
+    vi.useRealTimers();
+  });
+
+  async function beginCapture(
+    size: { width: number; height: number },
+    limits: MediaTrackConstraints,
+    capabilities: MediaTrackCapabilities = {},
+  ) {
+    const stream = screenStream();
+    const track = stream.getVideoTracks()[0];
+    let observed = size;
+    let constraints = limits;
+    Object.assign(track, {
+      getSettings: () => ({ ...observed, frameRate: POINT.fps }),
+      getConstraints: () => constraints,
+      getCapabilities: () => capabilities,
+    });
+    const apply = vi.spyOn(track, 'applyConstraints').mockImplementation(async (next = {}) => {
+      constraints = next;
+      const width = typeof next.width === 'object' ? next.width.ideal : undefined;
+      const height = typeof next.height === 'object' ? next.height.ideal : undefined;
+      observed = { width: typeof width === 'number' ? width : POINT.width,
+        height: typeof height === 'number' ? height : POINT.height };
+    });
+    stubDisplayMedia(stream);
+    const { stream: captured } = await webrtcService.captureScreen(POINT);
+    await webrtcService.addScreenShareTracks(captured, POINT);
+    return { stream, track, apply };
+  }
+
+  const staleLimits: MediaTrackConstraints = {
+    width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 },
+  };
+  const fullLimits: MediaTrackConstraints = {
+    width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 },
+  };
+
+  it('repairs stale low constraints despite a cached 1080p request, then stays quiet', async () => {
+    const { apply } = await beginCapture({ width: 478, height: 268 }, staleLimits);
+    expect(webrtcService.getAppliedScreenPoint()).toEqual(POINT);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply).toHaveBeenLastCalledWith({ ...fullLimits, frameRate: { ideal: POINT.fps, max: POINT.fps } });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fight native adaptation when low pixels already have permissive constraints', async () => {
+    const { apply } = await beginCapture({ width: 478, height: 268 }, fullLimits);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it('respects a naturally small source and a movie aspect ratio', async () => {
+    const small = await beginCapture({ width: 478, height: 268 }, staleLimits, {
+      width: { min: 1, max: 480 }, height: { min: 1, max: 270 },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(small.apply).not.toHaveBeenCalled();
+    await webrtcService.stopScreenShare();
+    const movie = await beginCapture({ width: 1920, height: 1040 }, {
+      width: { max: 1920 }, height: { max: 1040 },
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(movie.apply).not.toHaveBeenCalled();
+  });
+
+  it('bounds rejected repairs per geometry even while bitrate ceilings change', async () => {
+    const { apply } = await beginCapture({ width: 478, height: 268 }, staleLimits);
+    apply.mockRejectedValue(new Error('capture resize unavailable'));
+    await vi.advanceTimersByTimeAsync(30_000);
+    await webrtcService.updateScreenShareQuality({ ...POINT, videoBps: POINT.videoBps + 100_000 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await webrtcService.updateScreenShareQuality({ ...POINT, videoBps: POINT.videoBps + 200_000 });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(webrtcService.getAppliedScreenPoint()?.videoBps).toBe(POINT.videoBps + 200_000);
+  });
+
+  it('retries a failed geometry application even after encoder parameters were accepted', async () => {
+    const { apply } = await beginCapture({ width: 1920, height: 1080 }, fullLimits);
+    const grow = { ...POINT, width: 2560, height: 1440 };
+    apply.mockRejectedValueOnce(new Error('temporary failure'));
+    await webrtcService.updateScreenShareQuality(grow);
+    expect(webrtcService.getAppliedScreenPoint()).toEqual(grow);
+    expect(apply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(apply).toHaveBeenLastCalledWith({
+      width: { ideal: 2560, max: 2560 }, height: { ideal: 1440, max: 1440 },
+      frameRate: { ideal: grow.fps, max: grow.fps },
+    });
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a rejected frame-rate change even when capture is already full size', async () => {
+    const { apply } = await beginCapture({ width: 1920, height: 1080 }, fullLimits);
+    const faster = { ...POINT, fps: 60 };
+    apply.mockRejectedValueOnce(new Error('temporary frame-rate failure'));
+    await webrtcService.updateScreenShareQuality(faster);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(apply).toHaveBeenLastCalledWith({ ...fullLimits, frameRate: { ideal: 60, max: 60 } });
+  });
+
+  it('preserves retry bounds across same-track configuration events and cancels on stop', async () => {
+    const { apply, track } = await beginCapture({ width: 478, height: 268 }, staleLimits);
+    apply.mockRejectedValue(new Error('unavailable'));
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    track.emit('configurationchange');
+    await vi.advanceTimersByTimeAsync(0);
+    const afterSwitch = apply.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(afterSwitch);
+    await webrtcService.stopScreenShare();
+    const afterStop = apply.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(apply).toHaveBeenCalledTimes(afterStop);
+  });
+});
