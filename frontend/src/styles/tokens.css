@@ -1,0 +1,179 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   WatchTogether — design tokens
+
+   The whole interface is one idea: a private screening room for two.
+
+   The room is dark velvet. The light in it comes from two people and the
+   screen between them — amber is you, teal is them, and where the two lights
+   overlap they mix to the warm white of a lit screen (screen-blend amber over
+   teal and you get --light-screen, which is not a coincidence). Every accent
+   in the app is one of those lights, so colour always answers "whose is this":
+   your messages and your actions are amber, theirs are teal, the leave button
+   is the exit sign.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Registered so they can be transitioned: the ambient light sampled from video
+   drifts between colours instead of jumping, and the audio level eases. */
+@property --amb-l {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgb(58 30 42);
+}
+@property --amb-r {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgb(58 30 42);
+}
+@property --amb-c {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: rgb(40 22 32);
+}
+@property --level {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
+}
+@property --sweep {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@property --spill-a {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 35%;
+}
+@property --spill-b {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 65%;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* ── the room ─────────────────────────────────────────────────────────── */
+  --velvet-950: #0c0609;
+  --velvet-900: #150a10;
+  --velvet-850: #1a0d14;
+  --velvet-800: #20111a;
+  --velvet-750: #271520;
+  --velvet-700: #301a27;
+  --velvet-600: #3e2233;
+  --velvet-500: #573148;
+
+  /* The black level of an actual screen, for letterboxing video. */
+  --screen-black: #050204;
+
+  --line: rgb(246 238 230 / 0.09);
+  --line-strong: rgb(246 238 230 / 0.16);
+  --line-hi: rgb(246 238 230 / 0.26);
+
+  /* ── light: text is what the screen throws back ───────────────────────── */
+  --light-screen: #fff3ec;
+  --text-1: #f6eee6;
+  --text-2: #d4c5c9;
+  --text-3: #a8939e;
+  --text-4: #93808b;
+
+  /* ── the two people ───────────────────────────────────────────────────── */
+  --amber: #ffb547;
+  --amber-hi: #ffcd80;
+  --amber-lo: #d98a1e;
+  --amber-ink: #2a1605;
+  --amber-wash: rgb(255 181 71 / 0.13);
+  --amber-rgb: 255 181 71;
+
+  --teal: #5ad4e6;
+  --teal-hi: #93e6f1;
+  --teal-lo: #22a7ba;
+  --teal-ink: #032a30;
+  --teal-wash: rgb(90 212 230 / 0.12);
+  --teal-rgb: 90 212 230;
+
+  /* The exit sign. --exit is for text and icons on the dark room; fills use
+     --exit-fill so white type on them still clears 4.5:1. */
+  --exit: #ff5a6e;
+  --exit-fill: #d12f47;
+  --exit-wash: rgb(255 90 110 / 0.12);
+  --exit-rgb: 255 90 110;
+
+  /* ── type ─────────────────────────────────────────────────────────────── */
+  --font-display: 'Caprasimo', 'Cooper Black', 'Cooper Std', Georgia, serif;
+  --font-text: 'Atkinson Hyperlegible Next', 'Atkinson Hyperlegible', system-ui, -apple-system,
+    'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'Atkinson Hyperlegible Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* A major-third scale off 16px, with the display sizes fluid. */
+  --t-xs: 0.75rem;
+  --t-sm: 0.875rem;
+  --t-md: 1rem;
+  --t-lg: 1.125rem;
+  --t-xl: 1.375rem;
+  --t-2xl: 1.75rem;
+  --t-3xl: clamp(1.9rem, 1.35rem + 2vw, 2.6rem);
+  --t-4xl: clamp(2.4rem, 1.5rem + 3.4vw, 3.8rem);
+  --t-5xl: clamp(2.9rem, 1.4rem + 5.6vw, 5.6rem);
+
+  /* ── space (4px grid) ─────────────────────────────────────────────────── */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 40px;
+  --s-9: 48px;
+  --s-10: 64px;
+  --s-11: 80px;
+
+  /* Radii follow what the thing is, not one value for everything: screens
+     have the soft corners of a display, sheets are big and gentle, controls
+     are capsules, inline chips are tight. */
+  --r-chip: 7px;
+  --r-field: 12px;
+  --r-card: 16px;
+  --r-screen: 20px;
+  --r-sheet: 26px;
+  --r-pill: 999px;
+
+  /* ── depth: light, not grey shadows ───────────────────────────────────── */
+  --edge-hi: inset 0 1px 0 rgb(255 240 230 / 0.06);
+  --drop: 0 30px 80px -32px rgb(0 0 0 / 0.75), 0 8px 24px -12px rgb(0 0 0 / 0.5);
+  --drop-sm: 0 12px 32px -16px rgb(0 0 0 / 0.7);
+  --glow-amber: 0 0 0 1px rgb(255 181 71 / 0.5), 0 12px 44px -10px rgb(255 181 71 / 0.55);
+  --glow-teal: 0 0 0 1px rgb(90 212 230 / 0.45), 0 12px 44px -10px rgb(90 212 230 / 0.5);
+
+  /* ── motion ───────────────────────────────────────────────────────────── */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-1: 140ms;
+  --dur-2: 240ms;
+  --dur-3: 420ms;
+  --dur-4: 700ms;
+
+  /* ── layers ───────────────────────────────────────────────────────────── */
+  --z-raised: 2;
+  --z-dock: 40;
+  --z-drawer: 60;
+  --z-popover: 80;
+  --z-overlay: 100;
+  --z-modal: 200;
+  --z-toast: 300;
+  --z-top: 400;
+}
+
+/* A real spring where the browser can express one: overshoots once, settles.
+   The cubic-bezier above is the fallback everywhere this is unsupported. */
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    --ease-spring: linear(
+      0, 0.0086, 0.0335 2.1%, 0.1294 4.5%, 0.5059 11.2%, 0.6936 15.3%, 0.8293 19.4%,
+      0.9313 23.9%, 0.9989 28.5%, 1.0392 33.2%, 1.0588 38.3%, 1.0606 42.4%, 1.0527 47.3%,
+      1.0128 62.7%, 0.9995 73.9%, 0.9978 100%
+    );
+  }
+}

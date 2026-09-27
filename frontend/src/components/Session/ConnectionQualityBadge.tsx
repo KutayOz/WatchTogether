@@ -9,136 +9,74 @@ interface ConnectionQualityBadgeProps {
 }
 
 /**
- * Wifi-bar style header indicator showing the current call-quality level
- * sourced from useQualityMonitor. Hovering reveals the underlying metrics
- * (RTT, packet loss, jitter, fps) so a power user can see *why* the bar
- * dropped — useful when debugging "why is it choppy" with the peer.
+ * Signal-bar indicator for the call, fed by useQualityMonitor. Hovering shows
+ * the numbers underneath (RTT, loss, jitter, fps) so a power user can see
+ * *why* a bar dropped.
  *
- * The bars-filled count is deliberately discrete (1, 2, 3, 4) rather than
- * continuous: it mirrors how OS-level wifi indicators behave and is much
- * easier to scan at a glance than a percentage. The tooltip carries the
- * precise numbers for the people who actually want them.
+ * The bar count is deliberately discrete (1–4) rather than continuous: it
+ * mirrors how OS-level wifi indicators behave and scans at a glance. The
+ * tooltip carries the precise numbers for the people who want them.
  */
 
-const QUALITY_CONFIG: Record<
-  QualityLevel,
-  { bars: 1 | 2 | 3 | 4; color: string; label: string }
-> = {
-  excellent: { bars: 4, color: 'var(--purple)',      label: 'excellent' },
-  good:      { bars: 3, color: 'var(--pink)',        label: 'good'      },
-  fair:      { bars: 2, color: 'var(--orange)',      label: 'fair'      },
-  poor:      { bars: 1, color: 'var(--orange-deep, var(--orange))', label: 'poor'  },
-  critical:  { bars: 1, color: 'var(--orange-deep, var(--orange))', label: 'critical' },
+const QUALITY_CONFIG: Record<QualityLevel, { bars: 1 | 2 | 3 | 4; colour: string; label: string }> = {
+  excellent: { bars: 4, colour: 'var(--teal)', label: 'excellent' },
+  good: { bars: 3, colour: 'var(--teal)', label: 'good' },
+  fair: { bars: 2, colour: 'var(--amber)', label: 'fair' },
+  poor: { bars: 1, colour: 'var(--exit)', label: 'poor' },
+  critical: { bars: 1, colour: 'var(--exit)', label: 'critical' },
 };
 
 function formatTooltip(metrics: QualityMetrics | null): string {
-  if (!metrics) return 'measuring connection…';
+  if (!metrics) return 'Measuring the connection…';
   const total = metrics.packetsReceived + metrics.packetsLost;
   const lossPct = total > 0 ? (metrics.packetsLost / total) * 100 : 0;
-  // Compact "RTT · loss · jitter" — only include fps if it's actually being
-  // measured (>0). Freezes replace the old frames-dropped line: dropped frames
-  // were a running total that only ever grew, so once it passed the threshold
-  // the badge said "drops" for the rest of the call. Freeze seconds are
-  // per-interval, so this reads as what is happening now.
+  // Freezes replace the old frames-dropped line: dropped frames were a running
+  // total that only ever grew, so once it passed the threshold the badge said
+  // "drops" for the rest of the call. Freeze seconds are per-interval, so this
+  // reads as what is happening now.
   const parts = [
-    `RTT ${Math.round(metrics.rttMs)}ms`,
+    `RTT ${Math.round(metrics.rttMs)} ms`,
     `loss ${lossPct.toFixed(1)}%`,
-    `jitter ${Math.round(metrics.jitterMs)}ms`,
+    `jitter ${Math.round(metrics.jitterMs)} ms`,
   ];
   if (metrics.fps > 0) parts.push(`${Math.round(metrics.fps)} fps`);
-  if (metrics.freezeSeconds > 0.1) parts.push(`${metrics.freezeSeconds.toFixed(1)}s frozen`);
-  return parts.join(' · ');
+  if (metrics.freezeSeconds > 0.1) parts.push(`${metrics.freezeSeconds.toFixed(1)} s frozen`);
+  return parts.join(', ');
 }
 
 export function ConnectionQualityBadge({ quality, metrics }: ConnectionQualityBadgeProps) {
-  // Until the first stats poll completes, show a neutral "measuring" pill
-  // so the badge slot doesn't jump in and out as the call starts.
+  // Until the first stats poll completes, a neutral "measuring" state keeps
+  // the slot from jumping in and out as the call starts.
   if (!quality) {
     return (
-      <span
-        title="measuring connection…"
-        aria-label="measuring connection"
-        className="hand"
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          fontSize: 14,
-          color: 'rgba(26,20,23,0.45)',
-          transform: 'rotate(-1deg)',
-        }}
-      >
-        <QualityBars filled={0} color="rgba(26,20,23,0.4)" />
-        <span>measuring…</span>
+      <span className="qbars" title="Measuring the connection…" aria-label="Measuring connection">
+        <Bars filled={0} />
+        <span>Measuring</span>
       </span>
     );
   }
 
   const cfg = QUALITY_CONFIG[quality];
-  const isCritical = quality === 'critical';
-
   return (
     <span
+      className="qbars"
+      data-level={quality}
+      style={{ color: cfg.colour }}
       title={formatTooltip(metrics)}
-      aria-label={`connection quality: ${cfg.label}. ${formatTooltip(metrics)}`}
-      className="hand"
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 6,
-        fontSize: 14,
-        color: cfg.color,
-        transform: 'rotate(-1deg)',
-        // Subtle pulse on critical — alerts without being aggressive.
-        animation: isCritical ? 'pulse-critical 1.4s ease-in-out infinite' : undefined,
-      }}
+      aria-label={`Connection quality: ${cfg.label}. ${formatTooltip(metrics)}`}
     >
-      <QualityBars filled={cfg.bars} color={cfg.color} />
-      <span>{cfg.label}</span>
-      {/* Keyframes scoped inline so we don't pollute the global stylesheet
-          for a single critical-state animation. */}
-      {isCritical && (
-        <style>{`
-          @keyframes pulse-critical {
-            0%, 100% { opacity: 1; }
-            50%      { opacity: 0.55; }
-          }
-        `}</style>
-      )}
+      <Bars filled={cfg.bars} />
+      <span style={{ textTransform: 'capitalize' }}>{cfg.label}</span>
     </span>
   );
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/* QualityBars — 4 staggered bars, growing left→right. Empty bars  */
-/* render as faint ghosts so the badge keeps its full width even   */
-/* when only one bar is lit (no shifting layout as quality changes).*/
-/* ────────────────────────────────────────────────────────────── */
-
-function QualityBars({ filled, color }: { filled: number; color: string }) {
-  const total = 4;
-  // Heights grow linearly so the silhouette reads as "wifi strength."
-  const heights = [6, 9, 12, 15];
+function Bars({ filled }: { filled: number }) {
   return (
-    <span
-      aria-hidden="true"
-      style={{ display: 'inline-flex', alignItems: 'flex-end', gap: 2, height: 16 }}
-    >
-      {Array.from({ length: total }).map((_, i) => {
-        const isOn = i < filled;
-        return (
-          <span
-            key={i}
-            style={{
-              width: 4,
-              height: heights[i],
-              background: isOn ? color : 'rgba(26,20,23,0.15)',
-              border: '1px solid var(--ink)',
-              transition: 'background 200ms ease',
-            }}
-          />
-        );
-      })}
+    <span className="qbars__bars" aria-hidden="true">
+      {[5, 8, 11, 14].map((h, i) => (
+        <span key={h} style={{ height: h }} data-on={i < filled ? '' : undefined} />
+      ))}
     </span>
   );
 }

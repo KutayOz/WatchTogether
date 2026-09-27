@@ -54,7 +54,17 @@ export default defineConfig({
     {
       name: 'chromium',
       testIgnore: ['**/stream-quality.spec.ts', '**/stream-controller.spec.ts'],
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // A synthetic camera (a moving test pattern) and microphone (a
+        // periodic beep), answered without a permission prompt. It is what
+        // lets session.spec.ts walk the device check and the call screen with
+        // real MediaStreams instead of stubbing getUserMedia away.
+        launchOptions: {
+          args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
+        },
+        permissions: ['camera', 'microphone'],
+      },
     },
     {
       name: 'media',

@@ -1,22 +1,20 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
+import { AnimatePresence, m } from 'motion/react';
 import { api } from '../../services/api';
 import { useAuthContext } from '../../context/AuthContext';
 import { PASSWORD_MIN_LENGTH } from '@shared/password';
-import { PasskeyIcon } from './PasskeyIcon';
 import { UsernameField } from './UsernameField';
 import { PasswordField } from './PasswordField';
 import { isUsernameValid } from '../../utils/username';
 import { isPasswordValid } from '../../utils/password';
-import {
-  Sketchbook,
-  SectionTitle,
-  TagSticker,
-  StickerButton,
-  BurstSticker,
-  BackButton,
-  Doodle,
-} from '../manga';
+import { Theater } from '../ui/Theater';
+import { FocusText } from '../ui/FocusText';
+import { Button } from '../ui/Button';
+import { Segmented } from '../ui/Segmented';
+import { AlertIcon, LockIcon, PasskeyIcon, TicketIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
+import { ease } from '../ui/motion';
 
 /**
  * Account creation from an invite link.
@@ -49,6 +47,7 @@ export function InviteSignup() {
   const [isValidating, setIsValidating] = useState(true);
   const [inviterTag, setInviterTag] = useState<string | null>(null);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
 
   const passwordsMatch = password.length > 0 && password === confirm;
   const canSubmit =
@@ -76,6 +75,10 @@ export function InviteSignup() {
     validateInviteLink();
   }, [validateInviteLink]);
 
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token || !canSubmit) return;
@@ -95,224 +98,174 @@ export function InviteSignup() {
 
   if (isValidating) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <div className="hand" style={{ fontSize: 28, color: 'var(--purple)' }}>
-            checking invitation link…
-          </div>
+      <Theater screen={<p className="theater__kicker">Checking your invite…</p>}>
+        <div className="status-card">
+          <span className="loading-line">
+            <span className="btn__spinner" aria-hidden="true" />
+            Checking the link
+          </span>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   if (invalidMessage) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <Sketchbook style={{ width: '100%', maxWidth: 540 }}>
-            <div style={{ textAlign: 'center' }}>
-              <SectionTitle size={42} underline="orange">
-                LINK EXPIRED
-              </SectionTitle>
-              <div style={{ marginTop: 30, display: 'flex', justifyContent: 'center' }}>
-                <BurstSticker bg="var(--orange)" rot={-3} w={220} h={140}>
-                  AW SHUCKS!
-                </BurstSticker>
-              </div>
-              <p className="hand" style={{ fontSize: 22, marginTop: 20, color: 'rgba(26,20,23,0.7)' }}>
-                {invalidMessage}
-              </p>
-              <p
-                className="hand"
-                style={{ fontSize: 18, marginTop: 8, color: 'rgba(26,20,23,0.55)' }}
-              >
-                links expire after 48h, and each one works exactly once. ask your friend for a
-                fresh one.
-              </p>
-              <div style={{ marginTop: 28, display: 'flex', justifyContent: 'center' }}>
-                <Link to="/login" style={{ textDecoration: 'none' }}>
-                  <BackButton>back to login</BackButton>
-                </Link>
-              </div>
-            </div>
-          </Sketchbook>
+      <Theater screen={<FocusText as="h1" className="theater__kicker" text="No seat on this ticket" />}>
+        <div className="status-card">
+          <span className="status-card__icon" aria-hidden="true">
+            <TicketIcon size={28} />
+          </span>
+          <h2>This invite can’t be used</h2>
+          <p>{invalidMessage}</p>
+          <p className="muted">
+            Invite links expire after 48 hours and work exactly once. Ask your friend for a fresh one.
+          </p>
+          <Link to="/login" className="btn btn--secondary" data-light="">
+            <span>Back to sign in</span>
+          </Link>
         </div>
-      </div>
+      </Theater>
     );
   }
 
+  const createLabel = method === 'password' ? 'Create account' : 'Create account with a passkey';
+
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', placeItems: 'center', padding: '20px 0' }}>
-        <Sketchbook style={{ width: '100%', maxWidth: 720 }}>
-          <div style={{ marginBottom: 12, position: 'relative' }}>
-            <SectionTitle size={52} underline="pink">
-              JOIN THE PARTY
-            </SectionTitle>
-            <div style={{ position: 'absolute', right: 0, top: -4 }}>
-              <TagSticker color="orange" rot={6}>
-                INVITED
-              </TagSticker>
-            </div>
-            {inviterTag && (
-              <div
-                className="hand"
-                style={{ fontSize: 22, color: 'rgba(26,20,23,0.7)', marginTop: 14 }}
-              >
-                <span style={{ color: 'var(--purple)' }}>{inviterTag}</span> wants to hang out with
-                you ↓
-              </div>
-            )}
-          </div>
+    <Theater
+      screen={
+        <>
+          <FocusText
+            as="h1"
+            className="theater__kicker"
+            text={inviterTag ? `${inviterTag} saved you a seat` : 'You have a seat'}
+            delay={0.4}
+          />
+          <m.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1, duration: 0.7 }}>
+            Pick a name and how you’ll sign in.
+          </m.p>
+        </>
+      }
+      foot={
+        <p>
+          Already have an account? <Link to="/login">Sign in</Link>
+        </p>
+      }
+    >
+      <form onSubmit={handleSubmit} className="stack" style={{ ['--gap' as string]: '20px' }}>
+        <UsernameField
+          value={username}
+          onChange={(v) => {
+            setUsername(v);
+            setError(null);
+          }}
+          disabled={isLoading}
+          autoFocus
+        />
 
-          <form onSubmit={handleSubmit} style={{ marginTop: 16, maxWidth: 520 }}>
-            <UsernameField
-              value={username}
-              onChange={(v) => {
-                setUsername(v);
-                setError(null);
-              }}
-              disabled={isLoading}
-              autoFocus
-            />
+        <div className="stack" style={{ ['--gap' as string]: '10px' }}>
+          <span className="field__label" id="method-label">
+            How you’ll sign in
+          </span>
+          <Segmented
+            legend="How you’ll sign in"
+            name="signin-method"
+            value={method}
+            disabled={isLoading}
+            onChange={(next) => {
+              setMethod(next);
+              setError(null);
+            }}
+            options={[
+              { value: 'passkey', label: 'Passkey', icon: <PasskeyIcon size={18} /> },
+              { value: 'password', label: 'Password', icon: <LockIcon size={18} /> },
+            ]}
+          />
+        </div>
 
-            <fieldset style={{ border: 'none', padding: 0, margin: '26px 0 0' }}>
-              <legend className="hand" style={{ fontSize: 22, color: 'var(--purple)' }}>
-                how do you want to sign in?
-              </legend>
-
-              <div className="row" style={{ gap: 20, marginTop: 10, flexWrap: 'wrap' }}>
-                {(['passkey', 'password'] as const).map((option) => (
-                  <label
-                    key={option}
-                    className="hand"
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      fontSize: 20,
-                      cursor: isLoading ? 'default' : 'pointer',
-                      color: method === option ? 'var(--ink)' : 'rgba(26,20,23,0.55)',
-                    }}
-                  >
-                    <input
-                      type="radio"
-                      name="signin-method"
-                      value={option}
-                      checked={method === option}
-                      disabled={isLoading}
-                      onChange={() => {
-                        setMethod(option);
-                        setError(null);
-                      }}
-                    />
-                    {option === 'passkey' ? 'a passkey' : 'a password'}
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            {method === 'passkey' ? (
-              <div
-                className="hand"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  marginTop: 20,
-                  fontSize: 18,
-                  color: 'rgba(26,20,23,0.6)',
+        <AnimatePresence mode="wait" initial={false}>
+          {method === 'passkey' ? (
+            <m.p
+              key="passkey"
+              className="method-note"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.25, ease: ease.out }}
+            >
+              <PasskeyIcon size={18} />
+              <span>Next, your device asks for your face, fingerprint or PIN. That’s the whole password.</span>
+            </m.p>
+          ) : (
+            <m.div
+              key="password"
+              className="stack"
+              style={{ ['--gap' as string]: '16px' }}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.3, ease: ease.out }}
+            >
+              <PasswordField
+                value={password}
+                onChange={(v) => {
+                  setPassword(v);
+                  setError(null);
                 }}
-              >
-                <PasskeyIcon size={18} />
-                next: your device will ask for your face, fingerprint or PIN
-              </div>
-            ) : (
-              <div style={{ marginTop: 12 }}>
-                <PasswordField
-                  value={password}
-                  onChange={(v) => {
-                    setPassword(v);
-                    setError(null);
-                  }}
-                  username={username}
-                  autoComplete="new-password"
-                  disabled={isLoading}
-                  hint={`at least ${PASSWORD_MIN_LENGTH} characters — length beats punctuation`}
-                />
+                username={username}
+                autoComplete="new-password"
+                disabled={isLoading}
+                hint={`At least ${PASSWORD_MIN_LENGTH} characters. Length beats punctuation.`}
+              />
 
-                <PasswordField
-                  label="again:"
-                  value={confirm}
-                  onChange={(v) => {
-                    setConfirm(v);
-                    setError(null);
-                  }}
-                  autoComplete="new-password"
-                  disabled={isLoading}
-                  // The rules are already being graded on the field above;
-                  // repeating them under this one would just be shouting twice.
-                  validate={false}
-                  hint={confirm && !passwordsMatch ? '· those two do not match' : ' '}
-                />
+              <PasswordField
+                label="Repeat password"
+                value={confirm}
+                onChange={(v) => {
+                  setConfirm(v);
+                  setError(null);
+                }}
+                autoComplete="new-password"
+                disabled={isLoading}
+                // The rules are already being graded on the field above;
+                // repeating them under this one would just be shouting twice.
+                validate={false}
+                hint={confirm && !passwordsMatch ? 'Those two don’t match yet.' : ' '}
+              />
 
-                {/* Said plainly, because it is the one thing about this choice
-                    that cannot be undone later by the person making it. */}
-                <div
-                  className="hand"
-                  style={{
-                    marginTop: 16,
-                    padding: '12px 14px',
-                    border: '2px dashed var(--orange)',
-                    fontSize: 17,
-                    color: 'rgba(26,20,23,0.75)',
-                  }}
-                >
-                  there is no password reset here — no email address is ever collected. if you
+              {/* Said plainly, because it is the one thing about this choice
+                  that cannot be undone later by the person making it. */}
+              <div className="notice notice--warn">
+                <AlertIcon size={18} />
+                <span>
+                  <strong>There’s no password reset here.</strong> No email address is ever collected, so if you
                   forget it, an admin has to issue you a new link by hand.
-                </div>
+                </span>
               </div>
-            )}
+            </m.div>
+          )}
+        </AnimatePresence>
 
-            {error && (
-              <div className="shake" style={{ marginTop: 18 }} role="alert">
-                <BurstSticker bg="var(--orange)" rot={-4} w={180} h={120}>
-                  OOPS!
-                </BurstSticker>
-                <div className="hand" style={{ fontSize: 18, marginTop: 6, color: 'var(--ink)' }}>
-                  {error}
-                </div>
-              </div>
-            )}
-
-            <div className="row" style={{ gap: 18, marginTop: 28, flexWrap: 'wrap' }}>
-              <StickerButton
-                type="submit"
-                color="pink"
-                size="xl"
-                sfx="TAP!"
-                sparks
-                disabled={isLoading || !canSubmit}
-              >
-                {isLoading
-                  ? 'CREATING…'
-                  : method === 'password'
-                    ? 'CREATE MY ACCOUNT'
-                    : 'CREATE MY PASSKEY'}
-              </StickerButton>
-              <Link to="/login" style={{ textDecoration: 'none' }}>
-                <BackButton>have an account?</BackButton>
-              </Link>
-            </div>
-          </form>
-
-          <div className="margin-doodles" style={{ position: 'absolute', right: 40, bottom: 60 }}>
-            <span className="bob" style={{ display: 'inline-block' }}>
-              <Doodle kind="heart" size={40} color="var(--pink)" />
-            </span>
+        {error && (
+          <div ref={errorRef} className="notice notice--error" role="alert">
+            <AlertIcon size={18} />
+            <span>{error}</span>
           </div>
-        </Sketchbook>
-      </div>
-    </div>
+        )}
+
+        <Button
+          type="submit"
+          variant="primary"
+          size="lg"
+          block
+          magnetic
+          loading={isLoading}
+          disabled={isLoading || !canSubmit}
+          icon={method === 'passkey' ? <PasskeyIcon size={20} /> : undefined}
+        >
+          {isLoading ? 'Creating…' : createLabel}
+        </Button>
+      </form>
+    </Theater>
   );
 }

@@ -7,7 +7,7 @@ type Service = typeof webrtcService;
 const SESSION = 'sess-quality-controller';
 
 /** Only the authenticated HTTP boundary and signaling room are simulated.
- * The legacy SessionRoom, controller hooks, DataChannel feedback and all native
+ * The real SessionRoom, controller hooks, DataChannel feedback and all native
  * WebRTC media operations run unchanged. Requires the media Playwright project.
  */
 async function prepareSession(page: Page, name: string) {
@@ -134,7 +134,7 @@ async function person(browser: Browser, name: string) {
 
 async function join(page: Page) {
   await page.goto(`/session/${SESSION}`);
-  await page.getByRole('button', { name: /^join!$/i }).click({ timeout: 20_000 });
+  await page.getByRole('button', { name: /^join$/i }).click({ timeout: 20_000 });
   await expect(page.getByRole('button', { name: 'Leave session', exact: true }).first()).toBeVisible({ timeout: 20_000 });
 }
 
@@ -163,7 +163,7 @@ async function measure(sender: Page, receiver: Page) {
     const modulePath = '/src/services/webrtcService.ts';
     const { webrtcService: service } = await import(/* @vite-ignore */ modulePath) as { webrtcService: Service };
     // Match the actual SDP track identity instead of guessing by resolution or
-    // depending on redesign classes absent from the legacy UI.
+    // by the stage's layout classes.
     const video = Array.from(document.querySelectorAll('video')).find((element) =>
       (element.srcObject as MediaStream | null)?.getVideoTracks()[0]?.id === screenTrackId,
     );
@@ -202,15 +202,13 @@ test('the full app sustains requested 1080p30 while its quality controllers and 
     const relay = await relaySignalling([{ page: alice, name: 'alice' }, { page: bob, name: 'bob' }], 'alice');
     await join(alice);
     await join(bob);
-    // Legacy SessionRoom's connection status is an aria-live text span.
-    await expect(alice.getByText('· connected', { exact: true })).toBeVisible({ timeout: 20_000 });
+    await expect(alice.locator('.room-top__state[data-state="connected"]')).toBeVisible({ timeout: 20_000 });
     await observeViewerFeedback(alice);
     await alice.getByRole('button', { name: /^share screen$/i }).click();
-    // The legacy postcard has no role=dialog; its actual ALLOW button is the
-    // interaction contract. Verify the requester copy before approving it.
-    await expect(bob.getByText('alice wants to share their screen.', { exact: true })).toBeVisible();
-    await bob.getByRole('button', { name: /^allow$/i }).click();
-    await expect(bob.getByText('alice IS SHARING', { exact: true })).toBeVisible({ timeout: 15_000 });
+    const request = bob.getByRole('dialog', { name: /alice wants to share their screen/i });
+    await expect(request).toBeVisible();
+    await request.getByRole('button', { name: /^allow$/i }).click();
+    await expect(bob.getByText(/alice is sharing/i)).toBeVisible({ timeout: 15_000 });
     await expect.poll(async () => {
       const sample = await measure(alice, bob);
       return sample.incoming.width === 1920 && sample.incoming.height === 1080 && sample.incoming.framesDecoded > 30;

@@ -1,0 +1,486 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   The theater: the shell every signed-out screen sits in.
+
+   A screen hangs at the top of the room. Its light spills down onto a single
+   sheet — the form — and a projector beam rises from behind you toward it,
+   with dust turning in it. Everything a visitor does happens in that light.
+   ───────────────────────────────────────────────────────────────────────── */
+
+.theater {
+  position: relative;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: clamp(16px, 3.2vh, 40px) 16px clamp(24px, 4vh, 48px);
+  overflow: hidden;
+}
+
+/* The beam: a cone from below the viewport, pointing up at the screen. The
+   angle is mirrored in DustMotes.tsx so the dust is lit only inside it. */
+.beam {
+  position: fixed;
+  left: 50%;
+  bottom: -15vh;
+  width: 260vmax;
+  height: 130vh;
+  translate: -50% 0;
+  pointer-events: none;
+  z-index: 0;
+  background: conic-gradient(
+    from -27deg at 50% 100%,
+    rgb(255 243 236 / 0) 0deg,
+    rgb(255 243 236 / 0.045) 14deg,
+    rgb(255 243 236 / 0.07) 27deg,
+    rgb(255 243 236 / 0.045) 40deg,
+    rgb(255 243 236 / 0) 54deg,
+    transparent 54deg
+  );
+  mask-image: linear-gradient(to top, transparent 0%, #000 35%, #000 70%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to top, transparent 0%, #000 35%, #000 70%, transparent 100%);
+}
+
+.dust {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.theater__screen-wrap {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.theater__screen {
+  --spill-a: 35%;
+  --spill-b: 65%;
+  position: relative;
+  height: clamp(190px, 32vh, 360px);
+  aspect-ratio: 2.39 / 1;
+  max-width: min(100%, 980px);
+  border-radius: var(--r-screen);
+  background: var(--screen-black);
+  box-shadow:
+    0 0 0 1px rgb(255 243 236 / 0.08),
+    0 40px 120px -40px rgb(var(--amber-rgb) / 0.35),
+    0 60px 160px -60px rgb(var(--teal-rgb) / 0.35);
+  isolation: isolate;
+  /* The title card is sized off the screen, not the window — a projected
+     title scales with the screen it is projected on. */
+  container-type: size;
+  transition: --spill-a 160ms linear, --spill-b 160ms linear;
+}
+.theater__screen::after {
+  /* Light thrown from the screen onto the room below it. It follows the two
+     lights across, because the canvas reports where they are. */
+  content: '';
+  position: absolute;
+  left: -12%;
+  right: -12%;
+  top: 92%;
+  height: 90%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(38% 70% at var(--spill-a) 0%, rgb(var(--amber-rgb) / 0.2), transparent 70%),
+    radial-gradient(38% 70% at var(--spill-b) 0%, rgb(var(--teal-rgb) / 0.17), transparent 70%);
+  filter: blur(6px);
+}
+
+.theater__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
+
+/* The title card projected on the screen. `screen` blending adds the type to
+   the light behind it, so it reads as projected, not pasted on. */
+.theater__title {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: clamp(6px, 1.2vh, 14px);
+  padding: 16px 24px;
+  text-align: center;
+  color: var(--light-screen);
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+.theater__title h1 {
+  font-size: clamp(1.9rem, min(11cqw, 30cqh), 5.4rem);
+  line-height: 0.95;
+  letter-spacing: -0.01em;
+  text-shadow: 0 0 40px rgb(255 243 236 / 0.35);
+}
+.theater__title p {
+  font-size: clamp(0.95rem, min(2.6cqw, 8cqh), 1.35rem);
+  font-weight: 500;
+  color: rgb(255 243 236 / 0.82);
+  max-width: 44ch;
+}
+.theater__title .theater__kicker {
+  font-family: var(--font-display);
+  font-size: clamp(1.5rem, min(6.4cqw, 17cqh), 3.1rem);
+  line-height: 1.05;
+  color: var(--light-screen);
+  text-shadow: 0 0 36px rgb(255 243 236 / 0.3);
+  max-width: 18ch;
+}
+
+.theater__seats {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 468px);
+  margin-top: clamp(28px, 5vh, 56px);
+}
+.theater__seats--wide {
+  width: min(100%, 560px);
+}
+
+.theater__sheet {
+  padding: clamp(22px, 3.2vw, 32px);
+  display: grid;
+  gap: 20px;
+}
+
+.theater__foot {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 468px);
+  margin-top: 22px;
+  color: var(--text-3);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  text-align: center;
+}
+.theater__foot p + p {
+  margin-top: 6px;
+}
+
+.theater__back {
+  position: absolute;
+  z-index: 2;
+  top: clamp(14px, 2.6vh, 28px);
+  left: clamp(14px, 2.4vw, 28px);
+}
+
+@media (max-width: 720px) {
+  .theater__screen {
+    height: auto;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+  }
+}
+
+@media (max-height: 640px) and (min-width: 721px) {
+  .theater__screen {
+    height: 170px;
+  }
+}
+
+/* ── pieces that recur on signed-out screens ──────────────────────────── */
+
+.passkey-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.setup-panel {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+  border-radius: var(--r-card);
+  border: 1px dashed rgb(var(--amber-rgb) / 0.45);
+  background: rgb(var(--amber-rgb) / 0.05);
+}
+.setup-panel__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-display);
+  font-size: var(--t-xl);
+  color: var(--amber-hi);
+}
+.setup-panel code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.35);
+  color: var(--text-1);
+  font-size: 0.85em;
+}
+
+.status-card {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  text-align: center;
+  padding: clamp(26px, 4vw, 40px) clamp(20px, 4vw, 36px);
+}
+.status-card__icon {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  color: var(--exit);
+  background: var(--exit-wash);
+  box-shadow: 0 0 0 8px rgb(var(--exit-rgb) / 0.06);
+}
+.status-card__icon[data-tone='ok'] {
+  color: var(--teal);
+  background: var(--teal-wash);
+  box-shadow: 0 0 0 8px rgb(var(--teal-rgb) / 0.06);
+}
+.status-card__icon[data-tone='wait'] {
+  color: var(--amber);
+  background: var(--amber-wash);
+  box-shadow: 0 0 0 8px rgb(var(--amber-rgb) / 0.06);
+}
+.status-card h2 {
+  font-size: var(--t-2xl);
+}
+.status-card p {
+  color: var(--text-2);
+  max-width: 42ch;
+}
+.status-card .muted {
+  font-size: 0.95rem;
+}
+
+.method-note {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  color: var(--text-3);
+  font-size: 0.925rem;
+  line-height: 1.5;
+}
+.method-note > svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--amber);
+}
+
+/* ── unsupported browser ──────────────────────────────────────────────── */
+
+.browser-block {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-top);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgb(12 6 9 / 0.94);
+  backdrop-filter: blur(10px);
+}
+.browser-block__sheet {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  width: min(100%, 520px);
+  padding: clamp(24px, 4vw, 40px);
+  text-align: center;
+}
+.browser-block__title {
+  font-size: var(--t-2xl);
+}
+.browser-block__msg {
+  color: var(--text-2);
+  max-width: 44ch;
+}
+.browser-block__links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* ── the house rules gate ─────────────────────────────────────────────── */
+
+.rules {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background:
+    radial-gradient(80% 60% at 50% 0%, rgb(var(--amber-rgb) / 0.08), transparent 70%),
+    rgb(12 6 9 / 0.6);
+}
+.rules__sheet {
+  width: min(100%, 720px);
+  max-height: min(92dvh, 960px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.rules__head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 26px 28px 18px;
+}
+.rules__badge {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 50px;
+  height: 50px;
+  border-radius: 15px;
+  color: var(--amber);
+  background: var(--amber-wash);
+  box-shadow: inset 0 0 0 1px rgb(var(--amber-rgb) / 0.3);
+}
+.rules__title {
+  font-size: var(--t-3xl);
+}
+.rules__sub {
+  margin-top: 4px;
+  color: var(--text-3);
+}
+.rules__progress {
+  height: 2px;
+  margin: 0 28px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+.rules__progress > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--amber), var(--teal));
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 120ms linear;
+}
+.rules__doc {
+  flex: 1;
+  min-height: 140px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 10px 28px 26px;
+}
+.rules__doc:focus-visible {
+  outline-offset: -3px;
+}
+.rules__text {
+  max-width: 66ch;
+}
+.rules__text h2 {
+  margin: 16px 0 10px;
+  font-size: var(--t-2xl);
+}
+.rules__text h3 {
+  margin: 22px 0 8px;
+  font-family: var(--font-text);
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: var(--amber-hi);
+}
+.rules__text p {
+  margin: 0 0 10px;
+  color: var(--text-2);
+  line-height: 1.65;
+}
+.rules__text .rules__li {
+  position: relative;
+  padding-left: 20px;
+  margin-bottom: 6px;
+}
+.rules__li::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 0.62em;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+.rules__foot {
+  display: grid;
+  gap: 12px;
+  padding: 16px 28px 24px;
+  border-top: 1px solid var(--line);
+  background: rgb(12 6 9 / 0.35);
+}
+.rules__hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 0.925rem;
+  font-weight: 600;
+}
+.rules__hint-arrow {
+  animation: nudge 1.4s var(--ease-in-out) infinite;
+}
+@keyframes nudge {
+  0%,
+  100% {
+    translate: 0 -2px;
+  }
+  50% {
+    translate: 0 3px;
+  }
+}
+.rules__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+@media (max-width: 560px) {
+  .rules {
+    padding: 0;
+    place-items: stretch;
+  }
+  .rules__sheet {
+    max-height: none;
+    min-height: 100dvh;
+    border-radius: 0;
+    border: 0;
+  }
+  .rules__head,
+  .rules__foot {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+  .rules__doc {
+    padding: 10px 20px 22px;
+  }
+  .rules__progress {
+    margin: 0 20px;
+  }
+  .rules__actions > * {
+    flex: 1;
+  }
+}
+
+.loading-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-2);
+  font-weight: 600;
+}

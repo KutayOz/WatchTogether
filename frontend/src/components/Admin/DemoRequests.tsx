@@ -1,12 +1,13 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { api } from '../../services/api';
-import {
-  SectionTitle,
-  StickerButton,
-  BackButton,
-  Doodle,
-} from '../manga';
-import { ModalShell } from './AdminModal';
+import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { TextArea } from '../ui/Field';
+import { ScrambleText } from '../ui/ScrambleText';
+import { AlertIcon, CheckIcon, CopyIcon, InboxIcon, MailIcon, TicketIcon } from '../ui/icons';
+import { sparkle } from '../ui/interactions';
+import { cascade, rise } from '../ui/motion';
 import type { AdminDemoRequest } from '../../types';
 
 const MAX_REJECTION_REASON = 500;
@@ -40,6 +41,7 @@ export function DemoRequests({
   const [copied, setCopied] = useState(false);
   const [rejecting, setRejecting] = useState<AdminDemoRequest | null>(null);
   const [reason, setReason] = useState('');
+  const copyRef = useRef<HTMLButtonElement>(null);
 
   const pending = requests.filter((r) => r.status === 'pending');
   const reviewed = requests.filter((r) => r.status !== 'pending');
@@ -88,113 +90,79 @@ export function DemoRequests({
   };
 
   return (
-    <div>
-      <div className="row" style={{ marginBottom: 16, alignItems: 'baseline', gap: 12 }}>
-        <SectionTitle size={26} underline="pink">
-          DEMO REQUESTS
-        </SectionTitle>
-        <span className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)' }}>
-          {pending.length} waiting
-        </span>
-      </div>
+    <div className="stack" style={{ ['--gap' as string]: '16px' }}>
+      <p className="muted">
+        {pending.length === 0
+          ? 'Nothing waiting.'
+          : `${pending.length} ${pending.length === 1 ? 'person is' : 'people are'} waiting for an answer.`}
+      </p>
 
       {error && (
-        <div
-          className="shake"
-          style={{
-            marginBottom: 12,
-            padding: '10px 14px',
-            border: '3px solid var(--ink)',
-            background: 'var(--orange)',
-            fontWeight: 700,
-          }}
-        >
-          {error}
+        <div className="notice notice--error" role="alert">
+          <AlertIcon size={18} />
+          <span>{error}</span>
         </div>
       )}
 
       {requests.length === 0 && (
-        <div
-          className="hand"
-          style={{
-            padding: '28px 20px',
-            textAlign: 'center',
-            fontSize: 22,
-            color: 'rgba(26,20,23,0.5)',
-            border: '3px dashed rgba(26,20,23,0.25)',
-          }}
-        >
-          <Doodle kind="envelope" size={40} color="rgba(26,20,23,0.35)" />
-          <div style={{ marginTop: 10 }}>nothing in the pile.</div>
+        <div className="empty">
+          <InboxIcon size={30} />
+          <p className="empty__title">No requests</p>
+          <p className="empty__text">When someone asks for a seat from the sign-in page, it shows up here.</p>
         </div>
       )}
 
-      <div style={{ display: 'grid', gap: 14 }}>
-        {pending.map((request) => (
-          <RequestCard
-            key={request.id}
-            request={request}
-            actions={
-              <>
-                <StickerButton
-                  color="purple"
-                  size="md"
-                  sfx="YES!"
-                  disabled={isSubmitting}
-                  onClick={() => handleApprove(request)}
-                >
-                  APPROVE
-                </StickerButton>
-                <BackButton
-                  color="cream"
-                  onClick={() => {
-                    setRejecting(request);
-                    setReason('');
-                  }}
-                >
-                  not now
-                </BackButton>
-              </>
-            }
-          />
-        ))}
-      </div>
+      <m.div className="requests" variants={cascade(0.06)} initial="hidden" animate="shown">
+        <AnimatePresence initial={false}>
+          {pending.map((request) => (
+            <RequestCard
+              key={request.id}
+              request={request}
+              actions={
+                <>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    icon={<TicketIcon size={16} />}
+                    disabled={isSubmitting}
+                    onClick={() => handleApprove(request)}
+                  >
+                    Approve and make link
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setRejecting(request);
+                      setReason('');
+                    }}
+                  >
+                    Not now
+                  </Button>
+                </>
+              }
+            />
+          ))}
+        </AnimatePresence>
+      </m.div>
 
       {reviewed.length > 0 && (
         <>
-          <div
-            className="hand"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-              margin: '26px 0 14px',
-              fontSize: 18,
-              color: 'rgba(26,20,23,0.45)',
-            }}
-          >
-            <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
-            already dealt with
-            <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
-          </div>
-
+          <div className="divider">Already answered</div>
           {/* Kept for a month after the decision, then swept by the nightly
               cron. The audit log keeps the decision itself for good. */}
-          <div style={{ display: 'grid', gap: 14, opacity: 0.72 }}>
+          <div className="requests requests--done">
             {reviewed.map((request) => (
               <RequestCard
                 key={request.id}
                 request={request}
                 actions={
                   request.status === 'approved' ? (
-                    <BackButton
-                      color="cream"
-                      onClick={() => handleApprove(request)}
-                    >
-                      {/* The first link was shown once and is gone; this mints
-                          a fresh one rather than leaving root stuck. */}
-                      new link
-                    </BackButton>
+                    // The first link was shown once and is gone; this mints a
+                    // fresh one rather than leaving root stuck.
+                    <Button variant="secondary" size="sm" onClick={() => handleApprove(request)}>
+                      Make a new link
+                    </Button>
                   ) : null
                 }
               />
@@ -204,93 +172,86 @@ export function DemoRequests({
       )}
 
       {/* The invite, shown exactly once — the server keeps only its hash. */}
-      {invite && (
-        <ModalShell title="INVITE LINK" onClose={closeInvite}>
-          <p className="hand" style={{ fontSize: 20, color: 'rgba(26,20,23,0.75)' }}>
-            send this to <span style={{ color: 'var(--purple)' }}>{invite.name}</span>. it works
-            once and expires in 48h.
-          </p>
-
-          <div
-            style={{
-              marginTop: 14,
-              padding: '10px 12px',
-              border: '3px solid var(--ink)',
-              background: 'var(--cream)',
-              fontFamily: 'monospace',
-              fontSize: 12,
-              wordBreak: 'break-all',
-            }}
-          >
-            {invite.url}
-          </div>
-
-          <p className="hand" style={{ fontSize: 17, marginTop: 10, color: 'var(--orange-deep)' }}>
-            · copy it now — closing this is the last you will see of it.
-          </p>
-
-          <div className="row" style={{ gap: 12, marginTop: 20, flexWrap: 'wrap' }}>
-            <StickerButton
-              color="purple"
-              sfx="KLIK"
+      <Modal
+        isOpen={invite !== null}
+        onClose={closeInvite}
+        title="Invite link"
+        description={invite ? `Send this to ${invite.name}. It works once and expires in 48 hours.` : undefined}
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeInvite}>
+              Done
+            </Button>
+            <Button
+              ref={copyRef}
+              variant="primary"
+              data-autofocus=""
+              icon={copied ? <CheckIcon size={18} /> : <CopyIcon size={18} />}
               onClick={() => {
+                if (!invite) return;
                 navigator.clipboard
                   ?.writeText(invite.url)
-                  .then(() => setCopied(true))
+                  .then(() => {
+                    setCopied(true);
+                    sparkle(copyRef.current);
+                  })
                   // Clipboard access can be refused outright; the link is on
                   // screen and selectable either way, so this is not an error.
                   .catch(() => setCopied(false));
               }}
             >
-              {copied ? 'COPIED!' : 'COPY LINK'}
-            </StickerButton>
-            <BackButton onClick={closeInvite}>done</BackButton>
+              {copied ? 'Copied' : 'Copy link'}
+            </Button>
+          </>
+        }
+      >
+        {invite && (
+          <div className="stack" style={{ ['--gap' as string]: '12px' }}>
+            <div className="invite-ticket">
+              <div className="invite-ticket__label">Invite link</div>
+              <ScrambleText text={invite.url} className="invite-ticket__url" />
+            </div>
+            <div className="notice notice--warn">
+              <AlertIcon size={18} />
+              <span>Copy it now. Closing this is the last you’ll see of it.</span>
+            </div>
           </div>
-        </ModalShell>
-      )}
+        )}
+      </Modal>
 
       {/* Closing a request. The note is for root's own memory — nothing shows
           it to the applicant, who is never told anything by this app. */}
-      {rejecting && (
-        <ModalShell title="CLOSE REQUEST?" onClose={() => setRejecting(null)}>
-          <p className="hand" style={{ fontSize: 20, color: 'rgba(26,20,23,0.75)' }}>
-            {rejecting.displayName} stays out, and this cannot be undone — though they can apply
-            again, and you can always invite them from the lobby.
-          </p>
-
-          <label
-            className="hand"
-            htmlFor="reject-reason"
-            style={{ display: 'block', marginTop: 16, fontSize: 18, color: 'rgba(26,20,23,0.6)' }}
-          >
-            a note for yourself (optional)
-          </label>
-          <textarea
-            id="reject-reason"
-            value={reason}
-            onChange={(e) => setReason(e.target.value.slice(0, MAX_REJECTION_REASON))}
-            rows={3}
-            maxLength={MAX_REJECTION_REASON}
-            style={{
-              width: '100%',
-              marginTop: 6,
-              padding: '8px 10px',
-              border: '3px solid var(--ink)',
-              background: 'var(--cream)',
-              fontFamily: 'var(--font-hand)',
-              fontSize: 18,
-              resize: 'vertical',
-            }}
-          />
-
-          <div className="row" style={{ gap: 12, marginTop: 20, flexWrap: 'wrap' }}>
-            <StickerButton color="orange" sfx="KLIK" onClick={handleReject} disabled={isSubmitting}>
-              {isSubmitting ? 'CLOSING…' : 'CLOSE IT'}
-            </StickerButton>
-            <BackButton onClick={() => setRejecting(null)}>nevermind</BackButton>
-          </div>
-        </ModalShell>
-      )}
+      <Modal
+        isOpen={rejecting !== null}
+        onClose={() => setRejecting(null)}
+        title="Close this request?"
+        description={
+          rejecting
+            ? `${rejecting.displayName} stays out, and this can’t be undone. They can apply again, and you can always invite them from the lobby.`
+            : undefined
+        }
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRejecting(null)}>
+              Keep it open
+            </Button>
+            <Button variant="danger" onClick={handleReject} loading={isSubmitting} disabled={isSubmitting}>
+              {isSubmitting ? 'Closing…' : 'Close request'}
+            </Button>
+          </>
+        }
+      >
+        <TextArea
+          label="A note for yourself"
+          note="(optional)"
+          value={reason}
+          onValueChange={(v) => setReason(v.slice(0, MAX_REJECTION_REASON))}
+          rows={3}
+          maxLength={MAX_REJECTION_REASON}
+          aside={`${reason.length} / ${MAX_REJECTION_REASON}`}
+          data-autofocus=""
+        />
+      </Modal>
     </div>
   );
 }
@@ -310,92 +271,46 @@ function RequestCard({
     });
 
   return (
-    <div
-      style={{
-        border: '3px solid var(--ink)',
-        background: 'var(--cream)',
-        boxShadow: '5px 5px 0 rgba(26,20,23,0.15)',
-        padding: '16px 18px',
-      }}
+    <m.article
+      className="request"
+      variants={rise}
+      layout
+      exit={{ opacity: 0, scale: 0.97, transition: { duration: 0.18 } }}
+      aria-label={`Request from ${request.displayName}`}
     >
-      <div className="row" style={{ alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-        <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 16, letterSpacing: 0.5 }}>
-          {request.displayName}
+      <header className="request__head">
+        <span className="avatar" data-who="neutral" style={{ ['--av' as string]: '36px' }} aria-hidden="true">
+          {request.displayName.charAt(0).toUpperCase()}
         </span>
-        <StatusPill status={request.status} />
-        <span style={{ flex: 1 }} />
-        <span className="hand" style={{ fontSize: 16, color: 'rgba(26,20,23,0.55)' }}>
-          {formatDate(request.submittedAt)}
-        </span>
-      </div>
-
-      <a
-        href={`mailto:${request.email}`}
-        style={{
-          display: 'inline-block',
-          marginTop: 6,
-          fontFamily: 'monospace',
-          fontSize: 13,
-          color: 'var(--purple)',
-          wordBreak: 'break-all',
-        }}
-      >
-        {request.email}
-      </a>
-
-      {request.message && (
-        <p
-          className="hand"
-          style={{
-            marginTop: 12,
-            paddingLeft: 12,
-            borderLeft: '3px solid rgba(123,63,228,0.35)',
-            fontSize: 19,
-            color: 'rgba(26,20,23,0.75)',
-            whiteSpace: 'pre-wrap',
-          }}
-        >
-          {request.message}
-        </p>
-      )}
-
-      {request.rejectionReason && (
-        <p className="hand" style={{ marginTop: 10, fontSize: 17, color: 'var(--orange-deep)' }}>
-          your note: {request.rejectionReason}
-        </p>
-      )}
-
-      {actions && (
-        <div className="row" style={{ gap: 12, marginTop: 14, flexWrap: 'wrap' }}>
-          {actions}
+        <div className="request__who">
+          <span className="request__name">{request.displayName}</span>
+          <a className="request__email" href={`mailto:${request.email}`}>
+            <MailIcon size={14} />
+            {request.email}
+          </a>
         </div>
-      )}
-    </div>
+        <StatusPill status={request.status} />
+        <time className="request__date" dateTime={new Date(request.submittedAt).toISOString()}>
+          {formatDate(request.submittedAt)}
+        </time>
+      </header>
+
+      {request.message && <p className="request__message">{request.message}</p>}
+
+      {request.rejectionReason && <p className="request__note">Your note: {request.rejectionReason}</p>}
+
+      {actions && <div className="request__actions">{actions}</div>}
+    </m.article>
   );
 }
 
 function StatusPill({ status }: { status: AdminDemoRequest['status'] }) {
-  const look =
-    status === 'approved'
-      ? { bg: 'var(--purple)', fg: 'var(--cream)', label: 'APPROVED' }
-      : status === 'rejected'
-        ? { bg: 'var(--orange)', fg: 'var(--ink)', label: 'CLOSED' }
-        : { bg: 'var(--pink)', fg: 'var(--ink)', label: 'WAITING' };
-
+  if (status === 'approved') return <span className="chip chip--teal">Approved</span>;
+  if (status === 'rejected') return <span className="chip chip--exit">Closed</span>;
   return (
-    <span
-      style={{
-        fontFamily: 'var(--font-sfx)',
-        fontSize: 11,
-        letterSpacing: 1,
-        padding: '2px 8px',
-        background: look.bg,
-        color: look.fg,
-        border: '2px solid var(--ink)',
-        borderRadius: 4,
-      }}
-    >
-      {look.label}
+    <span className="chip chip--amber">
+      <span className="chip__dot" data-live="" aria-hidden="true" />
+      Waiting
     </span>
   );
 }

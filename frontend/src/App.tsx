@@ -9,7 +9,7 @@ import {
   hasUserDismissedWarning,
   dismissWarning,
 } from './utils/browserDetection';
-import { ScreentoneDefs } from './components/manga';
+import { MotionRoot } from './components/ui/MotionRoot';
 
 /*
  * Route-level code splitting.
@@ -46,12 +46,11 @@ const TermsModal = lazy(() => import('./components/Auth/TermsModal').then((m) =>
 /**
  * Suspense fallback used while a route chunk is downloading. The visible delay
  * on a warm cache is usually 0 ms; on a cold cache + 4G this is what the user
- * sees for ~200-400 ms. It mirrors the sketchbook aesthetic so a brief flash
- * looks intentional (a loading state in the comic), not broken.
+ * sees for ~200-400 ms: the two lights of the mark breathing toward each other
+ * in the dark, which reads as the room waiting rather than the app stalling.
  *
- * `inset: 0` + grid place-items keeps the dots centered regardless of where
- * the route ends up rendering — Auth pages center themselves, SessionRoom
- * fills the viewport, both look right.
+ * `inset: 0` + grid place-items keeps it centred regardless of where the route
+ * ends up rendering — the theater centres itself, the call fills the viewport.
  */
 function RouteLoader() {
   return (
@@ -63,23 +62,26 @@ function RouteLoader() {
         inset: 0,
         display: 'grid',
         placeItems: 'center',
-        background: 'var(--cream, #fdf6e7)',
+        background: 'var(--velvet-900, #150a10)',
         zIndex: 9999,
       }}
     >
-      <div className="hand" style={{ fontSize: 28, color: 'var(--purple, #6b46c1)', letterSpacing: 2 }}>
-        loading
-        <span style={{ display: 'inline-block', animation: 'routeDot 1.2s infinite', animationDelay: '0s' }}>.</span>
-        <span style={{ display: 'inline-block', animation: 'routeDot 1.2s infinite', animationDelay: '0.2s' }}>.</span>
-        <span style={{ display: 'inline-block', animation: 'routeDot 1.2s infinite', animationDelay: '0.4s' }}>.</span>
-      </div>
-      {/* Inlined so the loader works even before the main stylesheet has fully
-          applied — the route loader is in the critical path. */}
+      <svg width="64" height="38" viewBox="0 0 40 24" aria-hidden="true" style={{ overflow: 'visible' }}>
+        <circle className="route-light route-light--you" cx="13" cy="12" r="9" fill="#ffb547" />
+        <circle className="route-light route-light--them" cx="27" cy="12" r="9" fill="#5ad4e6" />
+      </svg>
+      {/* Inlined so the loader animates even before the main stylesheet has
+          applied — it is the one thing on the critical path of every route. */}
       <style>{`
-        @keyframes routeDot {
-          0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
-          40% { opacity: 1; transform: translateY(-4px); }
+        .route-light { mix-blend-mode: screen; animation: routeBreath 1.6s ease-in-out infinite; }
+        .route-light--them { animation-delay: -0.8s; }
+        @keyframes routeBreath {
+          0%, 100% { opacity: 0.35; transform: translateX(0); }
+          50% { opacity: 1; transform: translateX(var(--shift, 0)); }
         }
+        .route-light--you { --shift: 3px; }
+        .route-light--them { --shift: -3px; }
+        @media (prefers-reduced-motion: reduce) { .route-light { animation: none; opacity: 0.8; } }
       `}</style>
     </div>
   );
@@ -251,29 +253,29 @@ function App() {
   };
 
   return (
-    <BrowserRouter>
-      {/* Screentone SVG <defs> — referenced by fill="url(#tone-…)" across the app */}
-      <ScreentoneDefs />
-      {browserWarning && (
-        <BrowserWarning
-          type={browserWarning.type}
-          message={browserWarning.message}
-          onDismiss={browserWarning.type === 'dismissible' ? handleDismissWarning : undefined}
-        />
-      )}
-      <AuthProvider>
-        <SessionProvider>
-          {/* Suspense wraps the whole route tree because *every* route is
-              lazy now. The fallback only shows while a chunk is in flight —
-              warm cache = invisible, cold = manga-styled loader. */}
-          <Suspense fallback={<RouteLoader />}>
-            <TermsGate>
-              <AppRoutes />
-            </TermsGate>
-          </Suspense>
-        </SessionProvider>
-      </AuthProvider>
-    </BrowserRouter>
+    <MotionRoot>
+      <BrowserRouter>
+        {browserWarning && (
+          <BrowserWarning
+            type={browserWarning.type}
+            message={browserWarning.message}
+            onDismiss={browserWarning.type === 'dismissible' ? handleDismissWarning : undefined}
+          />
+        )}
+        <AuthProvider>
+          <SessionProvider>
+            {/* Suspense wraps the whole route tree because *every* route is
+                lazy now. The fallback only shows while a chunk is in flight —
+                warm cache = invisible, cold = the breathing lights above. */}
+            <Suspense fallback={<RouteLoader />}>
+              <TermsGate>
+                <AppRoutes />
+              </TermsGate>
+            </Suspense>
+          </SessionProvider>
+        </AuthProvider>
+      </BrowserRouter>
+    </MotionRoot>
   );
 }
 
