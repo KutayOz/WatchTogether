@@ -117,7 +117,8 @@ curl http://localhost:8787/api/health
 ```
 frontend/                     React SPA; dist/ is served by the Worker
 └─ src/
-   ├─ components/             Auth, Lobby, Session, Chat, Admin, Settings, manga/ (the design system)
+   ├─ components/             Auth, Lobby, Session, Chat, Admin, Settings, ui/ (the design system)
+   ├─ styles/                 Tokens, base, shared components — see frontend/DESIGN.md
    ├─ services/
    │  ├─ api.ts               REST client, cookie auth
    │  ├─ transportService.ts  Facade: routes each message to WS or DataChannel
@@ -242,12 +243,21 @@ re-registers.
 
 ```bash
 cd worker    && npm test    # 281 — Durable Objects, D1, WebAuthn, PBKDF2, in workerd
-cd frontend  && npm test    # 202 — services, hooks, storage, the shipped CSP
-cd frontend  && npm run e2e # 34  — Playwright, /api/* stubbed at the boundary
+cd frontend  && npm test    # 445 — services, hooks, storage, the shipped CSP
+cd frontend  && npm run e2e # 120 — Playwright, /api/* stubbed at the boundary
 ```
 
 All three run on every pull request and again before every deploy
 (`.github/workflows/`). `npm run e2e:ui` opens Playwright's interactive runner.
+
+The e2e suite runs Chromium with a fake camera and microphone, so the device
+check and the call screen run on real MediaStreams. `session.spec.ts` plays
+the signalling room itself over an intercepted WebSocket; `call.spec.ts` goes
+further and relays signalling between two browser contexts, so two pages hold
+a real peer-to-peer call — media, DataChannel, screen share — with no Worker
+running. `responsive.spec.ts` checks every screen at phone, tablet and desk
+widths and leaves screenshots in `test-results/` for review; `motion.spec.ts`
+checks that the animations run, and that they stop under reduced motion.
 
 The worker suite runs against the real runtime rather than doubles, which is
 what makes it worth trusting: a Durable Object alarm really fires, D1 really

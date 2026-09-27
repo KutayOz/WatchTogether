@@ -1,4 +1,5 @@
-import { useState, type ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
+import { m } from 'motion/react';
 import {
   type ScreenShareQuality,
   type UplinkEstimate,
@@ -14,6 +15,38 @@ import {
 import type { OperatingPoint } from '../../hooks/operatingPoint';
 import { jitterBufferMs, type InboundScreenStats } from '../../hooks/useQualityMonitor';
 import { SOURCE_IDLE_FPS_RATIO } from '../../hooks/useSenderHealth';
+import { canCaptureScreen } from '../../utils/capabilities';
+import { Button, IconButton } from '../ui/Button';
+import { Popover } from '../ui/Popover';
+import { useDismiss } from '../ui/useDismiss';
+import {
+  CamIcon,
+  CamOffIcon,
+  ChatIcon,
+  ClipboardIcon,
+  LeaveIcon,
+  MicIcon,
+  MicOffIcon,
+  MoreIcon,
+  PersonIcon,
+  QualityIcon,
+  ScreenIcon,
+  ScreenStopIcon,
+  SmileIcon,
+  VolumeIcon,
+} from '../ui/icons';
+
+/** An extra entry for the "more" menu — watch together, blur, shortcuts. */
+export interface DockMenuItem {
+  id: string;
+  label: string;
+  hint?: string;
+  icon: ReactNode;
+  onSelect: () => void;
+  /** For toggles: rendered as aria-pressed with an on/off state. */
+  pressed?: boolean;
+  disabled?: boolean;
+}
 
 export interface MediaControlsProps {
   isMuted: boolean;
@@ -65,12 +98,17 @@ export interface MediaControlsProps {
   /**
    * Build and show the debug report.
    *
-   * Rendered OUTSIDE the quality menu on purpose. That menu is gated on
-   * `isSharer || !isScreenSharing`, so the one person who cannot reach it is
-   * the one watching someone else's share — which is exactly the person who
-   * sees the picture freeze and has something to report.
+   * Offered from the "more" menu rather than the quality panel on purpose:
+   * the person who most needs it is the one watching someone else's share,
+   * which is exactly the person with least reason to open quality settings.
    */
   onDebugReport?: () => void;
+  /** Extra "more" menu entries supplied by the room. */
+  menuItems?: DockMenuItem[];
+  /** Send a reaction. Omitted when there is nobody to react to. */
+  onReact?: (emoji: string) => void;
+  /** The chat / side panel toggle, with its unread count. */
+  chat?: { open: boolean; unread: number; onToggle: () => void };
 }
 
 /**
@@ -101,6 +139,20 @@ export type MediaControlsQualityProps = Pick<
   | 'onPeerVolumeChange'
 >;
 
+type Panel = 'quality' | 'voice' | 'more' | 'react';
+
+const REACTION_EMOJI = ['🩷', '😂', '🔥', '👏', '👍', '🤯'];
+
+/**
+ * The dock: every control for the call in one floating bar.
+ *
+ * The primary controls (mic, camera, share, leave) are always in the bar.
+ * Quality and volume get their own buttons where there is room and move into
+ * the "more" menu on a narrow screen, so a phone keeps a bar that fits a thumb
+ * instead of one that scrolls. Every panel opens from the same spot above the
+ * bar and closes on Escape or a tap outside — never on the pointer merely
+ * drifting off it, which on a touch screen could never be done on purpose.
+ */
 export function MediaControls({
   isMuted,
   isCameraOn,
@@ -133,721 +185,458 @@ export function MediaControls({
   onDebugReport,
   contentMode = 'film',
   onContentModeChange,
+  menuItems = [],
+  onReact,
+  chat,
 }: MediaControlsProps) {
-  const [showQualityMenu, setShowQualityMenu] = useState(false);
-  const [showVoiceMenu, setShowVoiceMenu] = useState(false);
+  const [panel, setPanel] = useState<Panel | null>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
+  useDismiss(dockRef, () => setPanel(null), panel !== null);
 
+  const toggle = (p: Panel) => setPanel((cur) => (cur === p ? null : p));
   const hasVoiceControls = hasPeer || (hasScreenAudio && !isSharer);
+  // Kept exactly as it was: whoever is sharing, or anyone while nobody is.
+  const showQuality = isSharer || !isScreenSharing;
+  // Screen capture does not exist on phones; a button that can only throw
+  // is worse than no button.
+  const canCapture = canCaptureScreen();
+
+  const moreItems: DockMenuItem[] = [
+    ...menuItems,
+    ...(onDebugReport
+      ? [
+          {
+            id: 'debug',
+            label: 'Debug report',
+            hint: 'Copy what the call is doing, for a bug report',
+            icon: <ClipboardIcon size={18} />,
+            onSelect: onDebugReport,
+          },
+        ]
+      : []),
+  ];
 
   return (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        gap: 12,
-        padding: '14px 22px',
-        background: 'var(--cream)',
-        border: '3.5px solid var(--ink)',
-        borderRadius: 100,
-        boxShadow: '6px 6px 0 var(--ink)',
-        transform: 'rotate(-0.6deg)',
-        width: 'fit-content',
-        margin: '0 auto',
-        maxWidth: '100%',
-        flexWrap: 'wrap',
-      }}
-    >
-      {/* Microphone */}
-      <ControlBtn
-        active={isMuted}
-        activeColor="orange"
-        onClick={onToggleMute}
-        title={isMuted ? 'unmute' : 'mute'}
-      >
-        {isMuted ? <MicOffIcon /> : <MicIcon />}
-      </ControlBtn>
-
-      {/* Camera */}
-      <ControlBtn
-        active={!isCameraOn}
-        activeColor="orange"
-        onClick={onToggleCamera}
-        title={isCameraOn ? 'camera off' : 'camera on'}
-      >
-        {isCameraOn ? <VideoIcon /> : <VideoOffIcon />}
-      </ControlBtn>
-
-      {/* Voice settings popover */}
-      <div style={{ position: 'relative' }}>
-        <ControlBtn
-          active={showVoiceMenu}
-          activeColor="purple"
-          onClick={() => setShowVoiceMenu((v) => !v)}
-          title="voice settings"
-          disabled={!hasVoiceControls}
+    <div className="dock" ref={dockRef} role="toolbar" aria-label="Call controls">
+      <div className="dock__group">
+        <IconButton
+          className="dock-btn"
+          label={isMuted ? 'Unmute' : 'Mute'}
+          data-state={isMuted ? 'off' : undefined}
+          onClick={onToggleMute}
         >
-          <VoiceIcon />
-        </ControlBtn>
-        {showVoiceMenu && hasVoiceControls && (
-          <PopMenu onClose={() => setShowVoiceMenu(false)} title="VOICE">
-            {!isSharer && hasScreenAudio && onScreenAudioVolumeChange && (
-              <VolumeSlider
-                label="stream audio"
-                value={screenAudioVolume}
-                onChange={onScreenAudioVolumeChange}
-              />
-            )}
-            {hasPeer && onPeerVolumeChange && (
-              <VolumeSlider
-                label={`${peerDisplayName ?? 'peer'}'s voice`}
-                value={peerVolume}
-                onChange={onPeerVolumeChange}
-              />
-            )}
-            {!hasVoiceControls && (
-              <div className="hand" style={{ fontSize: 16, color: 'rgba(26,20,23,0.5)' }}>
-                no audio to control
-              </div>
-            )}
-          </PopMenu>
+          <SwapIcon on={!isMuted} onIcon={<MicIcon size={21} />} offIcon={<MicOffIcon size={21} />} />
+        </IconButton>
+        <IconButton
+          className="dock-btn"
+          label={isCameraOn ? 'Turn camera off' : 'Turn camera on'}
+          data-state={isCameraOn ? undefined : 'off'}
+          onClick={onToggleCamera}
+        >
+          <SwapIcon on={isCameraOn} onIcon={<CamIcon size={21} />} offIcon={<CamOffIcon size={21} />} />
+        </IconButton>
+        {(canCapture || isScreenSharing) && (
+          <IconButton
+            className="dock-btn"
+            label={isScreenSharing ? 'Stop sharing' : canShare ? 'Share screen' : 'Someone is sharing'}
+            data-state={isScreenSharing ? 'on' : undefined}
+            onClick={onToggleScreenShare}
+            disabled={!canShare}
+          >
+            {isScreenSharing ? <ScreenStopIcon size={21} /> : <ScreenIcon size={21} />}
+          </IconButton>
         )}
       </div>
 
-      {/* Screen share — hidden on tiny screens via media check below */}
-      <div className="screen-share-group" style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 6 }}>
-        <ControlBtn
-          active={isScreenSharing}
-          activeColor="purple"
-          onClick={onToggleScreenShare}
-          title={isScreenSharing ? 'stop sharing' : canShare ? 'share screen' : 'someone is sharing'}
-          disabled={!canShare}
-        >
-          <ScreenIcon />
-        </ControlBtn>
-
-        {(isSharer || !isScreenSharing) ? (
-          <>
-            <ControlBtn
-              active={showQualityMenu}
-              activeColor="purple"
-              onClick={() => setShowQualityMenu((v) => !v)}
-              title={isScreenSharing ? 'change quality' : 'select quality'}
-              size="sm"
+      <div className="dock__group">
+        <span className="dock__secondary">
+          {showQuality && (
+            <IconButton
+              className="dock-btn"
+              label={isScreenSharing ? 'Change quality' : 'Stream quality'}
+              aria-expanded={panel === 'quality'}
+              aria-haspopup="dialog"
+              onClick={() => toggle('quality')}
             >
-              <QualityIcon />
-            </ControlBtn>
+              <QualityIcon size={20} />
+            </IconButton>
+          )}
+          <IconButton
+            className="dock-btn"
+            label="Volume"
+            aria-expanded={panel === 'voice'}
+            aria-haspopup="dialog"
+            onClick={() => toggle('voice')}
+            disabled={!hasVoiceControls}
+          >
+            <VolumeIcon size={20} />
+          </IconButton>
+        </span>
 
-            {showQualityMenu && onQualityChange && (
-              <PopMenu onClose={() => setShowQualityMenu(false)} title={isScreenSharing ? 'CHANGE QUALITY' : 'STREAM QUALITY'}>
-                {(uplink || diagnostics?.path || diagnostics?.outbound || inbound || peerShare) && (
-                  <div
-                    className="hand"
-                    style={{
-                      fontSize: 16,
-                      color: 'rgba(26,20,23,0.6)',
-                      marginBottom: 8,
-                      paddingBottom: 8,
-                      borderBottom: '2px dashed rgba(26,20,23,0.3)',
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    {/* "≥" and not "=" when the number is a measured lower
-                        bound rather than a capacity estimate — on a TCP relay
-                        `availableOutgoingBitrate` describes TCP, not the path.
-                        Showing 0.0 Mbps there, as this line used to, is how a
-                        200 Mbps link got reported as having no bandwidth. */}
-                    {uplink && (
-                      <div>
-                        ↑ uplink: {uplink.capacityKnown ? '' : '≥ '}
-                        {uplink.uplinkMbps} Mbps
-                        {!uplink.capacityKnown && (
-                          <span style={{ opacity: 0.7 }}> · no capacity estimate on this path</span>
-                        )}
-                      </div>
-                    )}
-                    {diagnostics?.path && (
-                      <div
-                        style={{
-                          color: diagnostics.path.isRelayed
-                            ? 'var(--orange-deep)'
-                            : 'rgba(26,20,23,0.6)',
-                        }}
-                      >
-                        path: {formatTransportPath(diagnostics.path)}
-                        {diagnostics.path.rttMs !== null && ` · ${diagnostics.path.rttMs} ms`}
-                      </div>
-                    )}
-                    {/* Per-field guards, not one gate on frameWidth: a report
-                        missing the geometry still carries a bitrate worth
-                        seeing, and an all-or-nothing gate made a partial
-                        reading indistinguishable from no connection at all. */}
-                    {diagnostics?.outbound && (
-                      <div>
-                        sending:{' '}
-                        {diagnostics.outbound.frameWidth != null
-                          ? `${diagnostics.outbound.frameWidth}×${diagnostics.outbound.frameHeight}`
-                          : '—'}
-                        {diagnostics.outbound.framesPerSecond != null &&
-                          ` @ ${Math.round(diagnostics.outbound.framesPerSecond)}`}
-                        {diagnostics.outbound.targetBitrate != null &&
-                          ` · ${(diagnostics.outbound.targetBitrate / 1_000_000).toFixed(2)} Mbps`}
-                        {diagnostics.bpp != null && ` · ${diagnostics.bpp.toFixed(3)} bpp`}
-                        {/* Software or hardware, in one string. 'libvpx-vp9' on
-                            a machine with no hardware VP9 encoder is the whole
-                            explanation for a share that stops and starts. */}
-                        {diagnostics.outbound.encoderImplementation && (
-                          <span style={{ opacity: 0.7 }}>
-                            {' '}
-                            · {diagnostics.outbound.encoderImplementation}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    {/* What we asked for, beside what came back. The reported
-                        session showed `344×182 @ 1 · 0.479 bpp` — a bpp figure
-                        13× above target, because a collapsed frame rate
-                        INFLATES bits-per-pixel. Only the gap against the ask
-                        makes that readable as a failure. */}
-                    {appliedPoint && (
-                      <div>
-                        asked: {appliedPoint.width}×{appliedPoint.height} @ {appliedPoint.fps}
-                        {` · ${(appliedPoint.videoBps / 1_000_000).toFixed(2)} Mbps`}
-                        {atBudgetFloor && (
-                          <span style={{ color: 'var(--orange-deep)' }}> · at floor</span>
-                        )}
-                      </div>
-                    )}
-                    {/* Only worth surfacing when it is actually limiting something. */}
-                    {diagnostics?.outbound?.qualityLimitationReason &&
-                      diagnostics.outbound.qualityLimitationReason !== 'none' && (
-                        <div style={{ color: 'var(--orange-deep)' }}>
-                          limited by: {diagnostics.outbound.qualityLimitationReason}
-                        </div>
-                      )}
+        {isFullscreen && hasPeerCamera && onTogglePeerCamera && (
+          <IconButton
+            className="dock-btn"
+            label={showPeerCamera ? 'Hide their camera' : 'Show their camera'}
+            aria-pressed={!showPeerCamera}
+            onClick={onTogglePeerCamera}
+          >
+            <PersonIcon size={20} />
+          </IconButton>
+        )}
 
-                    {/* The viewer's half. Everything above describes the local
-                        encoder, which is exactly the wrong end when the person
-                        reporting the fault is the one watching. */}
-                    {inbound && (
-                      <div>
-                        receiving:{' '}
-                        {inbound.frameWidth != null
-                          ? `${inbound.frameWidth}×${inbound.frameHeight}`
-                          : '—'}
-                        {inbound.framesPerSecond != null &&
-                          ` @ ${Math.round(inbound.framesPerSecond)}`}
-                        {inbound.decoderImplementation && (
-                          <span style={{ opacity: 0.7 }}> · {inbound.decoderImplementation}</span>
-                        )}
-                      </div>
-                    )}
-                    {/* Freezing is the symptom nothing else in this panel can
-                        show, and it is the one the last bug report was about. */}
-                    {inbound?.freezeCount != null && (
-                      <div
-                        style={{
-                          color: inbound.freezeCount > 0 ? 'var(--orange-deep)' : undefined,
-                        }}
-                      >
-                        freezes: {inbound.freezeCount}
-                        {inbound.totalFreezesDuration != null &&
-                          ` (${inbound.totalFreezesDuration.toFixed(1)} s)`}
-                        {jitterBufferMs(inbound) != null &&
-                          ` · buffer ${Math.round(jitterBufferMs(inbound)!)} ms`}
-                        {inbound.framesDropped != null && ` · dropped ${inbound.framesDropped}`}
-                      </div>
-                    )}
-                    {/* Recovery traffic. A PLI is a keyframe we had to ask for,
-                        which is what a freeze ends with — so these two counters
-                        separate "the picture stalled" from "the link is lossy". */}
-                    {(inbound?.pliCount != null || inbound?.nackCount != null) && (
-                      <div style={{ opacity: 0.8 }}>
-                        recovery: {inbound.pliCount ?? '—'} PLI · {inbound.nackCount ?? '—'} NACK
-                      </div>
-                    )}
-                    {/* And what the far end says it is doing, so the two halves
-                        of the diagnosis finally sit on one screen. */}
-                    {peerShare && (
-                      <div>
-                        their encoder: {peerShare.encoder ?? 'unknown'}
-                        {peerShare.limitedBy && peerShare.limitedBy !== 'none' && (
-                          <span style={{ color: 'var(--orange-deep)' }}>
-                            {' '}
-                            · limited by {peerShare.limitedBy}
-                          </span>
-                        )}
-                        <br />
-                        their ask: {peerShare.width}×{peerShare.height} @ {peerShare.fps}
-                        {` · ${(peerShare.bps / 1_000_000).toFixed(2)} Mbps`}
-                        {/* Beside the ask, because the gap between the two is
-                            the answer whenever this side is freezing: frames
-                            that were never made cannot have been lost. */}
-                        {peerShare.sentFps !== undefined && (
-                          <>
-                            <br />
-                            they send: {Math.round(peerShare.sentFps)} fps
-                            {peerShare.sentFps < peerShare.fps * SOURCE_IDLE_FPS_RATIO && (
-                              <span style={{ opacity: 0.7 }}> · their screen is still</span>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-                {isScreenSharing && (
-                  <div className="hand" style={{ fontSize: 15, color: 'rgba(26,20,23,0.55)', marginBottom: 6 }}>
-                    adjusts live — no interruption
-                  </div>
-                )}
+        {onReact && (
+          <IconButton
+            className="dock-btn"
+            label="React"
+            aria-expanded={panel === 'react'}
+            aria-haspopup="dialog"
+            onClick={() => toggle('react')}
+          >
+            <SmileIcon size={21} />
+          </IconButton>
+        )}
 
-                {/* Content mode. Frame rate is the cheapest sharpness lever
-                    there is: film is 24 fps at source, so encoding it at 30
-                    divides the budget over 25% more frames for nothing. */}
-                {onContentModeChange && (
-                  <div style={{ marginBottom: 10 }}>
-                    <div
-                      className="hand"
-                      style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)', marginBottom: 4 }}
-                    >
-                      what are you sharing?
-                    </div>
-                    <div style={{ display: 'flex', gap: 4 }}>
-                      {(Object.keys(CONTENT_MODES) as ContentMode[]).map((mode) => {
-                        const isActive = contentMode === mode;
-                        return (
-                          <button
-                            key={mode}
-                            type="button"
-                            title={CONTENT_MODES[mode].description}
-                            onClick={() => onContentModeChange(mode)}
-                            style={{
-                              flex: 1,
-                              padding: '5px 4px',
-                              background: isActive ? 'var(--purple)' : 'transparent',
-                              color: isActive ? 'var(--paper)' : 'var(--ink)',
-                              border: '2.5px solid var(--ink)',
-                              borderRadius: 8,
-                              cursor: 'pointer',
-                              fontFamily: 'var(--font-sfx)',
-                              fontSize: 14,
-                              letterSpacing: 0.5,
-                            }}
-                          >
-                            {CONTENT_MODES[mode].label}
-                            <div className="hand" style={{ fontSize: 12, opacity: 0.75 }}>
-                              {CONTENT_MODES[mode].fps} fps
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-                {(Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]).map((key) => {
-                  const preset = QUALITY_PRESETS[key];
-                  const isSelected = screenShareQuality === key;
-                  const isRecommended = uplink?.recommendedQuality === key;
-                  // Advisory only. Never `disabled`: a preset is a ceiling, and
-                  // a ceiling above your link costs nothing — chooseOperatingPoint
-                  // still sits on the budget. Locking these was what left a
-                  // collapsed session with no way out, and on a fast link it is
-                  // what kept everything above `auto` permanently out of reach,
-                  // since `auto` bounds the very estimate the lock consults.
-                  const aboveLink = !!uplink && uplink.withinEstimate[key] === false;
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        onQualityChange(key);
-                        setShowQualityMenu(false);
-                      }}
-                      style={{
-                        width: '100%',
-                        textAlign: 'left',
-                        padding: '8px 10px',
-                        marginBottom: 2,
-                        background: isSelected ? 'var(--pink)' : 'transparent',
-                        color: 'var(--ink)',
-                        border: isSelected ? '2.5px solid var(--ink)' : '2.5px solid transparent',
-                        borderRadius: 8,
-                        cursor: 'pointer',
-                        opacity: 1,
-                        fontFamily: 'var(--font-body)',
-                        fontWeight: 600,
-                        transition: 'background .15s, border .15s',
-                      }}
-                      onMouseEnter={(e) => {
-                        if (!isSelected) e.currentTarget.style.background = 'rgba(255,79,163,0.15)';
-                      }}
-                      onMouseLeave={(e) => {
-                        if (!isSelected) e.currentTarget.style.background = 'transparent';
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        {isRecommended && (
-                          <span style={{ color: 'var(--purple)', fontFamily: 'var(--font-sfx)' }}>★</span>
-                        )}
-                        <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 16, letterSpacing: 1 }}>{preset.label}</span>
-                        {isRecommended && (
-                          <span className="hand" style={{ marginLeft: 'auto', fontSize: 13, color: 'var(--purple)' }}>
-                            recommended
-                          </span>
-                        )}
-                        {aboveLink && !isRecommended && (
-                          <span className="hand" style={{ marginLeft: 'auto', fontSize: 13, color: 'rgba(26,20,23,0.5)' }}>
-                            above your link
-                          </span>
-                        )}
-                      </div>
-                      <div className="hand" style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)', marginTop: 2 }}>
-                        {preset.description}
-                      </div>
-                    </button>
-                  );
-                })}
-              </PopMenu>
+        {chat && (
+          <IconButton
+            className="dock-btn"
+            label={chat.open ? 'Hide chat' : 'Show chat'}
+            onClick={chat.onToggle}
+          >
+            <ChatIcon size={20} />
+            {!chat.open && chat.unread > 0 && (
+              <span className="dock-btn__badge" aria-label={`${chat.unread} unread message${chat.unread === 1 ? '' : 's'}`}>
+                {chat.unread > 9 ? '9+' : chat.unread}
+              </span>
             )}
-          </>
-        ) : (
-          <div
-            className="hand"
-            style={{
-              padding: '6px 12px',
-              border: '2.5px solid var(--ink)',
-              borderRadius: 999,
-              background: 'var(--cream)',
-              fontSize: 14,
-              color: 'var(--ink)',
-            }}
-          >
-            {QUALITY_PRESETS[screenShareQuality]?.label ?? screenShareQuality}
-          </div>
+          </IconButton>
         )}
 
-        {onDebugReport && (
-          <ControlBtn
-            onClick={onDebugReport}
-            title="debug report (D) — copy what is happening"
-            size="sm"
-          >
-            <BugIcon />
-          </ControlBtn>
-        )}
-      </div>
-
-      {/* Peer camera toggle — fullscreen only */}
-      {isFullscreen && hasPeerCamera && onTogglePeerCamera && (
-        <ControlBtn
-          active={!showPeerCamera}
-          activeColor="orange"
-          onClick={onTogglePeerCamera}
-          title={showPeerCamera ? 'hide peer cam' : 'show peer cam'}
+        <IconButton
+          className="dock-btn"
+          label="More"
+          aria-expanded={panel === 'more'}
+          aria-haspopup="dialog"
+          onClick={() => toggle('more')}
         >
-          <PeerCameraIcon show={showPeerCamera} />
-        </ControlBtn>
-      )}
+          <MoreIcon size={20} />
+        </IconButton>
+      </div>
 
-      {/* Dashed divider */}
-      <span
-        aria-hidden="true"
-        style={{ width: 0, borderLeft: '2px dashed var(--ink)', height: 32, marginLeft: 4 }}
-      />
+      <span className="dock__divider" aria-hidden="true" />
 
-      {/* Leave — bright orange, bigger */}
-      <LeaveBtn onClick={onLeave} />
+      <Button variant="danger" className="dock-leave" icon={<LeaveIcon size={20} />} onClick={onLeave} aria-label="Leave session">
+        <span className="dock-leave__label">Leave</span>
+      </Button>
+
+      {/* ── panels ─────────────────────────────────────────────────────── */}
+
+      <Popover open={panel === 'react'} label="Reactions" className="dock-panel dock-react-panel">
+        <div className="react-tray">
+          {REACTION_EMOJI.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              className="react-tray__btn"
+              aria-label={`React with ${emoji}`}
+              onClick={() => onReact?.(emoji)}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+      </Popover>
+
+      <Popover open={panel === 'voice'} title="Volume" className="dock-panel">
+        {!isSharer && hasScreenAudio && onScreenAudioVolumeChange && (
+          <VolumeSlider label="Shared audio" value={screenAudioVolume} onChange={onScreenAudioVolumeChange} />
+        )}
+        {hasPeer && onPeerVolumeChange && (
+          <VolumeSlider label={`${peerDisplayName ?? 'Their'} voice`} value={peerVolume} onChange={onPeerVolumeChange} />
+        )}
+        {!hasVoiceControls && <p className="muted">No audio to control yet.</p>}
+      </Popover>
+
+      <Popover open={panel === 'quality' && !!onQualityChange} title={isScreenSharing ? 'Change quality' : 'Stream quality'} className="dock-panel">
+        <Diagnostics
+          uplink={uplink}
+          diagnostics={diagnostics}
+          appliedPoint={appliedPoint}
+          atBudgetFloor={atBudgetFloor}
+          inbound={inbound}
+          peerShare={peerShare}
+        />
+        {isScreenSharing && <p className="panel-label">Changes apply live, without interrupting the share.</p>}
+
+        {/* Content mode. Frame rate is the cheapest sharpness lever there is:
+            film is 24 fps at source, so encoding it at 30 divides the budget
+            over 25% more frames for nothing. */}
+        {onContentModeChange && (
+          <>
+            <p className="panel-label">What are you sharing?</p>
+            <div className="modes">
+              {(Object.keys(CONTENT_MODES) as ContentMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className="mode"
+                  title={CONTENT_MODES[mode].description}
+                  aria-pressed={contentMode === mode}
+                  onClick={() => onContentModeChange(mode)}
+                >
+                  {CONTENT_MODES[mode].label}
+                  <small>{CONTENT_MODES[mode].fps} fps</small>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        <p className="panel-label">Quality ceiling</p>
+        <div className="presets" role="radiogroup" aria-label="Quality ceiling">
+          {(Object.keys(QUALITY_PRESETS) as ScreenShareQuality[]).map((key) => {
+            const preset = QUALITY_PRESETS[key];
+            const isSelected = screenShareQuality === key;
+            const isRecommended = uplink?.recommendedQuality === key;
+            // Advisory only. Never `disabled`: a preset is a ceiling, and a
+            // ceiling above your link costs nothing — chooseOperatingPoint
+            // still sits on the budget. Locking these was what left a
+            // collapsed session with no way out, and on a fast link it is
+            // what kept everything above `auto` permanently out of reach,
+            // since `auto` bounds the very estimate the lock consults.
+            const aboveLink = !!uplink && uplink.withinEstimate[key] === false;
+            return (
+              <button
+                key={key}
+                type="button"
+                role="radio"
+                aria-checked={isSelected}
+                className="preset"
+                onClick={() => {
+                  onQualityChange?.(key);
+                  setPanel(null);
+                }}
+              >
+                <span className="preset__radio" aria-hidden="true" />
+                <span className="preset__name">
+                  {preset.label}
+                  <small>{preset.description}</small>
+                </span>
+                {isRecommended ? (
+                  <span className="preset__tag" data-kind="recommended">
+                    Recommended
+                  </span>
+                ) : aboveLink ? (
+                  <span className="preset__tag">Above your link</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+      </Popover>
+
+      <Popover open={panel === 'more'} title="More" className="dock-panel">
+        <div className="stack" style={{ ['--gap' as string]: '2px' }}>
+          {/* On a narrow screen the quality and volume buttons live here. */}
+          <div className="dock-more-compact">
+            {showQuality && onQualityChange && (
+              <button type="button" className="menu-item" onClick={() => setPanel('quality')}>
+                <QualityIcon size={18} />
+                <span className="menu-item__label">Stream quality</span>
+              </button>
+            )}
+            <button type="button" className="menu-item" onClick={() => setPanel('voice')} disabled={!hasVoiceControls}>
+              <VolumeIcon size={18} />
+              <span className="menu-item__label">Volume</span>
+            </button>
+          </div>
+          {moreItems.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className="menu-item"
+              aria-pressed={item.pressed}
+              disabled={item.disabled}
+              onClick={() => {
+                item.onSelect();
+                setPanel(null);
+              }}
+            >
+              {item.icon}
+              <span className="menu-item__label">
+                {item.label}
+                {item.hint && <span className="menu-item__hint">{item.hint}</span>}
+              </span>
+              {item.pressed !== undefined && <span className="menu-item__state">{item.pressed ? 'On' : 'Off'}</span>}
+            </button>
+          ))}
+          {moreItems.length === 0 && <p className="muted">Nothing else here right now.</p>}
+        </div>
+      </Popover>
     </div>
   );
 }
 
-/* ──────────────────────────────────────────────────────────── */
-/* ControlBtn — circular sticker button used in the controls bar */
-/* ──────────────────────────────────────────────────────────── */
-
-interface ControlBtnProps {
-  children: ReactNode;
-  active?: boolean;
-  activeColor?: 'pink' | 'orange' | 'purple';
-  onClick?: () => void;
-  title?: string;
-  size?: 'sm' | 'md';
-  disabled?: boolean;
-}
-
-function ControlBtn({
-  children,
-  active = false,
-  activeColor = 'pink',
-  onClick,
-  title,
-  size = 'md',
-  disabled = false,
-}: ControlBtnProps) {
-  const dim = size === 'sm' ? 40 : 50;
-  const activeBg = `var(--${activeColor})`;
+/**
+ * Two icons that trade places with a quick rotate-and-fade — the mic slash
+ * does not just appear, it is drawn in.
+ */
+function SwapIcon({ on, onIcon, offIcon }: { on: boolean; onIcon: ReactNode; offIcon: ReactNode }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      // aria-label mirrors the `title` so screen readers get the same
-      // affordance the tooltip shows mouse users. aria-pressed makes the
-      // toggle nature of mute/camera-off legible to assistive tech —
-      // without it, "mute" reads as a one-shot action instead of state.
-      aria-label={title}
-      aria-pressed={active}
-      disabled={disabled}
-      style={{
-        width: dim,
-        height: dim,
-        border: '3px solid var(--ink)',
-        borderRadius: '50%',
-        background: active ? activeBg : 'var(--cream)',
-        color: active && activeColor === 'purple' ? 'var(--cream)' : 'var(--ink)',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-        display: 'grid',
-        placeItems: 'center',
-        transform: `rotate(${active ? 0 : -2}deg)`,
-        transition: 'transform .15s, background .15s, box-shadow .15s',
-        boxShadow: '3px 3px 0 var(--ink)',
-        padding: 0,
-        opacity: disabled ? 0.4 : 1,
-      }}
-      onMouseEnter={(e) => {
-        if (disabled) return;
-        e.currentTarget.style.transform = 'rotate(0) translateY(-3px) scale(1.08)';
-        e.currentTarget.style.boxShadow = '5px 5px 0 var(--ink)';
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.transform = `rotate(${active ? 0 : -2}deg)`;
-        e.currentTarget.style.boxShadow = '3px 3px 0 var(--ink)';
-      }}
+    <m.span
+      key={on ? 'on' : 'off'}
+      initial={{ opacity: 0, rotate: -30, scale: 0.6 }}
+      animate={{ opacity: 1, rotate: 0, scale: 1 }}
+      transition={{ type: 'spring', stiffness: 500, damping: 26 }}
+      style={{ display: 'grid' }}
     >
-      {children}
-    </button>
+      {on ? onIcon : offIcon}
+    </m.span>
   );
 }
 
-/* ──────────────────────────────────────────────────────────── */
-/* LeaveBtn — orange exit                                       */
-/* ──────────────────────────────────────────────────────────── */
-
-function LeaveBtn({ onClick }: { onClick: () => void }) {
+function VolumeSlider({ label, value, onChange }: { label: string; value: number; onChange: (n: number) => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label="Leave session"
-      title="leave session"
-      style={{
-        background: 'var(--orange)',
-        border: '3px solid var(--ink)',
-        borderRadius: 12,
-        padding: '10px 18px 8px',
-        fontFamily: 'var(--font-sfx)',
-        fontSize: 20,
-        letterSpacing: 1,
-        cursor: 'pointer',
-        color: 'var(--ink)',
-        boxShadow: '4px 4px 0 var(--ink)',
-        transform: 'rotate(1.5deg)',
-        transition: 'transform .15s, box-shadow .15s',
-      }}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.transform = 'rotate(0) translate(-2px, -2px) scale(1.05)';
-        e.currentTarget.style.boxShadow = '6px 6px 0 var(--ink)';
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.transform = 'rotate(1.5deg)';
-        e.currentTarget.style.boxShadow = '4px 4px 0 var(--ink)';
-      }}
-    >
-      LEAVE
-    </button>
-  );
-}
-
-/* ──────────────────────────────────────────────────────────── */
-/* PopMenu — sticker-style dropdown                             */
-/* ──────────────────────────────────────────────────────────── */
-
-interface PopMenuProps {
-  title: string;
-  children: ReactNode;
-  onClose: () => void;
-}
-
-function PopMenu({ title, children, onClose }: PopMenuProps) {
-  return (
-    <div
-      onMouseLeave={onClose}
-      style={{
-        position: 'absolute',
-        bottom: 'calc(100% + 12px)',
-        left: '50%',
-        transform: 'translateX(-50%) rotate(-1deg)',
-        minWidth: 240,
-        background: 'var(--cream)',
-        border: '3.5px solid var(--ink)',
-        borderRadius: 12,
-        boxShadow: '6px 6px 0 var(--ink)',
-        padding: 14,
-        zIndex: 5000,
-      }}
-    >
-      <div
-        style={{
-          fontFamily: 'var(--font-sfx)',
-          fontSize: 14,
-          letterSpacing: 1.5,
-          color: 'var(--purple)',
-          marginBottom: 10,
-          paddingBottom: 6,
-          borderBottom: '2px dashed rgba(26,20,23,0.25)',
-        }}
-      >
-        {title}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function VolumeSlider({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  onChange: (n: number) => void;
-}) {
-  return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
-        <span className="hand" style={{ fontSize: 16, color: 'var(--ink)' }}>{label}</span>
-        <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 14, color: 'var(--pink)' }}>{value}%</span>
-      </div>
+    <label className="slider-row">
+      <span className="slider-row__head">
+        <span>{label}</span>
+        <output>{value}%</output>
+      </span>
       <input
         type="range"
+        className="range"
         min={0}
         max={100}
         value={value}
+        style={{ ['--fill' as string]: `${value}%` }}
         onChange={(e) => onChange(Number(e.target.value))}
-        style={{
-          width: '100%',
-          accentColor: 'var(--pink)',
-          cursor: 'pointer',
-        }}
       />
+    </label>
+  );
+}
+
+/**
+ * The live readout: both halves of the picture, so a bug report can say which
+ * end gave up. Every line is guarded on its own — a partial reading still
+ * carries information, and an all-or-nothing gate made one indistinguishable
+ * from no connection at all.
+ */
+function Diagnostics({
+  uplink,
+  diagnostics,
+  appliedPoint,
+  atBudgetFloor,
+  inbound,
+  peerShare,
+}: Pick<MediaControlsProps, 'uplink' | 'diagnostics' | 'appliedPoint' | 'atBudgetFloor' | 'inbound' | 'peerShare'>) {
+  if (!(uplink || diagnostics?.path || diagnostics?.outbound || inbound || peerShare)) return null;
+  const jitter = inbound ? jitterBufferMs(inbound) : null;
+  return (
+    <div className="stats">
+      {/* "≥" and not "=" when the number is a measured lower bound rather than
+          a capacity estimate — on a TCP relay `availableOutgoingBitrate`
+          describes TCP, not the path. Showing 0.0 Mbps there is how a 200 Mbps
+          link got reported as having no bandwidth. */}
+      {uplink && (
+        <Stat k="Uplink">
+          {uplink.capacityKnown ? '' : '≥ '}
+          {uplink.uplinkMbps} Mbps{!uplink.capacityKnown && ', no capacity estimate on this path'}
+        </Stat>
+      )}
+      {diagnostics?.path && (
+        <Stat k="Path" note={diagnostics.path.isRelayed}>
+          {formatTransportPath(diagnostics.path)}
+          {diagnostics.path.rttMs !== null && `, ${diagnostics.path.rttMs} ms`}
+        </Stat>
+      )}
+      {diagnostics?.outbound && (
+        <Stat k="Sending">
+          {diagnostics.outbound.frameWidth != null
+            ? `${diagnostics.outbound.frameWidth}×${diagnostics.outbound.frameHeight}`
+            : '—'}
+          {diagnostics.outbound.framesPerSecond != null && ` @ ${Math.round(diagnostics.outbound.framesPerSecond)}`}
+          {diagnostics.outbound.targetBitrate != null &&
+            `, ${(diagnostics.outbound.targetBitrate / 1_000_000).toFixed(2)} Mbps`}
+          {diagnostics.bpp != null && `, ${diagnostics.bpp.toFixed(3)} bpp`}
+          {/* Software or hardware, in one string. 'libvpx-vp9' on a machine
+              with no hardware VP9 encoder is the whole explanation for a share
+              that stops and starts. */}
+          {diagnostics.outbound.encoderImplementation && `, ${diagnostics.outbound.encoderImplementation}`}
+        </Stat>
+      )}
+      {/* What we asked for, beside what came back. A collapsed frame rate
+          INFLATES bits-per-pixel, so only the gap against the ask makes that
+          readable as a failure. */}
+      {appliedPoint && (
+        <Stat k="Asked" warn={atBudgetFloor}>
+          {appliedPoint.width}×{appliedPoint.height} @ {appliedPoint.fps}, {(appliedPoint.videoBps / 1_000_000).toFixed(2)}{' '}
+          Mbps{atBudgetFloor && ', at floor'}
+        </Stat>
+      )}
+      {diagnostics?.outbound?.qualityLimitationReason && diagnostics.outbound.qualityLimitationReason !== 'none' && (
+        <Stat k="Limited by" warn>
+          {diagnostics.outbound.qualityLimitationReason}
+        </Stat>
+      )}
+      {/* The viewer's half. Everything above describes the local encoder,
+          which is exactly the wrong end when the person reporting the fault is
+          the one watching. */}
+      {inbound && (
+        <Stat k="Receiving">
+          {inbound.frameWidth != null ? `${inbound.frameWidth}×${inbound.frameHeight}` : '—'}
+          {inbound.framesPerSecond != null && ` @ ${Math.round(inbound.framesPerSecond)}`}
+          {inbound.decoderImplementation && `, ${inbound.decoderImplementation}`}
+        </Stat>
+      )}
+      {/* Freezing is the symptom nothing else in this panel can show. */}
+      {inbound?.freezeCount != null && (
+        <Stat k="Freezes" warn={inbound.freezeCount > 0}>
+          {inbound.freezeCount}
+          {inbound.totalFreezesDuration != null && ` (${inbound.totalFreezesDuration.toFixed(1)} s)`}
+          {jitter != null && `, buffer ${Math.round(jitter)} ms`}
+          {inbound.framesDropped != null && `, dropped ${inbound.framesDropped}`}
+        </Stat>
+      )}
+      {/* Recovery traffic. A PLI is a keyframe we had to ask for, which is
+          what a freeze ends with — so these separate "the picture stalled"
+          from "the link is lossy". */}
+      {(inbound?.pliCount != null || inbound?.nackCount != null) && (
+        <Stat k="Recovery">
+          {inbound.pliCount ?? '—'} PLI, {inbound.nackCount ?? '—'} NACK
+        </Stat>
+      )}
+      {/* And what the far end says it is doing, so the two halves of the
+          diagnosis finally sit on one screen. */}
+      {peerShare && (
+        <>
+          <Stat k="Their encoder" warn={!!peerShare.limitedBy && peerShare.limitedBy !== 'none'}>
+            {peerShare.encoder ?? 'unknown'}
+            {peerShare.limitedBy && peerShare.limitedBy !== 'none' && `, limited by ${peerShare.limitedBy}`}
+          </Stat>
+          <Stat k="Their ask">
+            {peerShare.width}×{peerShare.height} @ {peerShare.fps}, {(peerShare.bps / 1_000_000).toFixed(2)} Mbps
+          </Stat>
+          {/* Beside the ask, because the gap between the two is the answer
+              whenever this side is freezing: frames that were never made
+              cannot have been lost. */}
+          {peerShare.sentFps !== undefined && (
+            <Stat k="They send">
+              {Math.round(peerShare.sentFps)} fps
+              {peerShare.sentFps < peerShare.fps * SOURCE_IDLE_FPS_RATIO && ', their screen is still'}
+            </Stat>
+          )}
+        </>
+      )}
     </div>
   );
 }
 
-/* ──────────────────────────────────────────────────────────── */
-/* Icons                                                        */
-/* ──────────────────────────────────────────────────────────── */
-
-const iconCommon = {
-  width: 22,
-  height: 22,
-  viewBox: '0 0 24 24',
-  fill: 'none',
-  stroke: 'currentColor',
-  strokeWidth: 2.5,
-  strokeLinecap: 'round' as const,
-  strokeLinejoin: 'round' as const,
-};
-
-function MicIcon() {
+function Stat({ k, children, warn, note }: { k: string; children: ReactNode; warn?: boolean; note?: boolean }) {
   return (
-    <svg {...iconCommon}>
-      <rect x="9" y="3" width="6" height="12" rx="3" />
-      <path d="M5 12 Q 5 19 12 19 Q 19 19 19 12" />
-      <line x1="12" y1="19" x2="12" y2="23" />
-    </svg>
-  );
-}
-
-function MicOffIcon() {
-  return (
-    <svg {...iconCommon}>
-      <rect x="9" y="3" width="6" height="12" rx="3" />
-      <path d="M5 12 Q 5 19 12 19 Q 19 19 19 12" />
-      <line x1="12" y1="19" x2="12" y2="23" />
-      <line x1="3" y1="3" x2="21" y2="21" stroke="var(--purple)" strokeWidth="3" />
-    </svg>
-  );
-}
-
-function VideoIcon() {
-  return (
-    <svg {...iconCommon}>
-      <rect x="2" y="6" width="14" height="12" rx="2" />
-      <path d="M16 10 L 22 7 L 22 17 L 16 14 Z" />
-    </svg>
-  );
-}
-
-function VideoOffIcon() {
-  return (
-    <svg {...iconCommon}>
-      <rect x="2" y="6" width="14" height="12" rx="2" />
-      <path d="M16 10 L 22 7 L 22 17 L 16 14 Z" />
-      <line x1="3" y1="3" x2="21" y2="21" stroke="var(--purple)" strokeWidth="3" />
-    </svg>
-  );
-}
-
-function VoiceIcon() {
-  return (
-    <svg {...iconCommon}>
-      <path d="M5 9 L 5 15 L 9 15 L 14 19 L 14 5 L 9 9 Z" />
-      <path d="M17 8 Q 20 12 17 16" />
-    </svg>
-  );
-}
-
-function ScreenIcon() {
-  return (
-    <svg {...iconCommon}>
-      <rect x="2" y="4" width="20" height="13" rx="2" />
-      <line x1="8" y1="21" x2="16" y2="21" />
-      <path d="M12 6 L 12 14 M 8 10 L 12 6 L 16 10" />
-    </svg>
-  );
-}
-
-/** A clipboard with a line on it: this collects something and hands it over. */
-function BugIcon() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M9 3h6v3H9z" />
-      <path d="M6 6h12v15H6z" />
-      <line x1="9" y1="12" x2="15" y2="12" />
-      <line x1="9" y1="16" x2="13" y2="16" />
-    </svg>
-  );
-}
-
-function QualityIcon() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
-      <line x1="4" y1="21" x2="4" y2="14" />
-      <line x1="12" y1="21" x2="12" y2="10" />
-      <line x1="20" y1="21" x2="20" y2="6" />
-    </svg>
-  );
-}
-
-function PeerCameraIcon({ show }: { show: boolean }) {
-  return (
-    <svg {...iconCommon}>
-      <circle cx="12" cy="9" r="4" />
-      <path d="M4 21 Q 4 14 12 14 Q 20 14 20 21" />
-      {!show && <line x1="3" y1="3" x2="21" y2="21" stroke="var(--purple)" strokeWidth="3" />}
-    </svg>
+    <div className="stats__row">
+      <span className="stats__key">{k}</span>
+      <span className="stats__val" data-warn={warn ? '' : undefined} data-note={note ? '' : undefined}>
+        {children}
+      </span>
+    </div>
   );
 }

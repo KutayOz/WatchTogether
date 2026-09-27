@@ -1,13 +1,10 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { api } from '../../services/api';
-import {
-  SectionTitle,
-  StickerButton,
-  BackButton,
-  BurstSticker,
-  TagSticker,
-} from '../manga';
-import { ModalShell } from './AdminModal';
+import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { ScrambleText } from '../ui/ScrambleText';
+import { AlertIcon, CheckIcon, CopyIcon, LockIcon, TrashIcon, UsersIcon } from '../ui/icons';
+import { sparkle } from '../ui/interactions';
 import type { AdminUser } from '../../types';
 
 interface UserTableProps {
@@ -18,9 +15,10 @@ interface UserTableProps {
 export function UserTable({ users, onRefresh }: UserTableProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<AdminUser | null>(null);
   const [resetLink, setResetLink] = useState<{ tag: string; url: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  const copyRef = useRef<HTMLButtonElement>(null);
 
   /**
    * Mint a password reset link.
@@ -62,275 +60,169 @@ export function UserTable({ users, onRefresh }: UserTableProps) {
   const formatDate = (millis: number) =>
     new Date(millis).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 
-  return (
-    <div>
-      <div className="row" style={{ marginBottom: 16, alignItems: 'baseline', gap: 12 }}>
-        <SectionTitle size={26} underline="pink">
-          USERS
-        </SectionTitle>
-        <span className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)' }}>
-          {users.length} total
-        </span>
+  if (users.length === 0) {
+    return (
+      <div className="empty">
+        <UsersIcon size={30} />
+        <p className="empty__title">Nobody yet</p>
       </div>
+    );
+  }
 
+  return (
+    <div className="stack" style={{ ['--gap' as string]: '14px' }}>
       {error && (
-        <div
-          className="shake"
-          style={{
-            marginBottom: 12,
-            padding: '10px 14px',
-            border: '3px solid var(--ink)',
-            background: 'var(--orange)',
-            fontWeight: 700,
-          }}
-        >
-          {error}
+        <div className="notice notice--error" role="alert">
+          <AlertIcon size={18} />
+          <span>{error}</span>
         </div>
       )}
 
-      <div
-        style={{
-          overflowX: 'auto',
-          border: '3px solid var(--ink)',
-          borderRadius: 4,
-          background: 'var(--cream)',
-          backgroundImage:
-            'repeating-linear-gradient(0deg, transparent 0 31px, rgba(123,63,228,0.12) 31px 32px)',
-        }}
-      >
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead>
-            <tr style={{ borderBottom: '3px solid var(--ink)' }}>
-              <Th>user</Th>
-              <Th>tag</Th>
-              <Th>status</Th>
-              <Th>joined</Th>
-              <Th align="right">actions</Th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.map((u) => (
-              <tr key={u.id} style={{ borderBottom: '2px dashed rgba(26,20,23,0.15)' }}>
-                <Td>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <div
-                      style={{
-                        width: 30,
-                        height: 30,
-                        display: 'grid',
-                        placeItems: 'center',
-                        background: u.isRootUser ? 'var(--purple)' : 'var(--pink)',
-                        color: u.isRootUser ? 'var(--cream)' : 'var(--ink)',
-                        border: '2.5px solid var(--ink)',
-                        borderRadius: '50%',
-                        fontFamily: 'var(--font-sfx)',
-                        fontSize: 14,
-                      }}
+      <div className="people" role="table" aria-label="People">
+        <div className="people__row people__row--head" role="row">
+          <span role="columnheader">Person</span>
+          <span role="columnheader">Status</span>
+          <span role="columnheader">Joined</span>
+          <span role="columnheader" className="people__actions-head">
+            Actions
+          </span>
+        </div>
+        {users.map((u) => (
+          <div className="people__row" role="row" key={u.id} data-deleted={u.isDeleted ? '' : undefined}>
+            <span role="cell" className="people__person">
+              <span
+                className="avatar"
+                data-who={u.isRootUser ? undefined : 'them'}
+                style={{ ['--av' as string]: '36px' }}
+                aria-hidden="true"
+              >
+                {u.username.charAt(0).toUpperCase()}
+              </span>
+              <span className="people__name">
+                <span className="people__username">{u.username}</span>
+                {/* The tag, not an email — it is what makes two people called
+                    "kutay" distinguishable, and the only handle admins can act on. */}
+                <span className="people__tag">{u.tag}</span>
+              </span>
+            </span>
+            <span role="cell" className="people__status">
+              {u.isRootUser && <span className="chip chip--amber">Root</span>}
+              {u.isDeleted ? <span className="chip chip--exit">Deleted</span> : !u.isRootUser && <span className="chip">Active</span>}
+            </span>
+            <span role="cell" className="people__joined">
+              <span className="people__cell-label">Joined </span>
+              {formatDate(u.createdAt)}
+            </span>
+            <span role="cell" className="people__actions">
+              {/* Reset and delete. The Worker exposes no other user-update
+                  endpoint, and root is undeletable server-side as well as
+                  here — though root can still be issued a reset link, since
+                  losing the only admin password is exactly when you need
+                  one most. */}
+              {!u.isDeleted && (
+                <>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<LockIcon size={16} />}
+                    onClick={() => handleResetPassword(u)}
+                    disabled={isSubmitting}
+                  >
+                    Reset password
+                  </Button>
+                  {!u.isRootUser && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="people__delete"
+                      icon={<TrashIcon size={16} />}
+                      onClick={() => setDeleteConfirm(u)}
                     >
-                      {u.username.charAt(0).toUpperCase()}
-                    </div>
-                    <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 15, letterSpacing: 0.5 }}>
-                      {u.username}
-                    </span>
-                    {u.isRootUser && <TagSticker color="orange" rot={3}>ROOT</TagSticker>}
-                  </div>
-                </Td>
-                <Td>
-                  {/* The tag, not an email — it is what makes two people called
-                      "kutay" distinguishable, and the only handle admins can act on. */}
-                  <span style={{ fontSize: 13, fontFamily: 'monospace' }}>{u.tag}</span>
-                </Td>
-                <Td>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {u.isDeleted && <Pill bg="var(--orange)">DELETED</Pill>}
-                    {u.isRootUser && <Pill bg="var(--purple)" fg="var(--cream)">ROOT</Pill>}
-                  </div>
-                </Td>
-                <Td>
-                  <span className="hand" style={{ fontSize: 16 }}>{formatDate(u.createdAt)}</span>
-                </Td>
-                <Td align="right">
-                  {/* Reset and delete. The Worker exposes no other user-update
-                      endpoint, and root is undeletable server-side as well as
-                      here — though root can still be issued a reset link, since
-                      losing the only admin password is exactly when you need
-                      one most. */}
-                  {!u.isDeleted && (
-                    <div style={{ display: 'inline-flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                      <ActionBtn
-                        onClick={() => handleResetPassword(u)}
-                        color="purple"
-                        disabled={isSubmitting}
-                      >
-                        reset password
-                      </ActionBtn>
-                      {!u.isRootUser && (
-                        <ActionBtn onClick={() => setDeleteConfirm(u.id)} color="orange">
-                          delete
-                        </ActionBtn>
-                      )}
-                    </div>
+                      Delete
+                    </Button>
                   )}
-                </Td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                </>
+              )}
+            </span>
+          </div>
+        ))}
       </div>
 
-
       {/* Reset link, shown exactly once — the server keeps only its hash. */}
-      {resetLink && (
-        <ModalShell title="RESET LINK" onClose={() => setResetLink(null)}>
-          <p className="hand" style={{ fontSize: 20, color: 'rgba(26,20,23,0.75)' }}>
-            hand this to <span style={{ color: 'var(--purple)' }}>{resetLink.tag}</span>. it works
-            once, expires in 48h, and any earlier link for them is now dead.
-          </p>
-
-          <div
-            style={{
-              marginTop: 14,
-              padding: '10px 12px',
-              border: '3px solid var(--ink)',
-              background: 'var(--cream)',
-              fontFamily: 'monospace',
-              fontSize: 12,
-              wordBreak: 'break-all',
-            }}
-          >
-            {resetLink.url}
-          </div>
-
-          <p className="hand" style={{ fontSize: 17, marginTop: 10, color: 'var(--orange-deep)' }}>
-            · copy it now — closing this is the last you will see of it.
-          </p>
-
-          <div className="row" style={{ gap: 12, marginTop: 20, flexWrap: 'wrap' }}>
-            <StickerButton
-              color="purple"
-              sfx="KLIK"
+      <Modal
+        isOpen={resetLink !== null}
+        onClose={() => setResetLink(null)}
+        title="Reset link"
+        description={
+          resetLink ? `Give this to ${resetLink.tag}. It works once, expires in 48 hours, and any earlier link for them is now dead.` : undefined
+        }
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setResetLink(null)}>
+              Done
+            </Button>
+            <Button
+              ref={copyRef}
+              variant="primary"
+              icon={copied ? <CheckIcon size={18} /> : <CopyIcon size={18} />}
+              data-autofocus=""
               onClick={() => {
+                if (!resetLink) return;
                 navigator.clipboard
                   ?.writeText(resetLink.url)
-                  .then(() => setCopied(true))
+                  .then(() => {
+                    setCopied(true);
+                    sparkle(copyRef.current);
+                  })
                   // Clipboard access can be refused outright; the link is on
                   // screen and selectable either way, so this is not an error.
                   .catch(() => setCopied(false));
               }}
             >
-              {copied ? 'COPIED!' : 'COPY LINK'}
-            </StickerButton>
-            <BackButton onClick={() => setResetLink(null)}>done</BackButton>
+              {copied ? 'Copied' : 'Copy link'}
+            </Button>
+          </>
+        }
+      >
+        {resetLink && (
+          <div className="stack" style={{ ['--gap' as string]: '12px' }}>
+            <div className="invite-ticket" style={{ borderStyle: 'solid' }}>
+              <div className="invite-ticket__label">Reset link</div>
+              <ScrambleText text={resetLink.url} className="invite-ticket__url" />
+            </div>
+            <div className="notice notice--warn">
+              <AlertIcon size={18} />
+              <span>Copy it now. Closing this is the last you’ll see of it.</span>
+            </div>
           </div>
-        </ModalShell>
-      )}
+        )}
+      </Modal>
 
-      {/* Delete confirm */}
-      {deleteConfirm && (
-        <ModalShell title="DELETE USER?" onClose={() => setDeleteConfirm(null)}>
-          <BurstSticker bg="var(--orange)" rot={-4} w={220} h={130}>
-            HOLD UP!
-          </BurstSticker>
-          <p className="hand" style={{ fontSize: 22, marginTop: 14, color: 'rgba(26,20,23,0.75)' }}>
-            this can't be undone.
-          </p>
-          <div className="row" style={{ gap: 12, marginTop: 20, flexWrap: 'wrap' }}>
-            <StickerButton color="orange" sfx="KLIK" onClick={() => handleDelete(deleteConfirm)} disabled={isSubmitting}>
-              {isSubmitting ? 'DELETING…' : 'YES, DELETE'}
-            </StickerButton>
-            <BackButton onClick={() => setDeleteConfirm(null)}>nevermind</BackButton>
-          </div>
-        </ModalShell>
-      )}
+      <Modal
+        isOpen={deleteConfirm !== null}
+        onClose={() => setDeleteConfirm(null)}
+        title="Delete this person?"
+        description={
+          deleteConfirm ? `${deleteConfirm.tag} loses their account. This can’t be undone.` : undefined
+        }
+        width={460}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setDeleteConfirm(null)}>
+              Keep them
+            </Button>
+            <Button
+              variant="danger"
+              icon={<TrashIcon size={17} />}
+              loading={isSubmitting}
+              disabled={isSubmitting}
+              onClick={() => deleteConfirm && handleDelete(deleteConfirm.id)}
+            >
+              {isSubmitting ? 'Deleting…' : 'Delete'}
+            </Button>
+          </>
+        }
+      />
     </div>
-  );
-}
-
-function Th({ children, align = 'left' }: { children: React.ReactNode; align?: 'left' | 'right' | 'center' }) {
-  return (
-    <th
-      style={{
-        textAlign: align,
-        padding: '10px 12px',
-        fontFamily: 'var(--font-sfx)',
-        fontSize: 14,
-        letterSpacing: 1.2,
-        color: 'var(--purple)',
-      }}
-    >
-      {children}
-    </th>
-  );
-}
-
-function Td({ children, align = 'left' }: { children: React.ReactNode; align?: 'left' | 'right' | 'center' }) {
-  return (
-    <td
-      style={{
-        textAlign: align,
-        padding: '10px 12px',
-        fontSize: 14,
-        fontWeight: 600,
-        color: 'var(--ink)',
-        verticalAlign: 'middle',
-      }}
-    >
-      {children}
-    </td>
-  );
-}
-
-function Pill({ children, bg, fg = 'var(--ink)' }: { children: React.ReactNode; bg: string; fg?: string }) {
-  return (
-    <span
-      style={{
-        fontFamily: 'var(--font-sfx)',
-        fontSize: 11,
-        letterSpacing: 1,
-        padding: '2px 8px',
-        background: bg,
-        color: fg,
-        border: '2px solid var(--ink)',
-        borderRadius: 4,
-        display: 'inline-block',
-        width: 'fit-content',
-      }}
-    >
-      {children}
-    </span>
-  );
-}
-
-function ActionBtn({
-  children,
-  onClick,
-  color,
-  disabled,
-}: {
-  children: React.ReactNode;
-  onClick: () => void;
-  color: 'purple' | 'orange';
-  disabled?: boolean;
-}) {
-  const fg = color === 'purple' ? 'var(--purple-deep)' : 'var(--orange-deep)';
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      style={{
-        background: 'transparent',
-        border: '2px solid var(--ink)',
-        borderRadius: 8,
-        padding: '4px 10px',
-        fontFamily: 'var(--font-hand)',
-        fontWeight: 700,
-        fontSize: 16,
-        color: fg,
-        cursor: 'pointer',
-      }}
-    >
-      {children}
-    </button>
   );
 }

@@ -1,21 +1,20 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { api } from '../../services/api';
 import { useAuthContext } from '../../context/AuthContext';
-import {
-  SectionTitle,
-  TagSticker,
-  StickerButton,
-  BackButton,
-  Doodle,
-  BurstSticker,
-} from '../manga';
+import { Modal } from '../ui/Modal';
+import { Button } from '../ui/Button';
+import { ScrambleText } from '../ui/ScrambleText';
+import { AlertIcon, CheckIcon, CopyIcon, TicketIcon, TrashIcon } from '../ui/icons';
+import { shake, sparkle } from '../ui/interactions';
+import { ease } from '../ui/motion';
 
 interface InviteModalProps {
   isOpen: boolean;
   onClose: () => void;
   remainingSlots: number;
-  /** Root admin has no quota cap. When true, the "X LEFT" badge renders as
-   *  "∞ LEFT" and the disabled-on-zero check is skipped — the backend will
+  /** Root admin has no quota cap. When true, the "X left" badge reads
+   *  "Unlimited" and the disabled-on-zero check is skipped — the backend will
    *  still respond to the create call regardless of how many links exist. */
   isUnlimited?: boolean;
   onInvitationSent: () => void;
@@ -38,13 +37,18 @@ export function InviteModal({ isOpen, onClose, remainingSlots, isUnlimited = fal
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
   const [timeLeft, setTimeLeft] = useState<string | null>(null);
+  const copyRef = useRef<HTMLButtonElement>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isOpen) {
       checkActiveLink();
     }
-
   }, [isOpen]);
+
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
 
   useEffect(() => {
     if (!expiresAt) {
@@ -121,9 +125,10 @@ export function InviteModal({ isOpen, onClose, remainingSlots, isUnlimited = fal
     try {
       await navigator.clipboard.writeText(inviteUrl);
       setCopied(true);
+      sparkle(copyRef.current);
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
-      setError('Failed to copy to clipboard');
+      setError('Copying was blocked. Select the link and copy it by hand.');
     }
   };
 
@@ -133,199 +138,127 @@ export function InviteModal({ isOpen, onClose, remainingSlots, isUnlimited = fal
     onClose();
   };
 
-  if (!isOpen) return null;
+  const hasOutstanding = !!expiresAt && !inviteUrl;
+  const outOfInvites = !isUnlimited && remainingSlots === 0;
 
   return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(26,20,23,0.5)',
-        zIndex: 7000,
-        display: 'grid',
-        placeItems: 'center',
-        animation: 'fadeIn 0.25s ease-out forwards',
-        padding: 16,
-      }}
-      onClick={handleClose}
+    <Modal
+      isOpen={isOpen}
+      onClose={handleClose}
+      width={540}
+      title={inviteUrl ? 'Your invite is ready' : 'Invite someone new'}
+      description={
+        inviteUrl
+          ? 'Send this to the person you’re inviting. Anyone with the link can use it, so send it privately.'
+          : 'This makes a one-time link for creating an account. It works once and expires after 48 hours.'
+      }
+      footerSplit
+      footer={
+        inviteUrl ? (
+          <>
+            <Button variant="ghost" icon={<TrashIcon size={17} />} onClick={handleRevokeLink}>
+              Revoke
+            </Button>
+            <div className="cluster">
+              <Button variant="secondary" onClick={handleClose}>
+                Done
+              </Button>
+              <Button
+                ref={copyRef}
+                variant="primary"
+                icon={copied ? <CheckIcon size={18} /> : <CopyIcon size={18} />}
+                onClick={handleCopy}
+                data-autofocus=""
+              >
+                {copied ? 'Copied' : 'Copy link'}
+              </Button>
+            </div>
+          </>
+        ) : (
+          <>
+            <span className={isUnlimited ? 'chip chip--amber' : 'chip'}>
+              {isUnlimited ? 'Unlimited invites' : `${remainingSlots} left`}
+            </span>
+            <div className="cluster">
+              <Button variant="ghost" onClick={handleClose}>
+                Not now
+              </Button>
+              <Button
+                variant="primary"
+                icon={<TicketIcon size={18} />}
+                onClick={handleGenerateLink}
+                loading={isGenerating}
+                disabled={isGenerating || hasOutstanding || outOfInvites}
+                data-autofocus=""
+              >
+                {isGenerating ? 'Making link…' : 'Make invite link'}
+              </Button>
+            </div>
+          </>
+        )
+      }
     >
-      {/* Postcard */}
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          position: 'relative',
-          width: '100%',
-          maxWidth: 600,
-          background: 'var(--cream)',
-          border: '4.5px solid var(--ink)',
-          boxShadow: '12px 12px 0 var(--ink)',
-          animation: 'postcardIn 0.55s cubic-bezier(.34,1.56,.64,1)',
-          transform: 'rotate(-1.5deg)',
-        }}
-      >
-        <div style={{ padding: '26px 32px 22px', position: 'relative' }}>
-          <div className="row" style={{ gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-            <SectionTitle size={38} underline="pink">
-              INVITE!
-            </SectionTitle>
-            {!inviteUrl && (isUnlimited || remainingSlots > 0) && (
-              <TagSticker color="orange" rot={4}>
-                {isUnlimited ? '∞' : remainingSlots} LEFT
-              </TagSticker>
-            )}
-          </div>
+      <AnimatePresence mode="wait" initial={false}>
+        {inviteUrl ? (
+          <m.div
+            key="link"
+            className="invite-ticket"
+            initial={{ opacity: 0, y: 24, rotate: -2, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, rotate: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ type: 'spring', stiffness: 300, damping: 22 }}
+          >
+            <div className="invite-ticket__label">Invite link</div>
+            <ScrambleText text={inviteUrl} className="invite-ticket__url" />
+            <div className="invite-ticket__meta">
+              Expires in <span className="tabular">{timeLeft ?? '…'}</span>. Works once.
+            </div>
+          </m.div>
+        ) : (
+          <m.div
+            key="plan"
+            className="stack"
+            style={{ ['--gap' as string]: '14px' }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0, transition: { duration: 0.12 } }}
+            transition={{ duration: 0.3, ease: ease.out }}
+          >
+            <ol className="invite-steps">
+              <li>Make the link here.</li>
+              <li>Send it to them however you usually talk.</li>
+              <li>They open it and pick a name. That’s their account.</li>
+            </ol>
 
-          {!inviteUrl ? (
-            <>
-              <p className="hand" style={{ fontSize: 22, marginTop: 16, color: 'rgba(26,20,23,0.7)' }}>
-                tear this off &amp; give it to{' '}
-                <span style={{ color: 'var(--purple)' }}>your favorite person</span>
-              </p>
-
-              {/* How-it-works ledger */}
-              <div
-                style={{
-                  marginTop: 18,
-                  border: '3px solid var(--ink)',
-                  padding: '14px 18px',
-                  background: 'rgba(123,63,228,0.06)',
-                  transform: 'rotate(0.4deg)',
-                }}
-              >
-                <div style={{ fontFamily: 'var(--font-sfx)', fontSize: 14, letterSpacing: 1, color: 'var(--purple)', marginBottom: 8 }}>
-                  THE PLAN
-                </div>
-                <ol className="hand" style={{ fontSize: 18, color: 'var(--ink)', margin: 0, paddingLeft: 22, lineHeight: 1.5 }}>
-                  <li>generate a one-time link below</li>
-                  <li>send it to a friend (whatsapp, dms, whatever)</li>
-                  <li>they click it &amp; make an account</li>
-                </ol>
-                <div className="hand" style={{ fontSize: 16, color: 'rgba(26,20,23,0.55)', marginTop: 8 }}>
-                  expires after 48h · one use only
-                </div>
-              </div>
-
-              {expiresAt && !inviteUrl && (
-                <div
-                  style={{
-                    marginTop: 16,
-                    border: '3px solid var(--ink)',
-                    background: 'var(--orange)',
-                    padding: '10px 14px',
-                  }}
-                >
-                  <span className="hand" style={{ fontSize: 18, color: 'var(--ink)' }}>
-                    you already have an active link expiring in {timeLeft}.{' '}
-                    <button
-                      type="button"
-                      onClick={handleRevokeLink}
-                      style={{
-                        background: 'transparent',
-                        border: 'none',
-                        textDecoration: 'underline',
-                        cursor: 'pointer',
-                        fontFamily: 'var(--font-hand)',
-                        fontWeight: 700,
-                        fontSize: 18,
-                        color: 'var(--ink)',
-                        padding: 0,
-                      }}
-                    >
-                      revoke it
-                    </button>{' '}
-                    to make a new one.
-                  </span>
-                </div>
-              )}
-
-              {error && (
-                <div className="shake" style={{ marginTop: 16 }}>
-                  <BurstSticker bg="var(--orange)" rot={-4} w={180} h={120}>
-                    OOPS!
-                  </BurstSticker>
-                  <div className="hand" style={{ fontSize: 18, marginTop: 6 }}>{error}</div>
-                </div>
-              )}
-
-              <div className="row" style={{ marginTop: 22, gap: 12, flexWrap: 'wrap' }}>
-                <StickerButton
-                  color="pink"
-                  sfx="STAMP!"
-                  onClick={handleGenerateLink}
-                  disabled={isGenerating || (!!expiresAt && !inviteUrl) || (!isUnlimited && remainingSlots === 0)}
-                >
-                  {isGenerating ? 'STAMPING…' : 'MAIL IT!'}
-                </StickerButton>
-                <span style={{ flex: 1 }} />
-                <BackButton onClick={handleClose}>put it away</BackButton>
-              </div>
-            </>
-          ) : (
-            <>
-              <p className="hand" style={{ fontSize: 22, marginTop: 16, color: 'rgba(26,20,23,0.7)' }}>
-                here's the link — send it to{' '}
-                <span style={{ color: 'var(--purple)' }}>your favorite person</span>
-              </p>
-
-              {/* Tear-off line */}
-              <div style={{ marginTop: 14, position: 'relative', display: 'flex', alignItems: 'center' }}>
-                <Doodle kind="x" size={20} color="var(--ink)" style={{ marginRight: -6 }} />
-                <span style={{ flex: 1, borderTop: '2px dashed var(--ink)', margin: '0 4px' }} />
-              </div>
-              <div className="hand" style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)', marginTop: -2, marginLeft: 22 }}>
-                ✂  cut here
-              </div>
-
-              <div
-                style={{
-                  marginTop: 8,
-                  border: '3px solid var(--ink)',
-                  padding: '16px 18px',
-                  background: 'rgba(255,79,163,0.08)',
-                  position: 'relative',
-                  transform: 'rotate(0.5deg)',
-                }}
-              >
-                <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 14, letterSpacing: 1, color: 'var(--purple)' }}>
-                  YOUR LINK
+            {hasOutstanding && (
+              <div className="notice notice--warn">
+                <AlertIcon size={18} />
+                <span>
+                  You already have a link out. It expires in <span className="tabular">{timeLeft}</span>.{' '}
+                  <button type="button" className="btn btn--link" onClick={handleRevokeLink}>
+                    Revoke it
+                  </button>{' '}
+                  to make a new one.
                 </span>
-                <div
-                  style={{
-                    fontFamily: 'monospace',
-                    fontSize: 15,
-                    fontWeight: 700,
-                    marginTop: 6,
-                    userSelect: 'all',
-                    wordBreak: 'break-all',
-                  }}
-                >
-                  {inviteUrl}
-                </div>
-                <div className="hand" style={{ fontSize: 16, color: 'rgba(26,20,23,0.55)', marginTop: 8 }}>
-                  expires in {timeLeft ?? '…'} · one use only
-                </div>
               </div>
+            )}
 
-              {error && (
-                <div className="hand" style={{ marginTop: 12, color: 'var(--orange-deep)', fontSize: 18 }}>
-                  {error}
-                </div>
-              )}
-
-              <div className="row" style={{ marginTop: 22, gap: 12, flexWrap: 'wrap' }}>
-                <StickerButton color={copied ? 'orange' : 'pink'} sfx="KLIK" onClick={handleCopy}>
-                  {copied ? 'COPIED!' : 'COPY LINK'}
-                </StickerButton>
-                <StickerButton color="cream" size="sm" sfx="KLIK" onClick={handleRevokeLink}>
-                  REVOKE
-                </StickerButton>
-                <span style={{ flex: 1 }} />
-                <BackButton onClick={handleClose}>done</BackButton>
+            {outOfInvites && !hasOutstanding && (
+              <div className="notice">
+                <AlertIcon size={18} />
+                <span>You’ve used all your invites.</span>
               </div>
-            </>
-          )}
+            )}
+          </m.div>
+        )}
+      </AnimatePresence>
+
+      {error && (
+        <div ref={errorRef} className="notice notice--error" role="alert" style={{ marginTop: 14 }}>
+          <AlertIcon size={18} />
+          <span>{error}</span>
         </div>
-      </div>
-    </div>
+      )}
+    </Modal>
   );
 }

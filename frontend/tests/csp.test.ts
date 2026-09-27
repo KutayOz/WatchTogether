@@ -110,16 +110,16 @@ describe('content security policy', () => {
   });
 
   /**
-   * Styles are the exception, and it is a real one: several components render
-   * a literal <style> block (App.tsx, Loading.tsx, PreflightLobby.tsx,
-   * ConnectionQualityBadge.tsx). React inserts those as style elements, which
-   * CSP treats as inline whatever created them, so dropping 'unsafe-inline'
-   * would strip the app's keyframes rather than harden anything.
+   * Styles are the exception, and it is a real one: the route loader in
+   * App.tsx renders a literal <style> block so its keyframes exist before the
+   * main stylesheet has applied. React inserts that as a style element, which
+   * CSP treats as inline whatever created it, so dropping 'unsafe-inline'
+   * would strip the loader's animation rather than harden anything.
    */
   it('allows inline styles, which the components genuinely use', () => {
     expect(csp.get('style-src')).toContain("'unsafe-inline'");
 
-    const withStyleBlocks = ['../src/App.tsx', '../src/components/common/Loading.tsx'];
+    const withStyleBlocks = ['../src/App.tsx'];
     for (const file of withStyleBlocks) {
       expect(read(file)).toMatch(/<style>/);
     }

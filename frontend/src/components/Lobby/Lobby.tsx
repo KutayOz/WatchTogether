@@ -1,38 +1,42 @@
 import { logger } from '../../services/logger';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { m } from 'motion/react';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { InviteModal } from '../Invitation/InviteModal';
 import type { InvitationSlots } from '../../types';
-import {
-  SectionTitle,
-  TagSticker,
-  StickerButton,
-  ComicPanel,
-  SpeedLines,
-  BurstSticker,
-  Doodle,
-  InkInput,
-  BackButton,
-} from '../manga';
+import { AppShell } from '../ui/AppShell';
+import { FocusText } from '../ui/FocusText';
+import { Projector } from '../ui/Projector';
+import { Button } from '../ui/Button';
+import { TextField } from '../ui/Field';
+import { AlertIcon, CheckIcon, LinkIcon, PlayIcon, TicketIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
+import { cascade, ease, rise } from '../ui/motion';
+import './lobby.css';
+
+/** How to say hello depends on when someone is here. */
+function greeting(now = new Date()): string {
+  const h = now.getHours();
+  if (h >= 5 && h < 12) return 'Good morning';
+  if (h >= 12 && h < 17) return 'Good afternoon';
+  if (h >= 17 && h < 23) return 'Good evening';
+  return 'Up late';
+}
 
 export function Lobby() {
   const navigate = useNavigate();
-  const { user, logout } = useAuthContext();
+  const { user } = useAuthContext();
   const [isCreating, setIsCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [invitationSlots, setInvitationSlots] = useState<InvitationSlots | null>(null);
   const [joinLink, setJoinLink] = useState('');
   const [isJoiningLink, setIsJoiningLink] = useState(false);
-
-  useEffect(() => {
-    if (user) {
-      fetchInvitationState();
-    }
-
-  }, [user]);
+  const joinRef = useRef<HTMLFormElement>(null);
+  const createErrorRef = useRef<HTMLDivElement>(null);
 
   const fetchInvitationState = async () => {
     try {
@@ -43,15 +47,38 @@ export function Lobby() {
     }
   };
 
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    api
+      .getAvailableSlots()
+      .then((slots) => {
+        if (!cancelled) setInvitationSlots(slots);
+      })
+      .catch((err) => logger.error('Failed to fetch invitation state:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (joinError) shake(joinRef.current);
+  }, [joinError]);
+  useEffect(() => {
+    if (createError) shake(createErrorRef.current);
+  }, [createError]);
+
   const handleCreateSession = async () => {
     setIsCreating(true);
-    setError(null);
+    setCreateError(null);
     try {
       const { sessionId } = await api.createSession();
+      // A beat for the screen to flare before the room replaces it — the
+      // request already took longer than this, so it costs nothing.
+      await new Promise((resolve) => window.setTimeout(resolve, 380));
       navigate(`/session/${sessionId}`, { state: { isCreator: true } });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create session');
-    } finally {
+      setCreateError(err instanceof Error ? err.message : 'Failed to create session');
       setIsCreating(false);
     }
   };
@@ -59,6 +86,7 @@ export function Lobby() {
   const handleJoinFromLink = () => {
     const trimmed = joinLink.trim();
     if (!trimmed) return;
+    setJoinError(null);
     try {
       // Resolve against our own origin. CRITICAL: we then reject any URL whose
       // origin doesn't match ours — without this check, a polished phishing link
@@ -67,7 +95,7 @@ export function Lobby() {
       // attacker is the other peer.
       const url = new URL(trimmed, window.location.origin);
       if (url.origin !== window.location.origin) {
-        setError('That invite is for a different site. Only paste WatchTogether links here.');
+        setJoinError('That link is for a different site. Only paste WatchTogether links here.');
         return;
       }
 
@@ -83,227 +111,163 @@ export function Lobby() {
         navigate(`/session/${sessionMatch[1]}`);
         return;
       }
-      setError('That link doesn\'t look like a session invite.');
+      setJoinError('That doesn’t look like a session link. It should end in /join/ and a code.');
     } catch {
-      setError('Couldn\'t read that link. Paste the whole URL.');
+      setJoinError('Couldn’t read that link. Paste the whole URL.');
     }
   };
 
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
-  };
-
   const isUnlimited = invitationSlots?.isUnlimited ?? false;
-  // For unlimited (root) users the backend sends MaxSlots = int.MaxValue.
-  // We can't iterate ~2 billion tickets in the React tree — clamp to
-  // "used tickets + 1 empty slot" so the lobby always shows one tear-off
-  // tile available to click. The next render after a new invite naturally
-  // grows by one used tile + one fresh empty.
+  // For unlimited (root) users the backend sends no cap. We can't draw
+  // infinite tickets — show the spent ones plus one fresh, so there is always
+  // one to tear off. The next render after a new invite naturally grows by one.
   const remainingSlots = isUnlimited
-    ? Number.POSITIVE_INFINITY  // sentinel for the modal's disabled check
-    : invitationSlots?.remainingSlots ?? 0;
+    ? Number.POSITIVE_INFINITY // sentinel for the modal's disabled check
+    : (invitationSlots?.remainingSlots ?? 0);
   const usedSlots = invitationSlots?.usedSlots ?? 0;
-  const totalSlots = isUnlimited
-    ? usedSlots + 1
-    : invitationSlots?.maxSlots ?? 0;
-  // The "X left" label in the corner of the ticket book. Root has no cap, and
-  // the Worker sends null rather than a sentinel numeral for that.
-  const remainingLabel = isUnlimited ? '∞' : String(remainingSlots);
+  const totalSlots = isUnlimited ? usedSlots + 1 : (invitationSlots?.maxSlots ?? 0);
+  // Root has no cap, and the Worker sends null rather than a sentinel numeral.
+  const remainingLabel = isUnlimited ? 'Unlimited' : `${remainingSlots} of ${totalSlots} left`;
 
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 380px', gap: 28 }}>
-        {/* MAIN ACTION */}
-        <div style={{ position: 'relative', paddingTop: 12, minWidth: 0 }}>
-          <div className="row" style={{ gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
-            <div className="hand" style={{ fontSize: 32, color: 'var(--ink)' }}>
-              hey,{' '}
-              <span style={{ color: 'var(--pink)', textDecoration: 'underline wavy' }}>
-                {user?.username ?? 'friend'}!
-              </span>
-            </div>
-            <TagSticker color="pink" rot={-3}>
-              {new Date().toLocaleDateString(undefined, { weekday: 'long' }).toUpperCase()}
-            </TagSticker>
-          </div>
-          <div className="hand" style={{ fontSize: 22, color: 'rgba(26,20,23,0.6)', marginTop: 4 }}>
-            ready to hang? ↓
-          </div>
-
-          {/* The big create-session button */}
-          <div
-            style={{
-              position: 'relative',
-              marginTop: 40,
-              padding: '60px 40px',
-              display: 'grid',
-              placeItems: 'center',
-            }}
+    <AppShell>
+      <div className="lobby">
+        <header className="lobby__intro">
+          <FocusText as="h1" className="lobby__hello" text={`${greeting()}, ${user?.username ?? 'friend'}`} delay={0.15} />
+          <m.p
+            className="lobby__lede"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.55, duration: 0.7, ease: ease.out }}
           >
-            <div style={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)' }}>
-              <SpeedLines count={22} radius={260} color="rgba(26,20,23,0.5)" />
-            </div>
+            Start a session and send the link to one person. It’s just the two of you.
+          </m.p>
+        </header>
 
-            <div style={{ position: 'relative', zIndex: 2 }}>
-              <StickerButton
-                color="pink"
+        <div className="lobby__grid">
+          {/* The screen. Starting a session turns the lamp all the way up. */}
+          <m.section
+            className="lobby__stage"
+            aria-labelledby="start-title"
+            initial={{ opacity: 0, scaleY: 0.04 }}
+            animate={{ opacity: 1, scaleY: 1 }}
+            transition={{ duration: 0.8, ease: ease.out, delay: 0.1 }}
+            data-flaring={isCreating ? '' : undefined}
+          >
+            <Projector className="lobby__canvas" interactive flare={isCreating} />
+            <div className="lobby__stage-content">
+              <h2 id="start-title" className="sr-only">
+                Start a session
+              </h2>
+              <Button
+                variant="primary"
                 size="xl"
-                sfx="WHOOSH!"
-                breathe
-                sparks
-                style={{ fontSize: 44, padding: '32px 56px 26px' }}
+                magnetic
+                icon={<PlayIcon size={22} />}
                 onClick={handleCreateSession}
+                loading={isCreating}
                 disabled={isCreating}
               >
-                {isCreating ? 'CREATING…' : 'CREATE A SESSION'}
-              </StickerButton>
+                {isCreating ? 'Setting up…' : 'Start a session'}
+              </Button>
+              <p className="lobby__stage-note">You’ll check your camera and mic before anyone sees you.</p>
             </div>
+          </m.section>
 
-            <div style={{ position: 'absolute', right: -10, top: 0, zIndex: 3 }}>
-              <BurstSticker bg="var(--orange)" rot={14} w={140} h={100}>
-                POW!
-              </BurstSticker>
-            </div>
-            <div style={{ position: 'absolute', left: 30, bottom: 30, zIndex: 3, transform: 'rotate(-8deg)' }}>
-              <Doodle kind="star" size={40} color="var(--orange)" />
-            </div>
-          </div>
-
-          {error && (
-            <div className="shake" style={{ marginTop: 8 }}>
-              <BurstSticker bg="var(--orange)" rot={-4} w={200} h={130}>
-                OOPS!
-              </BurstSticker>
-              <div className="hand" style={{ fontSize: 18, marginTop: 6 }}>{error}</div>
-            </div>
-          )}
-
-          {/* Join via link */}
-          <ComicPanel rotate={-0.6} shadow="ink" style={{ marginTop: 40, padding: '20px 24px' }}>
-            <div className="row" style={{ gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-              <div className="col" style={{ flex: 1, minWidth: 220, gap: 6 }}>
-                <span className="hand" style={{ fontSize: 22 }}>got an invite link?</span>
-                <InkInput
-                  placeholder="paste it here"
-                  value={joinLink}
-                  onChange={(e) => setJoinLink(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleJoinFromLink();
-                  }}
-                />
+          <m.aside className="lobby__side" variants={cascade(0.1, 0.35)} initial="hidden" animate="shown">
+            <m.section className="card lobby__panel" variants={rise} aria-labelledby="join-title">
+              <div className="lobby__panel-head">
+                <span className="lobby__panel-icon" aria-hidden="true">
+                  <LinkIcon size={18} />
+                </span>
+                <div>
+                  <h2 id="join-title" className="section-title">
+                    Have a link?
+                  </h2>
+                  <p className="section-sub">Paste the session link your friend sent.</p>
+                </div>
               </div>
-              <StickerButton
-                color="purple"
-                sfx="KLIK"
-                onClick={() => {
+              <form
+                ref={joinRef}
+                className="lobby__join"
+                onSubmit={(e) => {
+                  e.preventDefault();
                   setIsJoiningLink(true);
                   handleJoinFromLink();
                   window.setTimeout(() => setIsJoiningLink(false), 400);
                 }}
-                disabled={!joinLink.trim() || isJoiningLink}
               >
-                JOIN
-              </StickerButton>
-            </div>
-          </ComicPanel>
+                <TextField
+                  label="Session link"
+                  value={joinLink}
+                  onValueChange={(v) => {
+                    setJoinLink(v);
+                    setJoinError(null);
+                  }}
+                  placeholder="https://…/join/…"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  inputMode="url"
+                  problem={joinError}
+                />
+                <Button type="submit" variant="teal" disabled={!joinLink.trim() || isJoiningLink}>
+                  Join
+                </Button>
+              </form>
+            </m.section>
 
-          {/* Footer row — settings + admin door + logout */}
-          <div className="row" style={{ marginTop: 36, justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-            <div className="row" style={{ gap: 12 }}>
-              <BackButton onClick={handleLogout}>sign out</BackButton>
-              <button
-                onClick={() => navigate('/settings')}
-                className="hand"
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: 18,
-                  color: 'rgba(26,20,23,0.6)',
-                  textDecoration: 'underline',
-                  textDecorationStyle: 'dashed',
-                  textUnderlineOffset: 3,
-                  padding: 4,
-                }}
-              >
-                settings
-              </button>
-            </div>
-            {user?.isRootUser && (
-              <button
-                onClick={() => navigate('/admin')}
-                className="hand"
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: 22,
-                  color: 'var(--purple)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: 4,
-                }}
-              >
-                <Doodle kind="key" size={32} color="var(--purple)" />
-                secret door
-              </button>
-            )}
-          </div>
+            <m.section className="card lobby__panel" variants={rise} aria-labelledby="tickets-title">
+              <div className="lobby__panel-head">
+                <span className="lobby__panel-icon" data-tone="amber" aria-hidden="true">
+                  <TicketIcon size={18} />
+                </span>
+                <div>
+                  <h2 id="tickets-title" className="section-title">
+                    Invites
+                  </h2>
+                  <p className="section-sub">Each one lets a new person make an account.</p>
+                </div>
+                {invitationSlots && <span className="chip chip--amber lobby__left">{remainingLabel}</span>}
+              </div>
+
+              {invitationSlots ? (
+                <m.ul className="tickets" variants={cascade(0.06, 0.5)} initial="hidden" animate="shown">
+                  {Array.from({ length: totalSlots }, (_, i) => {
+                    // A slot is either spent or free. The Worker tracks one
+                    // active-link count per user, so the book shows
+                    // spent-then-free and nothing in between.
+                    const used = i < usedSlots;
+                    return (
+                      <m.li key={i} variants={rise}>
+                        <Ticket
+                          number={i + 1}
+                          used={used}
+                          total={isUnlimited ? null : totalSlots}
+                          onClick={used ? undefined : () => setShowInviteModal(true)}
+                        />
+                      </m.li>
+                    );
+                  })}
+                </m.ul>
+              ) : (
+                <p className="muted" style={{ fontSize: '0.95rem' }}>
+                  Loading your invites…
+                </p>
+              )}
+            </m.section>
+          </m.aside>
         </div>
 
-        {/* RIGHT — ticket book */}
-        <ComicPanel rotate={0.8} shadow="ink" pad={20}>
-          <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
-            <SectionTitle size={28} underline="purple">
-              YOUR TICKETS
-            </SectionTitle>
-            <span className="hand" style={{ fontSize: 16 }}>
-              {remainingLabel} left
-            </span>
+        {createError && (
+          <div ref={createErrorRef} className="notice notice--error lobby__error" role="alert">
+            <AlertIcon size={18} />
+            <span>{createError}</span>
           </div>
-
-          <div className="col" style={{ gap: 14 }}>
-            {invitationSlots ? (
-              Array.from({ length: totalSlots }, (_, i) => {
-                // A slot is either spent or free. The old pending/used split
-                // needed a per-invitation record to distinguish "link is out
-                // there" from "someone signed up through it"; the Worker tracks
-                // one active-link count per user instead, so the ticket book
-                // shows spent-then-free and nothing in between.
-                const used = i < usedSlots;
-                const pending = false;
-                const available = i >= usedSlots;
-                const label = `invite #${String(i + 1).padStart(3, '0')}`;
-                return (
-                  <Ticket
-                    key={i}
-                    label={label}
-                    used={used}
-                    pending={pending}
-                    available={available}
-                    onClick={available || pending ? () => setShowInviteModal(true) : undefined}
-                  />
-                );
-              })
-            ) : (
-              <div className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)' }}>
-                loading ticket book…
-              </div>
-            )}
-          </div>
-
-          <div
-            className="hand"
-            style={{ fontSize: 16, marginTop: 14, color: 'rgba(26,20,23,0.6)', textAlign: 'center' }}
-          >
-            ↑ tear off &amp; give to a friend ↑
-          </div>
-        </ComicPanel>
+        )}
       </div>
 
-      {/* Invite Modal */}
       <InviteModal
         isOpen={showInviteModal}
         onClose={() => setShowInviteModal(false)}
@@ -311,107 +275,59 @@ export function Lobby() {
         isUnlimited={isUnlimited}
         onInvitationSent={fetchInvitationState}
       />
-    </div>
+    </AppShell>
   );
 }
 
 /* ──────────────────────────────────────────────────────────── */
-/* Ticket — torn-off invitation slip                            */
+/* Ticket — one invite, torn off to give to someone             */
 /* ──────────────────────────────────────────────────────────── */
 
 interface TicketProps {
-  label: string;
-  used?: boolean;
-  pending?: boolean;
-  available?: boolean;
+  number: number;
+  used: boolean;
+  /** Null for root, who has no cap. */
+  total: number | null;
   onClick?: () => void;
 }
 
-function Ticket({ label, used, pending, available, onClick }: TicketProps) {
-  const clickable = !!(available || pending);
-  const baseRot = used ? -0.6 : pending ? 0 : 0.6;
-
-  const background =
-    used ? 'rgba(26,20,23,0.06)' :
-    pending ? 'rgba(255,122,41,0.12)' :
-    'var(--cream)';
-
-  const boxShadow =
-    available ? '3px 3px 0 var(--pink)' :
-    pending ? '3px 3px 0 var(--orange)' :
-    'none';
-
-  const checkboxBg =
-    available ? 'var(--pink)' :
-    pending ? 'var(--orange)' :
-    'transparent';
-
-  const subtitle =
-    used ? 'already gifted' :
-    pending ? 'link out — tap to manage' :
-    'tear me off!';
-
-  return (
-    <div
-      onClick={onClick}
-      onMouseEnter={(e) => {
-        if (clickable) e.currentTarget.style.transform = 'rotate(0) translateY(-2px)';
-      }}
-      onMouseLeave={(e) => {
-        if (clickable) e.currentTarget.style.transform = `rotate(${baseRot}deg)`;
-      }}
-      style={{
-        position: 'relative',
-        border: '2.5px solid var(--ink)',
-        borderRadius: 4,
-        padding: '12px 14px',
-        background,
-        transform: `rotate(${baseRot}deg)`,
-        cursor: clickable ? 'pointer' : 'default',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: 12,
-        overflow: 'hidden',
-        transition: 'transform .15s, box-shadow .15s',
-        boxShadow,
-      }}
-    >
-      <span
-        style={{ position: 'absolute', left: '70%', top: 0, bottom: 0, borderLeft: '2px dashed var(--ink)' }}
-        aria-hidden="true"
-      />
-      <div className="row" style={{ gap: 10 }}>
-        <span
-          style={{
-            width: 24,
-            height: 24,
-            border: '2.5px solid var(--ink)',
-            borderRadius: 4,
-            display: 'grid',
-            placeItems: 'center',
-            background: checkboxBg,
-          }}
-          aria-hidden="true"
-        >
-          {used && <Doodle kind="x" size={18} />}
+function Ticket({ number, used, total, onClick }: TicketProps) {
+  const serial = `No. ${String(number).padStart(3, '0')}`;
+  if (used) {
+    return (
+      <div className="ticket" data-state="used">
+        <span className="ticket__body">
+          <span className="ticket__no">{serial}</span>
+          <span className="ticket__title">Admit one</span>
+          <span className="ticket__meta">Given away</span>
         </span>
-        <div className="col" style={{ gap: 0 }}>
-          <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 16, letterSpacing: 1 }}>{label}</span>
-          <span
-            className="hand"
-            style={{
-              fontSize: 16,
-              color: used ? 'rgba(26,20,23,0.5)' : pending ? 'var(--orange-deep)' : 'var(--ink)',
-              textDecoration: used ? 'line-through' : 'none',
-            }}
-          >
-            {subtitle}
-          </span>
-        </div>
+        <span className="ticket__stub" aria-hidden="true">
+          <CheckIcon size={18} />
+        </span>
+        <span className="ticket__stamp" aria-hidden="true">
+          Used
+        </span>
       </div>
-      {available && <Doodle kind="sparkle" size={20} color="var(--orange)" />}
-      {pending && <Doodle kind="envelope" size={20} color="var(--orange)" />}
-    </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="ticket"
+      data-state="available"
+      data-tilt=""
+      data-light=""
+      onClick={onClick}
+      aria-label={total ? `Make an invite link (invite ${number} of ${total})` : 'Make an invite link'}
+    >
+      <span className="ticket__body">
+        <span className="ticket__no">{serial}</span>
+        <span className="ticket__title">Admit one</span>
+        <span className="ticket__meta">Make an invite link</span>
+      </span>
+      <span className="ticket__stub" aria-hidden="true">
+        <TicketIcon size={20} />
+      </span>
+    </button>
   );
 }

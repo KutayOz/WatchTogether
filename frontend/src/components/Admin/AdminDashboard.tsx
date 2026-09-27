@@ -1,17 +1,16 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { AnimatePresence, m } from 'motion/react';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { UserTree } from './UserTree';
 import { UserTable } from './UserTable';
 import { DemoRequests } from './DemoRequests';
-import {
-  SectionTitle,
-  TagSticker,
-  ComicPanel,
-  BackButton,
-} from '../manga';
+import { AppShell } from '../ui/AppShell';
+import { AlertIcon, InboxIcon, TreeIcon, UsersIcon } from '../ui/icons';
+import { ease, spring } from '../ui/motion';
 import type { AdminDemoRequest, AdminUser, UserTreeResponse } from '../../types';
+import './admin.css';
 
 /**
  * Three tabs. The invitations tab stays gone — invites are a single self-serve
@@ -61,122 +60,91 @@ export function AdminDashboard() {
     }
   };
 
+  // The count is the pending ones — a dealt-with request is not a thing
+  // anybody needs to be nudged about.
+  const pending = demoRequests.filter((r) => r.status === 'pending').length;
 
-
-  if (isLoading) {
-    return (
-      <div className="app" style={{ display: 'grid', placeItems: 'center', minHeight: '70vh' }}>
-        <div className="hand" style={{ fontSize: 28, color: 'var(--purple)' }}>
-          opening the backroom…
-        </div>
-      </div>
-    );
-  }
+  const tabs: Array<{ id: Tab; label: string; count?: number; icon: React.ReactNode }> = [
+    { id: 'tree', label: 'Invite tree', icon: <TreeIcon size={18} /> },
+    { id: 'users', label: 'People', count: users.length, icon: <UsersIcon size={18} /> },
+    { id: 'demo', label: 'Requests', count: pending, icon: <InboxIcon size={18} /> },
+  ];
 
   return (
-    <div className="app" style={{ position: 'relative' }}>
-      {/* Purple wash background */}
-      <div
-        style={{ position: 'absolute', inset: -40, pointerEvents: 'none', zIndex: 0 }}
-        aria-hidden="true"
+    <AppShell>
+      <header className="page-head">
+        <div>
+          <h1>Admin</h1>
+          <p className="page-head__sub">Who’s here, who invited whom, and who’s asking to join.</p>
+        </div>
+      </header>
+
+      {error && (
+        <div className="notice notice--error" role="alert" style={{ marginBottom: 18 }}>
+          <AlertIcon size={18} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      <div className="admin-tabs" role="tablist" aria-label="Admin sections">
+        {tabs.map((tab) => {
+          const active = tab.id === activeTab;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              id={`tab-${tab.id}`}
+              aria-selected={active}
+              aria-controls={`panel-${tab.id}`}
+              className="admin-tab"
+              data-light=""
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {active && (
+                <m.span layoutId="admin-tab" className="admin-tab__pill" transition={spring.snappy} aria-hidden="true" />
+              )}
+              {tab.icon}
+              <span>{tab.label}</span>
+              {tab.count !== undefined && !isLoading && (
+                <span className="admin-tab__count tabular" data-hot={tab.id === 'demo' && tab.count > 0 ? '' : undefined}>
+                  {tab.count}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <section
+        className="card admin-panel"
+        role="tabpanel"
+        id={`panel-${activeTab}`}
+        aria-labelledby={`tab-${activeTab}`}
       >
-        <svg width="100%" height="100%" preserveAspectRatio="none">
-          <rect width="100%" height="100%" fill="url(#tone-purple)" opacity="0.12" />
-        </svg>
-      </div>
-
-      <div style={{ position: 'relative', zIndex: 1 }}>
-        <div className="row" style={{ alignItems: 'center', gap: 16, flexWrap: 'wrap', marginBottom: 18 }}>
-          <SectionTitle size={42} underline="purple">
-            BACKROOM
-          </SectionTitle>
-          <TagSticker color="purple" rot={-4}>
-            VIP
-          </TagSticker>
-          <TagSticker color="orange" rot={3}>
-            SECRET
-          </TagSticker>
-          <span className="hand" style={{ fontSize: 22, color: 'var(--purple)' }}>
-            shh, admins only
-          </span>
-          <span style={{ flex: 1 }} />
-          <BackButton color="purple" onClick={() => navigate('/')}>
-            back to the regular world
-          </BackButton>
-        </div>
-
-        {error && (
-          <div
-            className="shake"
-            style={{
-              marginBottom: 16,
-              padding: '12px 16px',
-              border: '3px solid var(--ink)',
-              background: 'var(--orange)',
-              fontFamily: 'var(--font-body)',
-              fontWeight: 700,
-            }}
-          >
-            {error}
+        {isLoading ? (
+          <div className="admin-loading" role="status">
+            <span className="btn__spinner" aria-hidden="true" />
+            Loading…
           </div>
+        ) : (
+          <AnimatePresence mode="wait" initial={false}>
+            <m.div
+              key={activeTab}
+              initial={{ opacity: 0, y: 10, filter: 'blur(4px)' }}
+              animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+              exit={{ opacity: 0, y: -6, filter: 'blur(2px)', transition: { duration: 0.14 } }}
+              transition={{ duration: 0.35, ease: ease.out }}
+            >
+              {activeTab === 'tree' && (
+                <UserTree data={treeData?.root ?? null} totalUsers={treeData?.totalUsers ?? 0} />
+              )}
+              {activeTab === 'users' && <UserTable users={users} onRefresh={loadData} />}
+              {activeTab === 'demo' && <DemoRequests requests={demoRequests} onRefresh={loadData} />}
+            </m.div>
+          </AnimatePresence>
         )}
-
-        {/* Tabs */}
-        <div className="row" style={{ gap: 10, marginBottom: 22, flexWrap: 'wrap' }}>
-          <TabBtn active={activeTab === 'tree'} onClick={() => setActiveTab('tree')}>
-            USER TREE
-          </TabBtn>
-          <TabBtn active={activeTab === 'users'} onClick={() => setActiveTab('users')}>
-            USERS ({users.length})
-          </TabBtn>
-          <TabBtn active={activeTab === 'demo'} onClick={() => setActiveTab('demo')}>
-            {/* The count is the pending ones — a dealt-with request is not a
-                thing anybody needs to be nudged about. */}
-            DEMO REQUESTS ({demoRequests.filter((r) => r.status === 'pending').length})
-          </TabBtn>
-        </div>
-
-        {/* Content panel */}
-        <ComicPanel rotate={-0.3} shadow="purple" pad={24}>
-          {activeTab === 'tree' && treeData && <UserTree data={treeData.root} totalUsers={treeData.totalUsers} />}
-
-          {activeTab === 'users' && <UserTable users={users} onRefresh={loadData} />}
-
-          {activeTab === 'demo' && <DemoRequests requests={demoRequests} onRefresh={loadData} />}
-
-        </ComicPanel>
-      </div>
-    </div>
-  );
-}
-
-function TabBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        fontFamily: 'var(--font-sfx)',
-        fontSize: 14,
-        letterSpacing: 1.2,
-        padding: '8px 14px',
-        background: active ? 'var(--ink)' : 'var(--cream)',
-        color: active ? 'var(--cream)' : 'var(--ink)',
-        border: '3px solid var(--ink)',
-        borderRadius: 999,
-        cursor: 'pointer',
-        boxShadow: active ? '3px 3px 0 var(--pink)' : '3px 3px 0 var(--ink)',
-        transform: active ? 'rotate(0)' : 'rotate(-1.5deg)',
-        transition: 'transform .15s, box-shadow .15s, background .15s',
-      }}
-      onMouseEnter={(e) => {
-        if (!active) e.currentTarget.style.transform = 'rotate(0) translateY(-2px)';
-      }}
-      onMouseLeave={(e) => {
-        if (!active) e.currentTarget.style.transform = 'rotate(-1.5deg)';
-      }}
-    >
-      {children}
-    </button>
+      </section>
+    </AppShell>
   );
 }

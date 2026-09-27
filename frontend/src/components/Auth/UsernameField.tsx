@@ -3,7 +3,7 @@ import {
   USERNAME_MAX_LENGTH,
   normalizeUsername,
 } from '@shared/identity';
-import { NotebookField } from '../manga';
+import { TextField } from '../ui/Field';
 
 /**
  * Username input, validated against the Worker's own rules.
@@ -18,7 +18,7 @@ import { NotebookField } from '../manga';
  * here can be bypassed.
  */
 export function UsernameField({
-  label = 'username:',
+  label = 'Username',
   value,
   onChange,
   disabled,
@@ -35,38 +35,27 @@ export function UsernameField({
   const problem = result && !result.ok ? USERNAME_ERROR_MESSAGES[result.error] : null;
 
   return (
-    <div>
-      <NotebookField
-        label={label}
-        value={value}
-        onChange={onChange}
-        placeholder="pick a name"
-        disabled={disabled}
-        autoFocus={autoFocus}
-        maxLength={USERNAME_MAX_LENGTH}
-      />
-
-      {problem ? (
-        <div
-          className="hand"
-          aria-live="polite"
-          style={{ marginTop: 4, color: 'var(--orange-deep)', fontSize: 18 }}
-        >
-          · {problem}
-        </div>
-      ) : (
-        <div
-          className="hand"
-          style={{ marginTop: 4, fontSize: 17, color: 'rgba(26,20,23,0.55)' }}
-        >
-          {/* Explaining the discriminator up front stops the number reading as a
-              mistake when it appears on the next screen. */}
-          you'll get a number too — like{' '}
-          <span style={{ color: 'var(--purple)' }}>{trimmed || 'name'}#0042</span> — so two people
-          can share a name
-        </div>
-      )}
-    </div>
+    <TextField
+      label={label}
+      value={value}
+      onValueChange={onChange}
+      placeholder="Pick a name"
+      disabled={disabled}
+      autoFocus={autoFocus}
+      maxLength={USERNAME_MAX_LENGTH}
+      autoComplete="username"
+      autoCapitalize="none"
+      autoCorrect="off"
+      spellCheck={false}
+      problem={problem}
+      hint={
+        // Explaining the discriminator up front stops the number reading as a
+        // mistake when it appears on the next screen.
+        <>
+          You also get a number, like <span style={{ color: 'var(--amber)' }}>{trimmed || 'name'}#0042</span>, so
+          two people can share a name.
+        </>
+      }
+    />
   );
 }
-

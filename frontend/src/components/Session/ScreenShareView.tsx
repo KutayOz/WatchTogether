@@ -1,8 +1,12 @@
 import { logger } from '../../services/logger';
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, type ReactNode } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { MediaControls, type MediaControlsQualityProps } from '../Controls/MediaControls';
 import { QualityIndicator } from '../Quality/QualityIndicator';
-import { StickerButton, BurstSticker, Doodle, SFX } from '../manga';
+import { Button, IconButton } from '../ui/Button';
+import { AudioWaveIcon, ExpandIcon, MicOffIcon, ScreenIcon, ShrinkIcon } from '../ui/icons';
+import { useAudioLevel } from '../../hooks/useAudioLevel';
+import { canCaptureScreen } from '../../utils/capabilities';
 import type { QualityLevel, Viewport } from '../../types';
 
 /**
@@ -28,8 +32,8 @@ interface ScreenShareViewProps extends MediaControlsQualityProps {
   onLeave: () => void;
   canShare: boolean;
   remoteCameraStream: MediaStream | null;
-  /** Local camera stream — used for the picture-in-self tile in the
-   *  "peer-large" empty state (no screen share active). */
+  /** Local camera stream — used for the self view in the "peer-large"
+   *  state (no screen share active). */
   localStream?: MediaStream | null;
   peerDisplayName: string | null;
   peerHasLeft: boolean;
@@ -52,6 +56,8 @@ interface ScreenShareViewProps extends MediaControlsQualityProps {
   onViewportChange?: (viewport: Viewport | null) => void;
   /** Build and show the debug report. Passed through to the fullscreen controls. */
   onDebugReport?: () => void;
+  /** What to show while nobody else is here — the room's invite card. */
+  waitingSlot?: ReactNode;
 }
 
 export function ScreenShareView({
@@ -84,6 +90,7 @@ export function ScreenShareView({
   onLocalCursor,
   onViewportChange,
   onDebugReport,
+  waitingSlot,
   screenShareQuality,
   onQualityChange,
   uplink,
@@ -435,50 +442,37 @@ export function ScreenShareView({
     }
   }, []);
 
+  /* The waiting chip is a button, not a label. Waiting used to be a dead
+     end: it disabled every other way back to sharing, so a request the peer
+     never answered could only be escaped by leaving the session. */
+  const approvalChip = (
+    <AnimatePresence>
+      {isWaitingForApproval && (
+        <m.div
+          className="approval-chip"
+          role="status"
+          initial={{ opacity: 0, y: -12, scale: 0.95 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -8 }}
+        >
+          <span className="chip__dot" data-live="" aria-hidden="true" />
+          <span>Waiting for {peerDisplayName ?? 'them'} to allow your screen</span>
+          <Button size="sm" variant="ghost" onClick={onCancelRequest}>
+            Cancel
+          </Button>
+        </m.div>
+      )}
+    </AnimatePresence>
+  );
+
   /* ────────────────────────────────────────────────────────── */
-  /* Empty state — no one is sharing                            */
+  /* Nobody is sharing                                          */
   /* ────────────────────────────────────────────────────────── */
   if (!screenStream && !sharerName) {
-    if (peerHasLeft) {
-      return (
-        <div
-          style={{
-            height: '100%',
-            display: 'grid',
-            placeItems: 'center',
-            border: '4px solid var(--ink)',
-            borderRadius: 6,
-            background: 'var(--cream)',
-            boxShadow: '6px 6px 0 var(--ink)',
-            position: 'relative',
-            overflow: 'hidden',
-          }}
-        >
-          <div style={{ textAlign: 'center' }}>
-            <BurstSticker bg="var(--orange)" rot={-4} w={240} h={150}>
-              BYE!
-            </BurstSticker>
-            <p className="hand" style={{ fontSize: 22, marginTop: 18 }}>
-              peer left the session
-            </p>
-            <p className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)', marginTop: 4 }}>
-              share the session link to invite someone
-            </p>
-          </div>
-        </div>
-      );
-    }
-
-    // ─────────────── Peer-large layout (no screen share, peer is here) ───────────────
-    // FaceTime / Around pattern: when there's nothing being shared, we don't
-    // want the user staring at a "nobody's sharing" card while their friend's
-    // face is shrunk to a 280px sidebar tile. Make the peer the centerpiece —
-    // their video fills the main canvas — and shrink the user themselves to
-    // a small picture-in-self in the corner. Symmetric 50/50 grids feel empty
-    // for 2-person calls; this asymmetric stack feels intimate. The SHARE
-    // button moves to a floating sticker on the bottom so the actual face
-    // doesn't get crowded out.
-    if (peerDisplayName && remoteCameraStream) {
+    // FaceTime / Around pattern: when there's nothing being shared, the
+    // other person IS the picture. You shrink to a small window you can park
+    // in any corner.
+    if (!peerHasLeft && peerDisplayName && remoteCameraStream) {
       return (
         <PeerLargeView
           peerStream={remoteCameraStream}
@@ -486,378 +480,144 @@ export function ScreenShareView({
           peerIsMuted={!!peerIsMuted}
           peerIsCameraOff={!!peerIsCameraOff}
           localStream={localStream ?? null}
-          onRequestShare={onRequestShare}
-          canRequestShare={canRequestShare}
-          isWaitingForApproval={isWaitingForApproval}
-          onCancelRequest={onCancelRequest}
+          approvalChip={approvalChip}
         />
       );
     }
 
-    // Fall-through: no peer yet, or peer joined but no camera stream at all.
+    const shareButton =
+      canRequestShare && !isWaitingForApproval && canCaptureScreen() ? (
+        <Button variant="secondary" icon={<ScreenIcon size={18} />} onClick={onRequestShare}>
+          Share your screen
+        </Button>
+      ) : null;
+
     return (
-      <div
-        style={{
-          height: '100%',
-          display: 'grid',
-          placeItems: 'center',
-          border: '4px solid var(--ink)',
-          borderRadius: 6,
-          background: 'var(--cream)',
-          boxShadow: '6px 6px 0 var(--ink)',
-          position: 'relative',
-          overflow: 'hidden',
-        }}
-      >
-        {/* Faint screentone background */}
-        <svg
-          aria-hidden="true"
-          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0.25, pointerEvents: 'none' }}
-        >
-          <rect width="100%" height="100%" fill="url(#tone-lines)" />
-        </svg>
-        <div style={{ textAlign: 'center', position: 'relative', padding: 24 }}>
-          <Doodle kind="tv" size={92} color="var(--purple)" />
-          <p className="hand" style={{ fontSize: 22, color: 'rgba(26,20,23,0.7)', marginTop: 12 }}>
-            {peerDisplayName ? `waiting for ${peerDisplayName}'s camera…` : "nobody's here yet"}
-          </p>
-          <div style={{ marginTop: 18, display: 'flex', justifyContent: 'center' }}>
-            {canRequestShare && !isWaitingForApproval && (
-              <StickerButton color="pink" size="md" sfx="WHRR" onClick={onRequestShare}>
-                SHARE MY SCREEN
-              </StickerButton>
+      <div className="stage">
+        {approvalChip}
+        <div className="stage__empty">
+          <m.div
+            className="stage__empty-inner"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5 }}
+          >
+            {peerHasLeft ? (
+              <>
+                <h2>They left</h2>
+                <p>The session is still open. Send a new invite to bring someone back.</p>
+                {waitingSlot}
+              </>
+            ) : peerDisplayName ? (
+              <>
+                <span className="avatar" data-who="them" style={{ ['--av' as string]: '72px' }} aria-hidden="true">
+                  {peerDisplayName.charAt(0).toUpperCase()}
+                </span>
+                <h2>{peerDisplayName} is here</h2>
+                <p>Waiting for their camera. Their voice may already be coming through.</p>
+              </>
+            ) : (
+              waitingSlot
             )}
-            {isWaitingForApproval && (
-              /* A button, not a label. Waiting used to be a dead end: it
-                 disabled every other way back to sharing, so a request the peer
-                 never answered could only be escaped by leaving the session. */
-              <button
-                type="button"
-                className="hand"
-                onClick={onCancelRequest}
-                title="cancel the request"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  fontSize: 20,
-                  color: 'var(--purple)',
-                  background: 'none',
-                  border: 'none',
-                  padding: 0,
-                  cursor: 'pointer',
-                  font: 'inherit',
-                }}
-              >
-                <span style={{ animation: 'speakPulse 1.2s ease-in-out infinite' }}>•</span>
-                waiting for approval… <span style={{ opacity: 0.6 }}>(cancel)</span>
-              </button>
-            )}
-          </div>
+            {shareButton}
+          </m.div>
         </div>
       </div>
     );
   }
 
   /* ────────────────────────────────────────────────────────── */
-  /* Active screen share — the big presentation panel           */
+  /* A screen is being shared                                   */
   /* ────────────────────────────────────────────────────────── */
+  const indicatorLevel = (isLocalSharing ? peerQualityLevel : qualityLevel) ?? null;
+
   return (
-    <div
-      ref={containerRef}
-      onMouseMove={handleMouseMove}
-      style={{
-        height: '100%',
-        position: 'relative',
-        background: 'var(--ink)',
-        border: '4px solid var(--ink)',
-        borderRadius: 6,
-        overflow: 'hidden',
-        boxShadow: '8px 8px 0 var(--ink)',
-      }}
-    >
+    <div ref={containerRef} className="stage stage--share" onMouseMove={handleMouseMove}>
       <video
         ref={attachVideo}
+        data-ambient=""
         autoPlay
         playsInline
         muted
         onDoubleClick={toggleFullscreen}
         onClick={handleScreenTap}
-        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       />
 
       {!isLocalSharing && <audio ref={audioRef} autoPlay playsInline />}
 
-      {/* Peer cursor halo — Figma-style multiplayer pointer. Translated
-          via percent-based left/top from the normalized 0..1 coordinates
-          the peer sent. pointerEvents:none so it never blocks our own
-          interactions. */}
+      {/* The lamp coming up on a new reel. Keyed on the sharer so a second
+          share gets its own flash. */}
+      <m.div
+        key={sharerName ?? 'share'}
+        className="stage__flash"
+        aria-hidden="true"
+        initial={{ opacity: 0.9 }}
+        animate={{ opacity: 0 }}
+        transition={{ duration: 1.1, ease: [0.22, 1, 0.36, 1] }}
+      />
+
+      {/* The other person's pointer over the shared content — their light.
+          Normalized coordinates, projected onto our own box. */}
       {peerCursor && (
         <div
+          className="cursor"
           aria-hidden="true"
-          style={{
-            position: 'absolute',
-            left: `${peerCursor.x * 100}%`,
-            top: `${peerCursor.y * 100}%`,
-            transform: 'translate(-6px, -6px)',
-            pointerEvents: 'none',
-            zIndex: 4,
-            transition: 'left 80ms linear, top 80ms linear',
-          }}
+          style={{ left: `${peerCursor.x * 100}%`, top: `${peerCursor.y * 100}%` }}
         >
-          {/* Halo dot */}
-          <div
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: 999,
-              background: 'var(--orange)',
-              border: '2.5px solid var(--ink)',
-              boxShadow: '0 0 0 6px rgba(255, 122, 41, 0.25)',
-            }}
-          />
-          {/* Name tag, leans 2° */}
-          <div
-            style={{
-              position: 'absolute',
-              left: 18,
-              top: 14,
-              padding: '1px 6px',
-              background: 'var(--orange)',
-              color: 'var(--ink)',
-              border: '2px solid var(--ink)',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 11,
-              letterSpacing: 0.5,
-              whiteSpace: 'nowrap',
-              transform: 'rotate(2deg)',
-            }}
-          >
-            {peerCursor.name}
-          </div>
+          <div className="cursor__dot" />
+          <div className="cursor__name">{peerCursor.name}</div>
         </div>
       )}
 
-      {/* Highlighter draw-in around the perimeter. In fullscreen we drop it —
-          the pink frame around shared content competes with the content itself,
-          and the whole point of fullscreen is "let me focus." On mouse idle
-          (overlay-hidden state) we fade it for the same reason. Faded via
-          opacity so the animation isn't re-triggered when overlays come back. */}
-      <svg
-        aria-hidden="true"
-        style={{
-          position: 'absolute',
-          inset: 0,
-          width: '100%',
-          height: '100%',
-          pointerEvents: 'none',
-          opacity: isFullscreen || hideOverlay ? 0 : 1,
-          transition: 'opacity 200ms ease',
-        }}
-        viewBox="0 0 800 450"
-        preserveAspectRatio="none"
-      >
-        <rect
-          x="6"
-          y="6"
-          width="788"
-          height="438"
-          fill="none"
-          stroke="var(--pink)"
-          strokeWidth="6"
-          strokeDasharray="1200"
-          style={{ animation: 'highlighterDraw 1.4s ease-out forwards', opacity: 0.6 }}
-        />
-      </svg>
-
-      {/* Top-left badges */}
       {!hideOverlay && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 12,
-            left: 12,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            flexWrap: 'wrap',
-          }}
-        >
-          {/* Sharing badge */}
-          <div
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: '6px 12px',
-              background: 'var(--orange)',
-              border: '3px solid var(--ink)',
-              borderRadius: 999,
-              boxShadow: '3px 3px 0 var(--ink)',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 14,
-              letterSpacing: 1,
-              color: 'var(--ink)',
-              transform: 'rotate(-2deg)',
-            }}
-          >
-            <span
-              style={{
-                width: 8,
-                height: 8,
-                background: 'var(--ink)',
-                borderRadius: 999,
-                animation: 'speakPulse 1.2s ease-in-out infinite',
-              }}
-              aria-hidden="true"
-            />
-            {isLocalSharing ? 'YOU ARE SHARING' : `${sharerName} IS SHARING`}
-          </div>
-
-          {/* Audio available badge */}
+        <div className="stage__chips">
+          <span className="chip chip--glass">
+            <span className="chip__dot" data-live="" style={{ color: 'var(--exit)' }} aria-hidden="true" />
+            {isLocalSharing ? 'You’re sharing your screen' : `${sharerName} is sharing`}
+          </span>
           {!isLocalSharing && hasAudioTrack && (
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '6px 10px',
-                background: 'var(--pink)',
-                border: '3px solid var(--ink)',
-                borderRadius: 999,
-                boxShadow: '3px 3px 0 var(--ink)',
-                fontFamily: 'var(--font-sfx)',
-                fontSize: 13,
-                letterSpacing: 1,
-                color: 'var(--ink)',
-                transform: 'rotate(1deg)',
-              }}
-            >
-              ♪ AUDIO
-            </div>
+            <span className="chip chip--glass">
+              <AudioWaveIcon size={15} />
+              Audio
+            </span>
           )}
-
-          {/* Quality indicator */}
-          {screenStream && (isLocalSharing ? peerQualityLevel : qualityLevel) && (
-            <QualityIndicator
-              level={(isLocalSharing ? peerQualityLevel : qualityLevel) ?? null}
-              showLabel={false}
-              size="sm"
-            />
-          )}
+          {screenStream && indicatorLevel && <QualityIndicator level={indicatorLevel} />}
         </div>
       )}
 
-      {/* Top-right SFX + fullscreen button */}
       {!hideOverlay && !isFullscreen && (
-        <>
-          <div
-            style={{
-              position: 'absolute',
-              top: 28,
-              right: 80,
-              pointerEvents: 'none',
-              zIndex: 3,
-            }}
+        <div className="stage__corner">
+          <IconButton
+            label={!screenStream ? 'No screen to show fullscreen' : 'Fullscreen'}
+            size="sm"
+            tip="below"
+            onClick={toggleFullscreen}
+            disabled={!screenStream}
           >
-            <SFX size={28} color="var(--cream)" tone="pink" stroke={2} angle={8}>
-              FEATURE!
-            </SFX>
-          </div>
-          <div style={{ position: 'absolute', top: 12, right: 12 }}>
-            <button
-              type="button"
-              onClick={toggleFullscreen}
-              disabled={!screenStream}
-              title={!screenStream ? 'no screen to fullscreen' : 'fullscreen'}
-              style={{
-                width: 40,
-                height: 40,
-                display: 'grid',
-                placeItems: 'center',
-                background: 'var(--cream)',
-                color: 'var(--ink)',
-                border: '3px solid var(--ink)',
-                borderRadius: 8,
-                cursor: screenStream ? 'pointer' : 'not-allowed',
-                boxShadow: '3px 3px 0 var(--ink)',
-                transform: 'rotate(-3deg)',
-                padding: 0,
-              }}
-            >
-              <svg width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M3 8 L 3 3 L 8 3 M16 3 L 21 3 L 21 8 M21 16 L 21 21 L 16 21 M8 21 L 3 21 L 3 16" />
-              </svg>
-            </button>
-          </div>
-        </>
+            <ExpandIcon size={17} />
+          </IconButton>
+        </div>
       )}
 
-      {/* Remote camera PiP in fullscreen */}
+      {/* Their camera, floating over the share in fullscreen. */}
       {isFullscreen && remoteCameraStream && showPeerCamera && (
         <div
           ref={pipRef}
+          className="fs-pip"
           onMouseDown={handlePipMouseDown}
           style={{
-            position: 'absolute',
-            bottom: 80,
-            right: 16,
-            width: 200,
-            height: 'auto',
-            aspectRatio: '16/9',
-            transform: `translate(${pipPosition.x}px, ${pipPosition.y}px) rotate(-1.5deg)`,
+            transform: `translate(${pipPosition.x}px, ${pipPosition.y}px)`,
             cursor: isDragging ? 'grabbing' : 'grab',
-            border: '3.5px solid var(--ink)',
-            background: 'var(--cream)',
-            boxShadow: '6px 6px 0 var(--ink)',
-            overflow: 'hidden',
-            userSelect: 'none',
           }}
         >
-          <video
-            ref={remoteCameraRef}
-            autoPlay
-            playsInline
-            muted
-            style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }}
-          />
-          <div
-            style={{
-              position: 'absolute',
-              left: 6,
-              bottom: 6,
-              background: 'var(--cream)',
-              border: '2.5px solid var(--ink)',
-              padding: '2px 8px',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 12,
-              pointerEvents: 'none',
-            }}
-          >
-            {peerDisplayName ?? 'peer'}
-          </div>
+          <video ref={remoteCameraRef} autoPlay playsInline muted />
+          <span className="chip chip--glass tile__name">{peerDisplayName ?? 'Them'}</span>
         </div>
       )}
 
       {/* Fullscreen controls overlay */}
       {isFullscreen && (
-        <div
-          style={{
-            position: 'absolute',
-            bottom: 0,
-            left: 0,
-            right: 0,
-            padding: 14,
-            background: 'linear-gradient(to top, rgba(26,20,23,0.8), transparent)',
-            opacity: hideOverlay ? 0 : 1,
-            pointerEvents: hideOverlay ? 'none' : 'auto',
-            transition: 'opacity .3s',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 8,
-          }}
-        >
+        <div className="fs-controls" data-hidden={hideOverlay ? '' : undefined}>
           <MediaControls
             isMuted={isMuted}
             isCameraOn={isCameraOn}
@@ -891,25 +651,9 @@ export function ScreenShareView({
             peerVolume={peerVolume}
             onPeerVolumeChange={onPeerVolumeChange}
           />
-          <button
-            type="button"
-            onClick={toggleFullscreen}
-            title="exit fullscreen (ESC)"
-            style={{
-              padding: '6px 16px',
-              background: 'var(--cream)',
-              border: '3px solid var(--ink)',
-              borderRadius: 999,
-              fontFamily: 'var(--font-hand)',
-              fontWeight: 700,
-              fontSize: 18,
-              color: 'var(--ink)',
-              cursor: 'pointer',
-              boxShadow: '3px 3px 0 var(--ink)',
-            }}
-          >
-            ↩ exit fullscreen
-          </button>
+          <Button size="sm" variant="secondary" icon={<ShrinkIcon size={16} />} onClick={toggleFullscreen}>
+            Exit fullscreen
+          </Button>
         </div>
       )}
     </div>
@@ -917,17 +661,7 @@ export function ScreenShareView({
 }
 
 /* ────────────────────────────────────────────────────────────── */
-/* PeerLargeView — "asymmetric stack" empty state                  */
-/*                                                                 */
-/* When there's a peer in the call but nobody is sharing a screen, */
-/* we'd rather not stare at a "nobody's showing their screen yet"  */
-/* card. The peer's face is the actual content of a 2-person call. */
-/* So we use the main panel as the peer's stage and shrink the     */
-/* user themselves into a tilted sticker tile in the corner —      */
-/* same pattern FaceTime / Around / Discord stream use.            */
-/*                                                                 */
-/* The SHARE button floats over the bottom so it's still reachable */
-/* without clipping the face mid-frame.                            */
+/* PeerLargeView — the other person, filling the stage            */
 /* ────────────────────────────────────────────────────────────── */
 
 interface PeerLargeViewProps {
@@ -936,228 +670,188 @@ interface PeerLargeViewProps {
   peerIsMuted: boolean;
   peerIsCameraOff: boolean;
   localStream: MediaStream | null;
-  onRequestShare: () => void;
-  canRequestShare: boolean;
-  isWaitingForApproval: boolean;
-  onCancelRequest: () => void;
+  approvalChip: ReactNode;
 }
 
-function PeerLargeView({
-  peerStream,
-  peerName,
-  peerIsMuted,
-  peerIsCameraOff,
-  localStream,
-  onRequestShare,
-  canRequestShare,
-  isWaitingForApproval,
-  onCancelRequest,
-}: PeerLargeViewProps) {
+function PeerLargeView({ peerStream, peerName, peerIsMuted, peerIsCameraOff, localStream, approvalChip }: PeerLargeViewProps) {
   const peerVideoRef = useRef<HTMLVideoElement>(null);
-  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+
+  // Their voice lights the frame.
+  useAudioLevel(peerStream, stageRef);
 
   useEffect(() => {
     if (peerVideoRef.current) peerVideoRef.current.srcObject = peerStream;
   }, [peerStream]);
 
-  useEffect(() => {
-    if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
-  }, [localStream]);
-
   return (
-    <div
-      style={{
-        position: 'relative',
-        height: '100%',
-        border: '4px solid var(--ink)',
-        borderRadius: 6,
-        background: 'var(--ink)',
-        boxShadow: '8px 8px 0 var(--ink)',
-        overflow: 'hidden',
-      }}
-    >
-      {/* Peer video — fills the canvas */}
+    <div className="stage stage--peer" ref={stageRef}>
       <video
         ref={peerVideoRef}
+        data-ambient=""
         autoPlay
         playsInline
         muted
-        style={{
-          width: '100%',
-          height: '100%',
-          objectFit: 'cover',
-          background: 'var(--cream-deep)',
-          opacity: peerIsCameraOff ? 0 : 1,
-          transition: 'opacity 150ms ease',
-        }}
+        style={{ opacity: peerIsCameraOff ? 0 : 1, transition: 'opacity 200ms ease' }}
       />
 
-      {/* Camera-off curtain — keeps the <video> mounted so it lights up
-          instantly when peer flips their camera back on. */}
-      {peerIsCameraOff && (
-        <div
-          aria-label={`${peerName}'s camera is off`}
-          style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'grid',
-            placeItems: 'center',
-            background: 'var(--cream-deep)',
-          }}
-        >
-          <div style={{ textAlign: 'center' }}>
-            <Doodle kind="z" size={64} color="rgba(26,20,23,0.45)" />
-            <p className="hand" style={{ fontSize: 22, color: 'rgba(26,20,23,0.6)', marginTop: 8 }}>
-              {peerName}'s camera is off
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Peer name plate, top-left */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 14,
-          left: 14,
-          padding: '6px 12px',
-          background: 'var(--cream)',
-          border: '3px solid var(--ink)',
-          boxShadow: '3px 3px 0 var(--ink)',
-          fontFamily: 'var(--font-sfx)',
-          fontSize: 14,
-          letterSpacing: 1,
-          color: 'var(--ink)',
-          transform: 'rotate(-2deg)',
-        }}
-      >
-        {peerName}
-      </div>
-
-      {/* Mute badge, top-right */}
-      {peerIsMuted && (
-        <div
-          aria-label={`${peerName} is muted`}
-          style={{
-            position: 'absolute',
-            top: 14,
-            right: 14,
-            padding: '4px 10px',
-            background: 'var(--orange)',
-            border: '3px solid var(--ink)',
-            boxShadow: '3px 3px 0 var(--ink)',
-            fontFamily: 'var(--font-sfx)',
-            fontSize: 14,
-            letterSpacing: 1,
-            color: 'var(--ink)',
-            transform: 'rotate(3deg)',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 6,
-          }}
-        >
-          <span aria-hidden="true">🔇</span> MUTED
-        </div>
-      )}
-
-      {/* Picture-in-self — bottom-right corner, mirrored, manga-tilted.
-          Hidden when localStream is missing (camera permission denied
-          or user explicitly stopped the camera). */}
-      {localStream && (
-        <div
-          style={{
-            position: 'absolute',
-            right: 16,
-            bottom: 80,
-            width: 180,
-            aspectRatio: '4/3',
-            border: '3.5px solid var(--ink)',
-            background: 'var(--cream-deep)',
-            boxShadow: '5px 5px 0 var(--purple)',
-            transform: 'rotate(2deg)',
-            overflow: 'hidden',
-            zIndex: 2,
-          }}
-        >
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-              transform: 'scaleX(-1)', // selfie mirror
-            }}
-          />
-          <div
-            style={{
-              position: 'absolute',
-              left: 6,
-              bottom: 6,
-              background: 'var(--cream)',
-              border: '2px solid var(--ink)',
-              padding: '1px 6px',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 11,
-              letterSpacing: 1,
-            }}
+      {/* Camera-off state — keeps the <video> mounted so it lights up
+          instantly when they flip their camera back on. */}
+      <AnimatePresence>
+        {peerIsCameraOff && (
+          <m.div
+            className="stage__off"
+            aria-label={`${peerName}'s camera is off`}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
           >
-            you
-          </div>
-        </div>
+            <span className="avatar" data-who="them" aria-hidden="true">
+              {peerName.charAt(0).toUpperCase()}
+            </span>
+            <span>{peerName}’s camera is off</span>
+          </m.div>
+        )}
+      </AnimatePresence>
+
+      {approvalChip}
+
+      <span className="chip chip--glass stage__name">{peerName}</span>
+
+      {peerIsMuted && (
+        <span className="chip chip--exit stage__muted" aria-label={`${peerName} is muted`}>
+          <MicOffIcon size={14} />
+          Muted
+        </span>
       )}
 
-      {/* Share button — floating along the bottom so it doesn't crowd
-          the face. Switches to a soft "waiting" message during the
-          approval round-trip. */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          bottom: 16,
-          display: 'flex',
-          justifyContent: 'center',
-          pointerEvents: 'none',
-          zIndex: 1,
-        }}
-      >
-        <div style={{ pointerEvents: 'auto' }}>
-          {canRequestShare && !isWaitingForApproval && (
-            <StickerButton color="pink" size="md" sfx="WHRR" onClick={onRequestShare}>
-              SHARE MY SCREEN
-            </StickerButton>
-          )}
-          {isWaitingForApproval && (
-            /* Same as the other waiting chip: clickable, so the user always has
-               a way out of a request nobody answered. */
-            <button
-              type="button"
-              className="hand"
-              onClick={onCancelRequest}
-              title="cancel the request"
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 10,
-                padding: '8px 16px',
-                background: 'var(--cream)',
-                border: '3px solid var(--ink)',
-                boxShadow: '3px 3px 0 var(--ink)',
-                fontSize: 18,
-                color: 'var(--purple)',
-                cursor: 'pointer',
-                font: 'inherit',
-              }}
-            >
-              <span style={{ animation: 'speakPulse 1.2s ease-in-out infinite' }}>•</span>
-              waiting for approval… <span style={{ opacity: 0.6 }}>(cancel)</span>
-            </button>
-          )}
-        </div>
-      </div>
+      {localStream && <SelfView stream={localStream} boundsRef={stageRef} />}
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────── */
+/* SelfView — you, in a corner you can move                       */
+/* ────────────────────────────────────────────────────────────── */
+
+type Corner = 'tl' | 'tr' | 'bl' | 'br';
+const CORNER_KEY = 'wt:selfview:corner';
+
+/** Animate an element from an offset back to where CSS now puts it. */
+function glide(el: HTMLElement, dx: number, dy: number) {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'translate(0, 0)' }], {
+    duration: 560,
+    easing: 'cubic-bezier(0.34, 1.4, 0.64, 1)',
+  });
+}
+
+function readCorner(): Corner {
+  try {
+    const saved = window.localStorage.getItem(CORNER_KEY);
+    if (saved === 'tl' || saved === 'tr' || saved === 'bl' || saved === 'br') return saved;
+  } catch {
+    // Storage can be unavailable; the default corner is fine.
+  }
+  return 'br';
+}
+
+/**
+ * Your own camera, small, mirrored — draggable anywhere, and on release it
+ * glides to the nearest corner and stays there next time.
+ *
+ * The glide is a FLIP: measure where it was dropped, switch the corner in
+ * CSS, measure where that put it, then animate the difference away. Built on
+ * pointer events and the Web Animations API, so it works the same for a
+ * mouse and a finger and needs nothing from React per frame.
+ */
+function SelfView({ stream, boundsRef }: { stream: MediaStream; boundsRef: React.RefObject<HTMLDivElement | null> }) {
+  const [corner, setCorner] = useState<Corner>(readCorner);
+  const elRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const drag = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
+  const flipFrom = useRef<DOMRect | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  // Your voice lights your frame.
+  useAudioLevel(stream, elRef);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.srcObject = stream;
+  }, [stream]);
+
+  useLayoutEffect(() => {
+    const el = elRef.current;
+    const from = flipFrom.current;
+    if (!el || !from) return;
+    flipFrom.current = null;
+    const to = el.getBoundingClientRect();
+    glide(el, from.left - to.left, from.top - to.top);
+  }, [corner]);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    if (!d || d.id !== e.pointerId) return;
+    const dx = e.clientX - d.x;
+    const dy = e.clientY - d.y;
+    if (!d.moved && Math.hypot(dx, dy) < 4) return;
+    if (!d.moved) {
+      d.moved = true;
+      setDragging(true);
+    }
+    e.currentTarget.style.translate = `${dx}px ${dy}px`;
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    const el = elRef.current;
+    const bounds = boundsRef.current;
+    drag.current = null;
+    if (!d || !el || !bounds || !d.moved) return;
+    setDragging(false);
+
+    const rect = el.getBoundingClientRect();
+    const b = bounds.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2 - b.left;
+    const cy = rect.top + rect.height / 2 - b.top;
+    const next: Corner = `${cy < b.height / 2 ? 't' : 'b'}${cx < b.width / 2 ? 'l' : 'r'}` as Corner;
+
+    el.style.translate = '';
+    if (next === corner) {
+      const home = el.getBoundingClientRect();
+      glide(el, rect.left - home.left, rect.top - home.top);
+    } else {
+      flipFrom.current = rect;
+      setCorner(next);
+      try {
+        window.localStorage.setItem(CORNER_KEY, next);
+      } catch {
+        // Not remembered; still moved.
+      }
+    }
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+  };
+
+  return (
+    <div
+      ref={elRef}
+      className="selfview"
+      data-corner={corner}
+      data-dragging={dragging ? '' : undefined}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      title="Drag to move"
+    >
+      <video ref={videoRef} autoPlay playsInline muted />
+      <span className="chip chip--glass selfview__label">You</span>
     </div>
   );
 }

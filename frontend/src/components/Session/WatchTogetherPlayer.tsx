@@ -1,6 +1,7 @@
 import { logger } from '../../services/logger';
 import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
-import { BurstSticker } from '../manga';
+import { IconButton } from '../ui/Button';
+import { CloseIcon, PlayIcon } from '../ui/icons';
 
 export interface WatchTogetherPlayerHandle {
   /** Apply a remote peer's command without re-broadcasting (avoids ping-pong). */
@@ -184,88 +185,29 @@ export const WatchTogetherPlayer = forwardRef<WatchTogetherPlayerHandle, WatchTo
     }), []);
 
     return (
-      <div
-        style={{
-          position: 'relative',
-          height: '100%',
-          background: 'var(--ink)',
-          border: '4px solid var(--ink)',
-          borderRadius: 6,
-          boxShadow: '8px 8px 0 var(--ink)',
-          overflow: 'hidden',
-        }}
-      >
+      <div className="watch">
         {/* YT.Player mounts INTO this div (it replaces the contents). */}
-        <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+        <div ref={containerRef} className="watch__player" />
 
         {!isReady && (
-          <div
-            style={{
-              position: 'absolute',
-              inset: 0,
-              display: 'grid',
-              placeItems: 'center',
-              background: 'var(--cream-deep)',
-              pointerEvents: 'none',
-            }}
-          >
-            <div className="hand" style={{ fontSize: 22, color: 'var(--purple)' }}>
-              loading video…
-            </div>
+          <div className="watch__loading">
+            <span className="loading-line">
+              <span className="btn__spinner" aria-hidden="true" />
+              Loading the video
+            </span>
           </div>
         )}
 
-        {/* Co-watch ribbon — top-left, mirrors the "FEATURE!" SFX on screen share */}
-        <div
-          style={{
-            position: 'absolute',
-            top: 12,
-            left: 12,
-            padding: '6px 12px',
-            background: 'var(--purple)',
-            border: '3px solid var(--ink)',
-            boxShadow: '3px 3px 0 var(--ink)',
-            fontFamily: 'var(--font-sfx)',
-            fontSize: 14,
-            letterSpacing: 1,
-            color: 'var(--cream)',
-            transform: 'rotate(-2deg)',
-            zIndex: 2,
-          }}
-        >
-          ♥ WATCHING TOGETHER
-          {peerDisplayName && (
-            <span style={{ opacity: 0.85, marginLeft: 8 }}>· with {peerDisplayName}</span>
-          )}
+        <div className="watch__top">
+          <span className="chip chip--glass">
+            <PlayIcon size={15} />
+            {peerDisplayName ? `Watching with ${peerDisplayName}` : 'Watching together'}
+          </span>
+          {/* Exits watch mode for both of you. */}
+          <IconButton label="Stop watching together" size="sm" tip="below" onClick={onClose}>
+            <CloseIcon size={17} />
+          </IconButton>
         </div>
-
-        {/* Close — top-right, exits watch-mode for both peers */}
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="exit watch together"
-          title="exit watch together"
-          style={{
-            position: 'absolute',
-            top: 12,
-            right: 12,
-            width: 36,
-            height: 36,
-            background: 'var(--cream)',
-            border: '3px solid var(--ink)',
-            borderRadius: 8,
-            boxShadow: '3px 3px 0 var(--ink)',
-            color: 'var(--ink)',
-            cursor: 'pointer',
-            padding: 0,
-            fontFamily: 'var(--font-sfx)',
-            fontSize: 18,
-            transform: 'rotate(2deg)',
-            zIndex: 2,
-          }}
-        >
-          ×
-        </button>
       </div>
     );
   }
@@ -302,16 +244,4 @@ export function extractYouTubeVideoId(raw: string): string | null {
     // Not a valid URL — fall through to null.
   }
   return null;
-}
-
-/* Sticker burst styled "invalid URL" — exported for the URL modal. */
-export function WatchInvalidStub({ message }: { message: string }) {
-  return (
-    <div style={{ textAlign: 'center', padding: 20 }}>
-      <BurstSticker bg="var(--orange)" rot={-4} w={200} h={120}>
-        OOPS
-      </BurstSticker>
-      <p className="hand" style={{ fontSize: 18, marginTop: 10, color: 'var(--ink)' }}>{message}</p>
-    </div>
-  );
 }

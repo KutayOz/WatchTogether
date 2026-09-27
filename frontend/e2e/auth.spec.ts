@@ -10,8 +10,8 @@ import {
 
 test.describe('Sign-in screen', () => {
   test.beforeEach(async ({ page }) => {
-    // StickerButton with breathe=true wiggles forever; disable so click()
-    // doesn't time out on the actionability check.
+    // The passkey button leans toward the cursor and every page arrives with
+    // a spring; disable so click() doesn't wait on the actionability check.
     await disableAnimations(page);
     // Default state: nobody is signed in. Without this stub the AuthContext
     // initial /me call hangs against the unmocked dev server and PublicRoute
@@ -27,7 +27,7 @@ test.describe('Sign-in screen', () => {
 
     // Heading + tagline are the load-bearing chrome of this page.
     await expect(page.getByRole('heading', { name: /watchtogether/i })).toBeVisible();
-    await expect(page.getByText(/two friends\. one screen/i)).toBeVisible();
+    await expect(page.getByText(/two people, one screen/i)).toBeVisible();
 
     await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeEnabled();
     // Accounts exist only by invitation, so there is no sign-up affordance —
@@ -71,8 +71,8 @@ test.describe('Sign-in screen', () => {
     const password = page.getByRole('button', { name: /sign in with a password/i });
 
     await expect(passkey).toBeVisible();
-    await expect(page.getByLabel('handle:')).toBeVisible();
-    await expect(page.getByLabel('password:')).toBeVisible();
+    await expect(page.getByLabel('Handle')).toBeVisible();
+    await expect(page.getByLabel('Password', { exact: true })).toBeVisible();
 
     // Passkeys stay the headline; the password form sits under an "or" divider.
     const passkeyBox = await passkey.boundingBox();
@@ -93,14 +93,16 @@ test.describe('Sign-in screen', () => {
     await expectPathname(page, '/');
   });
 
-  test('shows the OOPS burst when the ceremony is cancelled', async ({ page }) => {
+  test('explains a cancelled ceremony and stays put', async ({ page }) => {
     await mockPasskeySignIn(page, 'cancelled');
     await page.goto('/login');
 
     await page.getByRole('button', { name: /sign in with a passkey/i }).click();
 
-    await expect(page.getByRole('alert')).toBeVisible();
-    await expect(page.getByText(/oops/i)).toBeVisible();
+    // Said in words, not left as a cryptic DOMException.
+    await expect(page.getByRole('alert')).toContainText(/no passkey was used/i);
+    // And the button is usable again for a second try.
+    await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeEnabled();
     // Still on /login — a dismissed system sheet is not a failed login.
     expect(new URL(page.url()).pathname).toBe('/login');
   });
@@ -135,7 +137,7 @@ test.describe('First-run bootstrap', () => {
 
     await page.goto('/login');
 
-    await expect(page.getByText(/first run — claim this instance/i)).toBeVisible();
+    await expect(page.getByText(/first run: claim this instance/i)).toBeVisible();
     await expect(page.getByRole('button', { name: /create root account/i })).toBeVisible();
   });
 
@@ -147,7 +149,7 @@ test.describe('First-run bootstrap', () => {
     // rendered screen rather than about a screen that has not painted yet.
     await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
 
-    await expect(page.getByText(/first run — claim this instance/i)).toHaveCount(0);
+    await expect(page.getByText(/claim this instance/i)).toHaveCount(0);
   });
 
   /**
@@ -161,7 +163,7 @@ test.describe('First-run bootstrap', () => {
     await page.goto('/login');
     await expect(page.getByRole('button', { name: /sign in with a passkey/i })).toBeVisible();
 
-    await expect(page.getByText(/first run — claim this instance/i)).toHaveCount(0);
+    await expect(page.getByText(/claim this instance/i)).toHaveCount(0);
   });
 });
 

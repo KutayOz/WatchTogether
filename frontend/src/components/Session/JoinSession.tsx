@@ -1,17 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
+import { m } from 'motion/react';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import {
-  Sketchbook,
-  SectionTitle,
-  StickerButton,
-  BackButton,
-  BurstSticker,
-  TagSticker,
-  Chibi,
-  SpeechBubble,
-} from '../manga';
+import { Theater } from '../ui/Theater';
+import { FocusText } from '../ui/FocusText';
+import { Button } from '../ui/Button';
+import { Lights } from '../ui/Lights';
+import { AlertIcon, LinkIcon, PlayIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
 
 export function JoinSession() {
   const navigate = useNavigate();
@@ -23,6 +20,7 @@ export function JoinSession() {
   const [creatorName, setCreatorName] = useState<string | null>(null);
   const [isInvalid, setIsInvalid] = useState(false);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (token && user) {
@@ -31,6 +29,10 @@ export function JoinSession() {
       setIsLoading(false);
     }
   }, [token, user]);
+
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
 
   const validateInvite = async () => {
     try {
@@ -68,112 +70,95 @@ export function JoinSession() {
 
   if (!user) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <Sketchbook style={{ width: '100%', maxWidth: 520 }}>
-            <div style={{ textAlign: 'center' }}>
-              <SectionTitle size={36} underline="purple">LOGIN FIRST</SectionTitle>
-              <div style={{ marginTop: 28, display: 'flex', justifyContent: 'center' }}>
-                <Chibi who="sprout" pose="wave" size={140} />
-              </div>
-              <p className="hand" style={{ fontSize: 22, marginTop: 14, color: 'rgba(26,20,23,0.7)' }}>
-                you'll need to be signed in to join this session.
-              </p>
-              <div className="row" style={{ justifyContent: 'center', marginTop: 24 }}>
-                <Link to="/login" state={{ returnTo: `/join/${token}` }} style={{ textDecoration: 'none' }}>
-                  <StickerButton color="pink" size="md" sfx="TAP!">
-                    SIGN IN
-                  </StickerButton>
-                </Link>
-              </div>
-            </div>
-          </Sketchbook>
+      <Theater screen={<FocusText as="h1" className="theater__kicker" text="Someone saved you a seat" delay={0.3} />}>
+        <div className="status-card">
+          <span className="status-card__icon" data-tone="wait" aria-hidden="true">
+            <LinkIcon size={26} />
+          </span>
+          <h2>Sign in to join</h2>
+          <p>You need to be signed in to join this session. The link will still work after.</p>
+          <Link to="/login" state={{ returnTo: `/join/${token}` }} className="btn btn--primary" data-light="">
+            <span>Sign in</span>
+          </Link>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   if (isLoading) {
     return (
-      <div className="app" style={{ display: 'grid', placeItems: 'center', minHeight: '60vh' }}>
-        <div className="hand" style={{ fontSize: 26, color: 'var(--purple)' }}>
-          opening the invite…
+      <Theater screen={<p className="theater__kicker">Opening the invite…</p>}>
+        <div className="status-card">
+          <span className="loading-line">
+            <span className="btn__spinner" aria-hidden="true" />
+            Checking the link
+          </span>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   if (isInvalid) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <Sketchbook style={{ width: '100%', maxWidth: 520 }}>
-            <div style={{ textAlign: 'center' }}>
-              <SectionTitle size={36} underline="orange">LINK BROKEN</SectionTitle>
-              <div style={{ marginTop: 28, display: 'flex', justifyContent: 'center' }}>
-                <BurstSticker bg="var(--orange)" rot={-4} w={220} h={140}>
-                  OOPS!
-                </BurstSticker>
-              </div>
-              <p className="hand" style={{ fontSize: 22, marginTop: 14 }}>{invalidMessage}</p>
-              <p className="hand" style={{ fontSize: 16, marginTop: 6, color: 'rgba(26,20,23,0.55)' }}>
-                session invite links expire after 15 minutes &amp; can only be used once.
-              </p>
-              <div className="row" style={{ justifyContent: 'center', marginTop: 24 }}>
-                <Link to="/" style={{ textDecoration: 'none' }}>
-                  <BackButton>go to lobby</BackButton>
-                </Link>
-              </div>
-            </div>
-          </Sketchbook>
+      <Theater screen={<FocusText as="h1" className="theater__kicker" text="This session link is spent" />}>
+        <div className="status-card">
+          <span className="status-card__icon" aria-hidden="true">
+            <AlertIcon size={26} />
+          </span>
+          <h2>This link can’t be used</h2>
+          <p>{invalidMessage}</p>
+          <p className="muted">Session links expire after 15 minutes and work once. Ask for a fresh one.</p>
+          <Link to="/" className="btn btn--secondary" data-light="">
+            <span>Go to the lobby</span>
+          </Link>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-        <Sketchbook style={{ width: '100%', maxWidth: 560 }}>
-          <div className="row" style={{ alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
-            <SectionTitle size={36} underline="pink">JOIN SESSION</SectionTitle>
-            <TagSticker color="orange" rot={4}>INVITED</TagSticker>
-          </div>
+    <Theater
+      screen={
+        <FocusText
+          as="h1"
+          className="theater__kicker"
+          text={creatorName ? `${creatorName} saved you a seat` : 'Someone saved you a seat'}
+          delay={0.35}
+        />
+      }
+    >
+      <div className="status-card" style={{ paddingTop: 12 }}>
+        {/* Theirs is already lit; yours arrives when you press join. */}
+        <m.div initial={{ scale: 0.7, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.6 }}>
+          <Lights together={isJoining} size={92} />
+        </m.div>
+        <h2>{creatorName ? `${creatorName} is waiting` : 'Someone is waiting'}</h2>
+        <p>Joining takes you to a quick camera and mic check first. Nobody sees you until you’re ready.</p>
 
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16, marginTop: 22, flexWrap: 'wrap' }}>
-            <Chibi who="mochi" pose="peace" size={130} />
-            <SpeechBubble kind="oval" color="cream" style={{ maxWidth: 340 }}>
-              <span style={{ fontFamily: 'var(--font-body)', fontWeight: 700 }}>
-                {creatorName ? (
-                  <>
-                    <span style={{ color: 'var(--purple)' }}>{creatorName}</span> is waiting to hang out ♥
-                  </>
-                ) : (
-                  <>someone is waiting for you ♥</>
-                )}
-              </span>
-            </SpeechBubble>
+        {error && (
+          <div ref={errorRef} className="notice notice--error" role="alert" style={{ width: '100%' }}>
+            <AlertIcon size={18} />
+            <span>{error}</span>
           </div>
+        )}
 
-          {error && (
-            <div className="shake" style={{ marginTop: 16 }}>
-              <BurstSticker bg="var(--orange)" rot={-4} w={200} h={130}>
-                OOPS!
-              </BurstSticker>
-              <div className="hand" style={{ fontSize: 18, marginTop: 6 }}>{error}</div>
-            </div>
-          )}
-
-          <div className="row" style={{ gap: 14, marginTop: 24, flexWrap: 'wrap' }}>
-            <StickerButton color="pink" size="md" sfx="WHOOSH!" onClick={handleJoin} disabled={isJoining}>
-              {isJoining ? 'JOINING…' : 'JOIN!'}
-            </StickerButton>
-            <Link to="/" style={{ textDecoration: 'none' }}>
-              <BackButton>nevermind</BackButton>
-            </Link>
-          </div>
-        </Sketchbook>
+        <div className="cluster" style={{ justifyContent: 'center', marginTop: 6 }}>
+          <Link to="/" className="btn btn--ghost" data-light="">
+            <span>Not now</span>
+          </Link>
+          <Button
+            variant="primary"
+            size="lg"
+            magnetic
+            icon={<PlayIcon size={20} />}
+            onClick={handleJoin}
+            loading={isJoining}
+            disabled={isJoining}
+          >
+            {isJoining ? 'Joining…' : 'Join session'}
+          </Button>
+        </div>
       </div>
-    </div>
+    </Theater>
   );
 }

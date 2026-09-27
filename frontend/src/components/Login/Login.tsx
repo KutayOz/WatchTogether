@@ -1,20 +1,18 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { m } from 'motion/react';
 import { useAuthContext } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import { PasskeyIcon } from '../Auth/PasskeyIcon';
 import { UsernameField } from '../Auth/UsernameField';
 import { PasswordField } from '../Auth/PasswordField';
 import { isTagValid } from '../../utils/password';
-import {
-  Sketchbook,
-  SectionTitle,
-  TagSticker,
-  StickerButton,
-  NotebookField,
-  Doodle,
-  BurstSticker,
-} from '../manga';
+import { Theater } from '../ui/Theater';
+import { FocusText } from '../ui/FocusText';
+import { Button } from '../ui/Button';
+import { TextField } from '../ui/Field';
+import { AlertIcon, PasskeyIcon, SparkIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
+import { ease } from '../ui/motion';
 
 /**
  * Sign-in. Passkey first, password underneath.
@@ -28,9 +26,9 @@ import {
  * full `name#1234` handle, because a bare username is ambiguous; and it gives
  * the app an account-enumeration surface the passkey-only design did not have,
  * which is why the server answers "no such handle" and "wrong password" with
- * one identical sentence, after doing identical work. There is also no "forgot"
- * link, because there is no email address to send anything to — recovery is a
- * link root issues by hand.
+ * one identical sentence, after doing identical work. There is also no
+ * recovery link, because there is no email address to send anything to —
+ * recovery is a link root issues by hand.
  *
  * First run is unchanged and still passkey-only: claiming root is a one-time
  * action at a keyboard, gated on an empty database plus a deployment secret.
@@ -52,12 +50,17 @@ export function Login() {
   } = useAuthContext();
 
   const [tag, setTag] = useState('');
+  const [tagTouched, setTagTouched] = useState(false);
   const [password, setPassword] = useState('');
+  // Which button started the work, so only that one shows it is busy.
+  const [pending, setPending] = useState<'passkey' | 'password' | 'setup' | null>(null);
 
   // undefined while unknown — the setup panel must not flash on a normal load.
   const [isSetupComplete, setIsSetupComplete] = useState<boolean | undefined>(undefined);
   const [setupUsername, setSetupUsername] = useState('');
   const [setupSecret, setSetupSecret] = useState('');
+
+  const errorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     api
@@ -68,332 +71,198 @@ export function Login() {
       .catch(() => setIsSetupComplete(true));
   }, []);
 
+  // A fresh failure shakes its message, so a second wrong password is
+  // visibly a new answer and not the old one still sitting there.
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
+
   // Always land on the lobby. Whether the House Rules still need accepting is
   // TermsGate's business now (see App.tsx) — it renders over whatever route the
   // user ends up on, so this screen no longer has to know.
   const handleSignIn = async () => {
+    setPending('passkey');
     try {
       await loginWithPasskey();
       navigate('/');
     } catch {
       // useAuth has already turned this into a readable message.
+    } finally {
+      setPending(null);
     }
   };
 
   const handlePasswordSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
+    setPending('password');
     try {
       await loginWithPassword(tag, password);
       navigate('/');
     } catch {
       // Same — the server's own sentence is already on screen.
+    } finally {
+      setPending(null);
     }
   };
 
   const handleSetup = async (e: React.FormEvent) => {
     e.preventDefault();
+    setPending('setup');
     try {
       await setupRootWithPasskey(setupUsername.trim(), setupSecret);
       navigate('/');
     } catch {
       // Same.
+    } finally {
+      setPending(null);
     }
   };
 
+  // Only after the field is left: mid-typing "alic" is not a mistake yet.
+  const tagProblem =
+    tagTouched && tag.trim() && !tag.includes('#') ? 'Add the number after the #, like alice#0042.' : null;
+
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', placeItems: 'center', padding: '20px 0' }}>
-        <Sketchbook style={{ width: '100%', maxWidth: 720 }}>
-          <div style={{ marginBottom: 24, position: 'relative' }}>
-            <SectionTitle size={64} underline="pink">
-              WatchTogether
-            </SectionTitle>
-            <div style={{ position: 'absolute', right: 0, top: -4 }}>
-              <TagSticker color="purple" rot={6}>
-                BETA
-              </TagSticker>
-            </div>
-            <div className="hand" style={{ fontSize: 24, color: 'rgba(26,20,23,0.7)', marginTop: 14 }}>
-              two friends. one screen. ♥
-            </div>
-          </div>
-
-          {error && (
-            <div className="shake" style={{ marginTop: 8, textAlign: 'left' }} role="alert">
-              <BurstSticker bg="var(--orange)" rot={-4} w={170} h={110}>
-                OOPS!
-              </BurstSticker>
-              <div className="hand" style={{ fontSize: 18, marginTop: 6, color: 'var(--ink)' }}>
-                {error}
-              </div>
-            </div>
-          )}
-
-          <div style={{ marginTop: 28, maxWidth: 520 }}>
-            <StickerButton
-              color="pink"
-              size="xl"
-              sfx="TAP!"
-              sparks
-              breathe
-              disabled={isLoading}
-              onClick={handleSignIn}
-            >
-              {isLoading ? 'CHECKING…' : 'SIGN IN WITH A PASSKEY'}
-            </StickerButton>
-
-            <div
-              className="hand"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                fontSize: 18,
-                color: 'rgba(26,20,23,0.55)',
-                marginTop: 18,
-              }}
-            >
-              <PasskeyIcon size={18} />
-              your face, fingerprint or device PIN — nothing to remember
-            </div>
-
-            {/* Hand-drawn divider. The password form is deliberately below the
-                fold of the passkey button rather than beside it — both work,
-                but only one of them is the recommendation. */}
-            <div
-              className="hand"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                marginTop: 30,
-                fontSize: 20,
-                color: 'rgba(26,20,23,0.45)',
-              }}
-            >
-              <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
-              or
-              <span style={{ flex: 1, borderTop: '2px dashed rgba(26,20,23,0.25)' }} />
-            </div>
-
-            <form onSubmit={handlePasswordSignIn} style={{ marginTop: 8 }}>
-              <NotebookField
-                label="handle:"
-                value={tag}
-                onChange={(v) => {
-                  setTag(v);
-                  setError(null);
-                }}
-                placeholder="alice#0042"
-                disabled={isLoading}
-                autoComplete="username"
-                // Spellcheck and autocapitalise both mangle a handle on mobile.
-                autoCapitalize="none"
-                autoCorrect="off"
-                spellCheck={false}
-              />
-
-              <PasswordField
-                value={password}
-                onChange={(v) => {
-                  setPassword(v);
-                  setError(null);
-                }}
-                autoComplete="current-password"
-                disabled={isLoading}
-                // No rulebook on the way in: the password is either the one on
-                // file or it is not, and grading it here would only insult
-                // somebody whose account predates the current rules.
-                validate={false}
-                hint="the whole handle, number and all"
-              />
-
-              <div style={{ marginTop: 18 }}>
-                <StickerButton
-                  type="submit"
-                  color="purple"
-                  size="md"
-                  sfx="POP!"
-                  // Gated on the handle parsing, so "you need the number too"
-                  // is visible in the button rather than arriving as a 400.
-                  disabled={isLoading || !isTagValid(tag) || !password}
-                >
-                  {isLoading ? 'UNLOCKING…' : 'SIGN IN WITH A PASSWORD'}
-                </StickerButton>
-              </div>
-            </form>
-          </div>
-
-          {/* Still no "create account" and no "forgot password", both on
-              purpose: an account comes from redeeming an invite, and with no
-              address on file the only way back from a forgotten password is a
-              link root issues by hand.
-
-              What this box does now have is the other half of "invite-only" —
-              a way in for somebody with nobody to ask. It files a request for
-              root to read; it mints nothing, which is why it sits as a quiet
-              line under the ask-a-friend sentence rather than as a second
-              button competing with sign-in. */}
-          <div
-            style={{
-              marginTop: 36,
-              padding: '20px 22px',
-              border: '3px solid var(--ink)',
-              background: 'rgba(123,63,228,0.08)',
-              boxShadow: '5px 5px 0 var(--purple)',
-              transform: 'rotate(-0.4deg)',
-              maxWidth: 520,
-            }}
+    <Theater
+      screen={
+        <>
+          <FocusText as="h1" text="WatchTogether" delay={0.45} stagger={0.1} />
+          <m.p
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, ease: ease.out, delay: 0.95 }}
           >
-            <div className="hand" style={{ fontSize: 22, color: 'var(--ink)', marginBottom: 8 }}>
-              no account yet?
-            </div>
-            <div className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.65)' }}>
-              WatchTogether is invite-only. ask the friend who told you about it for a link.
-            </div>
-            <div
-              className="hand"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                marginTop: 14,
-                paddingTop: 12,
-                borderTop: '2px dashed rgba(26,20,23,0.25)',
-                fontSize: 18,
-                color: 'rgba(26,20,23,0.65)',
-                flexWrap: 'wrap',
-              }}
-            >
-              <Doodle kind="envelope" size={20} color="var(--purple)" />
-              nobody to ask?
-              <Link
-                to="/request-demo"
-                style={{
-                  color: 'var(--purple)',
-                  fontWeight: 700,
-                  textDecorationThickness: 2,
-                  textUnderlineOffset: 3,
-                }}
-              >
-                request a demo
-              </Link>
-            </div>
-          </div>
+            Two people, one screen.
+          </m.p>
+        </>
+      }
+      foot={
+        <>
+          <p>
+            No account yet? WatchTogether is invite-only, so ask the friend who told you about it for a link.
+          </p>
+          <p>
+            Nobody to ask? <Link to="/request-demo">Request a demo</Link>
+          </p>
+        </>
+      }
+    >
+      {error && (
+        <div ref={errorRef} className="notice notice--error" role="alert">
+          <AlertIcon size={18} />
+          <span>{error}</span>
+        </div>
+      )}
 
-          {/* First run only. Disappears permanently the moment root exists. */}
-          {isSetupComplete === false && (
-            <form
-              onSubmit={handleSetup}
-              style={{
-                marginTop: 28,
-                padding: '20px 22px',
-                border: '3px dashed var(--ink)',
-                maxWidth: 520,
-              }}
-            >
-              <div className="hand" style={{ fontSize: 22, color: 'var(--ink)', marginBottom: 4 }}>
-                <Doodle kind="sparkle" size={18} color="var(--purple)" /> first run — claim this
-                instance
-              </div>
-              <div
-                className="hand"
-                style={{ fontSize: 17, color: 'rgba(26,20,23,0.6)', marginBottom: 12 }}
-              >
-                nobody has registered yet. the setup secret is the one set with{' '}
-                <code>wrangler secret put SETUP_SECRET</code>.
-              </div>
-
-              <UsernameField
-                label="username:"
-                value={setupUsername}
-                onChange={(v) => {
-                  setSetupUsername(v);
-                  setError(null);
-                }}
-                disabled={isLoading}
-              />
-
-              <label className="hand" style={{ display: 'block', marginTop: 14, fontSize: 20 }}>
-                setup secret:
-                <input
-                  type="password"
-                  value={setupSecret}
-                  onChange={(e) => setSetupSecret(e.target.value)}
-                  disabled={isLoading}
-                  autoComplete="off"
-                  style={{
-                    display: 'block',
-                    width: '100%',
-                    marginTop: 6,
-                    padding: '10px 12px',
-                    border: '3px solid var(--ink)',
-                    background: 'var(--cream)',
-                    fontFamily: 'var(--font-body)',
-                    fontSize: 16,
-                  }}
-                />
-              </label>
-
-              <div style={{ marginTop: 18 }}>
-                <StickerButton
-                  type="submit"
-                  color="purple"
-                  size="md"
-                  sfx="POP!"
-                  disabled={isLoading || !setupUsername.trim() || !setupSecret}
-                >
-                  {isLoading ? 'CLAIMING…' : 'CREATE ROOT ACCOUNT'}
-                </StickerButton>
-              </div>
-            </form>
-          )}
-
-          <div className="margin-doodles" style={{ position: 'absolute', right: 24, top: 40 }}>
-            <span
-              className="bob"
-              style={
-                {
-                  ['--r' as string]: '-12deg',
-                  ['--r2' as string]: '8deg',
-                  display: 'inline-block',
-                } as React.CSSProperties
-              }
-            >
-              <Doodle kind="tv" size={56} color="var(--purple)" />
-            </span>
-          </div>
-          <div className="margin-doodles" style={{ position: 'absolute', right: 80, top: 140 }}>
-            <span
-              className="bob delay-1"
-              style={
-                {
-                  ['--r' as string]: '10deg',
-                  ['--r2' as string]: '-6deg',
-                  display: 'inline-block',
-                } as React.CSSProperties
-              }
-            >
-              <Doodle kind="popcorn" size={48} color="var(--orange)" />
-            </span>
-          </div>
-          <div
-            className="margin-doodles hand"
-            style={{
-              position: 'absolute',
-              right: 48,
-              // Clears the top edge of the invite-only box, which grew when the
-              // request-a-demo line was added under it.
-              bottom: 178,
-              fontSize: 22,
-              color: 'var(--purple)',
-              transform: 'rotate(-6deg)',
-            }}
-          >
-            watch with friends ♥
-          </div>
-        </Sketchbook>
+      <div className="stack" style={{ ['--gap' as string]: '12px' }}>
+        <Button
+          variant="primary"
+          size="lg"
+          block
+          magnetic
+          icon={<PasskeyIcon size={20} />}
+          loading={pending === 'passkey'}
+          disabled={isLoading}
+          onClick={handleSignIn}
+        >
+          {pending === 'passkey' ? 'Waiting for your device…' : 'Sign in with a passkey'}
+        </Button>
+        <p className="passkey-hint">Uses your face, fingerprint or device PIN. Nothing to remember.</p>
       </div>
-    </div>
+
+      {/* The password form is deliberately under the passkey button rather than
+          beside it — both work, but only one of them is the recommendation. */}
+      <div className="divider">or</div>
+
+      <form onSubmit={handlePasswordSignIn} className="stack" style={{ ['--gap' as string]: '14px' }}>
+        <TextField
+          label="Handle"
+          value={tag}
+          onValueChange={(v) => {
+            setTag(v);
+            setError(null);
+          }}
+          placeholder="alice#0042"
+          disabled={isLoading}
+          autoComplete="username"
+          // Spellcheck and autocapitalise both mangle a handle on mobile.
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          onBlur={() => setTagTouched(true)}
+          problem={tagProblem}
+          hint="Your full handle, number included."
+        />
+
+        <PasswordField
+          value={password}
+          onChange={(v) => {
+            setPassword(v);
+            setError(null);
+          }}
+          autoComplete="current-password"
+          disabled={isLoading}
+          // No rulebook on the way in: the password is either the one on
+          // file or it is not, and grading it here would only insult
+          // somebody whose account predates the current rules.
+          validate={false}
+        />
+
+        <Button
+          type="submit"
+          variant="secondary"
+          block
+          loading={pending === 'password'}
+          // Gated on the handle parsing, so "you need the number too" is
+          // visible in the button rather than arriving as a 400.
+          disabled={isLoading || !isTagValid(tag) || !password}
+        >
+          {pending === 'password' ? 'Checking…' : 'Sign in with a password'}
+        </Button>
+      </form>
+
+      {/* First run only. Disappears permanently the moment root exists. */}
+      {isSetupComplete === false && (
+        <form onSubmit={handleSetup} className="setup-panel">
+          <div className="setup-panel__title">
+            <SparkIcon size={20} />
+            <span>First run: claim this instance</span>
+          </div>
+          <p className="muted" style={{ fontSize: '0.95rem' }}>
+            Nobody has registered yet. The setup secret is the one set with{' '}
+            <code>wrangler secret put SETUP_SECRET</code>.
+          </p>
+
+          <UsernameField
+            value={setupUsername}
+            onChange={(v) => {
+              setSetupUsername(v);
+              setError(null);
+            }}
+            disabled={isLoading}
+          />
+
+          <TextField
+            label="Setup secret"
+            type="password"
+            value={setupSecret}
+            onValueChange={setSetupSecret}
+            disabled={isLoading}
+            autoComplete="off"
+          />
+
+          <Button
+            type="submit"
+            variant="primary"
+            block
+            icon={<PasskeyIcon size={18} />}
+            loading={pending === 'setup'}
+            disabled={isLoading || !setupUsername.trim() || !setupSecret}
+          >
+            {pending === 'setup' ? 'Claiming…' : 'Create root account'}
+          </Button>
+        </form>
+      )}
+    </Theater>
   );
 }

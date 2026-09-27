@@ -109,6 +109,28 @@ export default defineConfig({
           if (id.includes('/components/Lobby/')) {
             return 'lobby';
           }
+          // The design system is shared by every route group. Unassigned, it
+          // would be pulled into whichever route chunk Rollup reached first
+          // (auth, as it happens) and every other route would then download
+          // the sign-in screens to get a button.
+          if (id.includes('/components/ui/')) {
+            return 'ui';
+          }
+          // The app's spine: contexts, the REST client, storage and types.
+          // App.tsx imports these directly, and Rollup pulls an unassigned
+          // module into the manual chunk of the first importer it meets — so
+          // left alone, SessionContext rode into `session` and AuthContext into
+          // `auth`, and the entry chunk statically imported BOTH route groups
+          // (plus the room's stylesheet) on every page, sign-in included.
+          if (
+            id.includes('/src/context/') ||
+            id.includes('/src/types/') ||
+            id.includes('/src/utils/') ||
+            id.includes('/src/hooks/useAuth') ||
+            /\/src\/services\/(api|http|logger|logBuffer)\.ts$/.test(id)
+          ) {
+            return 'core';
+          }
 
           // Vendor chunks — only for the heavy / stable deps. Everything
           // else (small libs, our own utils) falls back to default chunking.
@@ -123,6 +145,17 @@ export default defineConfig({
             }
             if (id.includes('node_modules/webrtc-adapter')) {
               return 'webrtc-adapter';
+            }
+            // Motion, as one long-cached vendor chunk. Splitting drag and
+            // layout projection off into a lazy chunk does not work: the core
+            // imports parts of them, so the two halves come out circular.
+            if (
+              id.includes('node_modules/framer-motion') ||
+              id.includes('node_modules/motion-dom') ||
+              id.includes('node_modules/motion-utils') ||
+              id.includes('node_modules/motion/')
+            ) {
+              return 'motion';
             }
             // Mediapipe is already dynamic-imported from useBackgroundBlur
             // and emits its own chunk via the runtime import. Don't override.

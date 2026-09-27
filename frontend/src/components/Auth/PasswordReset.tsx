@@ -1,18 +1,15 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
 import { PASSWORD_MIN_LENGTH } from '@shared/password';
 import { api } from '../../services/api';
 import { useAuthContext } from '../../context/AuthContext';
 import { PasswordField } from './PasswordField';
 import { isPasswordValid } from '../../utils/password';
-import {
-  Sketchbook,
-  SectionTitle,
-  StickerButton,
-  BurstSticker,
-  BackButton,
-  Doodle,
-} from '../manga';
+import { Theater } from '../ui/Theater';
+import { FocusText } from '../ui/FocusText';
+import { Button } from '../ui/Button';
+import { AlertIcon, LockIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
 
 /**
  * Redeem a root-issued password reset link.
@@ -43,6 +40,7 @@ export function PasswordReset() {
 
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  const errorRef = useRef<HTMLDivElement>(null);
 
   const passwordsMatch = password.length > 0 && password === confirm;
   const canSubmit = isPasswordValid(password, username ?? undefined) && passwordsMatch;
@@ -78,6 +76,10 @@ export function PasswordReset() {
     checkLink();
   }, [checkLink]);
 
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token || !username || !canSubmit) return;
@@ -93,122 +95,98 @@ export function PasswordReset() {
 
   if (isChecking) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <div className="hand" style={{ fontSize: 28, color: 'var(--purple)' }}>
-            checking that link…
-          </div>
+      <Theater screen={<p className="theater__kicker">Checking that link…</p>}>
+        <div className="status-card">
+          <span className="loading-line">
+            <span className="btn__spinner" aria-hidden="true" />
+            Checking the link
+          </span>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   if (invalidMessage) {
     return (
-      <div className="app">
-        <div className="screen" style={{ display: 'grid', placeItems: 'center', minHeight: 600 }}>
-          <Sketchbook style={{ width: '100%', maxWidth: 540 }}>
-            <div style={{ textAlign: 'center' }}>
-              <SectionTitle size={42} underline="orange">
-                LINK NO GOOD
-              </SectionTitle>
-              <div style={{ marginTop: 30, display: 'flex', justifyContent: 'center' }}>
-                <BurstSticker bg="var(--orange)" rot={-3} w={220} h={140}>
-                  AW SHUCKS!
-                </BurstSticker>
-              </div>
-              <p className="hand" style={{ fontSize: 22, marginTop: 20, color: 'rgba(26,20,23,0.7)' }}>
-                {invalidMessage}
-              </p>
-              <p className="hand" style={{ fontSize: 18, marginTop: 8, color: 'rgba(26,20,23,0.55)' }}>
-                reset links expire after 48h and work exactly once. ask an admin for a fresh one.
-              </p>
-              <div style={{ marginTop: 28, display: 'flex', justifyContent: 'center' }}>
-                <Link to="/login" style={{ textDecoration: 'none' }}>
-                  <BackButton>back to login</BackButton>
-                </Link>
-              </div>
-            </div>
-          </Sketchbook>
+      <Theater screen={<FocusText as="h1" className="theater__kicker" text="This link is spent" />}>
+        <div className="status-card">
+          <span className="status-card__icon" aria-hidden="true">
+            <LockIcon size={28} />
+          </span>
+          <h2>This link can’t be used</h2>
+          <p>{invalidMessage}</p>
+          <p className="muted">Reset links expire after 48 hours and work exactly once. Ask an admin for a fresh one.</p>
+          <Link to="/login" className="btn btn--secondary" data-light="">
+            <span>Back to sign in</span>
+          </Link>
         </div>
-      </div>
+      </Theater>
     );
   }
 
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', placeItems: 'center', padding: '20px 0' }}>
-        <Sketchbook style={{ width: '100%', maxWidth: 640 }}>
-          <SectionTitle size={46} underline="purple">
-            NEW PASSWORD
-          </SectionTitle>
-
-          <div className="hand" style={{ fontSize: 22, color: 'rgba(26,20,23,0.7)', marginTop: 14 }}>
-            for <span style={{ color: 'var(--purple)' }}>{tag ?? username}</span> — pick something
-            you have not used anywhere else.
-          </div>
-
-          <form onSubmit={handleSubmit} style={{ marginTop: 20, maxWidth: 520 }}>
-            <PasswordField
-              value={password}
-              onChange={(v) => {
-                setPassword(v);
-                setError(null);
-              }}
-              username={username ?? undefined}
-              autoComplete="new-password"
-              disabled={isLoading}
-              autoFocus
-              hint={`at least ${PASSWORD_MIN_LENGTH} characters — length beats punctuation`}
-            />
-
-            <PasswordField
-              label="again:"
-              value={confirm}
-              onChange={(v) => {
-                setConfirm(v);
-                setError(null);
-              }}
-              autoComplete="new-password"
-              disabled={isLoading}
-              validate={false}
-              hint={confirm && !passwordsMatch ? '· those two do not match' : ' '}
-            />
-
-            {error && (
-              <div className="shake" style={{ marginTop: 18 }} role="alert">
-                <BurstSticker bg="var(--orange)" rot={-4} w={180} h={120}>
-                  OOPS!
-                </BurstSticker>
-                <div className="hand" style={{ fontSize: 18, marginTop: 6, color: 'var(--ink)' }}>
-                  {error}
-                </div>
-              </div>
-            )}
-
-            <div className="row" style={{ gap: 18, marginTop: 28, flexWrap: 'wrap' }}>
-              <StickerButton
-                type="submit"
-                color="purple"
-                size="xl"
-                sfx="POP!"
-                disabled={isLoading || !canSubmit}
-              >
-                {isLoading ? 'SETTING…' : 'SET IT'}
-              </StickerButton>
-              <Link to="/login" style={{ textDecoration: 'none' }}>
-                <BackButton>never mind</BackButton>
-              </Link>
-            </div>
-          </form>
-
-          <div className="margin-doodles" style={{ position: 'absolute', right: 40, bottom: 60 }}>
-            <span className="bob" style={{ display: 'inline-block' }}>
-              <Doodle kind="sparkle" size={40} color="var(--purple)" />
-            </span>
-          </div>
-        </Sketchbook>
+    <Theater
+      screen={<FocusText as="h1" className="theater__kicker" text="A new password" delay={0.35} />}
+      foot={
+        <p>
+          Changed your mind? <Link to="/login">Back to sign in</Link>
+        </p>
+      }
+    >
+      <div className="stack" style={{ ['--gap' as string]: '6px' }}>
+        <p className="muted">Setting a password for</p>
+        <p style={{ fontSize: 'var(--t-xl)', fontWeight: 700, color: 'var(--amber-hi)' }}>{tag ?? username}</p>
+        <p className="muted" style={{ fontSize: '0.95rem' }}>
+          Pick something you haven’t used anywhere else.
+        </p>
       </div>
-    </div>
+
+      <form onSubmit={handleSubmit} className="stack" style={{ ['--gap' as string]: '16px' }}>
+        <PasswordField
+          value={password}
+          onChange={(v) => {
+            setPassword(v);
+            setError(null);
+          }}
+          username={username ?? undefined}
+          autoComplete="new-password"
+          disabled={isLoading}
+          autoFocus
+          hint={`At least ${PASSWORD_MIN_LENGTH} characters. Length beats punctuation.`}
+        />
+
+        <PasswordField
+          label="Repeat password"
+          value={confirm}
+          onChange={(v) => {
+            setConfirm(v);
+            setError(null);
+          }}
+          autoComplete="new-password"
+          disabled={isLoading}
+          validate={false}
+          hint={confirm && !passwordsMatch ? 'Those two don’t match yet.' : ' '}
+        />
+
+        {error && (
+          <div ref={errorRef} className="notice notice--error" role="alert">
+            <AlertIcon size={18} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <Button
+          type="submit"
+          variant="primary"
+          size="lg"
+          block
+          magnetic
+          loading={isLoading}
+          disabled={isLoading || !canSubmit}
+        >
+          {isLoading ? 'Setting…' : 'Set password'}
+        </Button>
+      </form>
+    </Theater>
   );
 }

@@ -1,8 +1,10 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { useSessionContext } from '../../context/SessionContext';
 import { useAuthContext } from '../../context/AuthContext';
 import { ChatMessageItem } from './ChatMessage';
-import { SectionTitle, Doodle } from '../manga';
+import { IconButton } from '../ui/Button';
+import { ChatIcon, SendIcon } from '../ui/icons';
 
 interface ChatPanelProps {
   onSendMessage: (message: string) => void;
@@ -16,13 +18,17 @@ interface ChatPanelProps {
   peerName?: string | null;
 }
 
+/** Messages from the same person this close together read as one turn. */
+const GROUP_GAP_MS = 3 * 60 * 1000;
+
 /**
- * ChatPanel — manga-style chat with spiral binding on the left edge,
- * thought-bubble input, and an airplane send button.
+ * The chat: your messages on the right in your light, theirs on the left in
+ * theirs. Consecutive messages from one person group under a single name, and
+ * the log follows new messages only while you are already at the bottom — if
+ * you have scrolled up to reread something, it stays put.
  *
- * Typing indicator lives below the input as a fixed-height row (always
- * occupies its space so messages don't jump when it appears/disappears).
- * Three animated dots when active; visibility:hidden when idle.
+ * The typing line has a fixed height so the log does not jump when it comes
+ * and goes.
  */
 export function ChatPanel({
   onSendMessage,
@@ -34,210 +40,125 @@ export function ChatPanel({
   const [input, setInput] = useState('');
   const { messages } = useSessionContext();
   const { user } = useAuthContext();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
 
+  useLayoutEffect(() => {
+    const log = logRef.current;
+    if (!log || !stickToBottom.current) return;
+    log.scrollTo({ top: log.scrollHeight, behavior: messages.length > 1 ? 'smooth' : 'auto' });
+  }, [messages.length]);
+
+  // A layout shift from fonts or images arriving should not strand the view
+  // just above the latest message.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const log = logRef.current;
+    if (!log) return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottom.current) log.scrollTop = log.scrollHeight;
+    });
+    observer.observe(log);
+    return () => observer.disconnect();
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
+    stickToBottom.current = true;
     onSendMessage(input.trim());
     setInput('');
   };
 
+  const typingName = peerTypingName ?? peerName ?? 'They';
+
   return (
-    <div
-      style={{
-        position: 'relative',
-        height: '100%',
-        display: 'flex',
-        flexDirection: 'column',
-        background: 'var(--cream)',
-        border: '4px solid var(--ink)',
-        borderRadius: 6,
-        boxShadow: '6px 6px 0 var(--ink)',
-        overflow: 'hidden',
-        minHeight: 240,
-      }}
-    >
-      {/* Spiral binding on the left edge */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          bottom: 0,
-          width: 18,
-          background: 'rgba(26,20,23,0.06)',
-          borderRight: '3px dashed var(--ink)',
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'space-around',
-          alignItems: 'center',
-          padding: '10px 0',
-          zIndex: 1,
-        }}
-        aria-hidden="true"
-      >
-        {Array.from({ length: 10 }, (_, i) => (
-          <span
-            key={i}
-            style={{
-              width: 8,
-              height: 12,
-              border: '2px solid var(--ink)',
-              borderRadius: 999,
-              background: 'rgba(26,20,23,0.08)',
-            }}
-          />
-        ))}
-      </div>
+    <section className="chat" aria-label="Chat">
+      <header className="chat__head">
+        <h2 className="chat__title">Chat</h2>
+        {messages.length > 0 && (
+          <span className="muted tabular" style={{ fontSize: '0.8rem', fontWeight: 600 }}>
+            {messages.length} {messages.length === 1 ? 'message' : 'messages'}
+          </span>
+        )}
+      </header>
 
-      {/* Header */}
       <div
-        style={{
-          padding: '12px 16px 8px 30px',
-          borderBottom: '2px dashed var(--ink)',
-          display: 'flex',
-          alignItems: 'baseline',
-          gap: 10,
-          flexShrink: 0,
-        }}
-      >
-        <SectionTitle size={24} underline="pink">
-          CHAT
-        </SectionTitle>
-      </div>
-
-      {/* Messages */}
-      <div
-        className="scroll-y"
-        style={{
-          flex: 1,
-          padding: '14px 14px 14px 30px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 12,
-          minHeight: 0,
+        ref={logRef}
+        className="chat__log"
+        role="log"
+        aria-live="polite"
+        aria-label="Messages"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
         {messages.length === 0 ? (
-          <div
-            className="hand"
-            style={{ textAlign: 'center', fontSize: 18, color: 'rgba(26,20,23,0.55)', marginTop: 12 }}
-          >
-            say hi! ↓
+          <div className="chat__empty">
+            <ChatIcon size={28} />
+            <span>{peerName ? `Say hi to ${peerName}.` : 'Messages you send appear here.'}</span>
           </div>
         ) : (
-          messages.map((msg, i) => (
-            <ChatMessageItem
-              key={i}
-              message={msg}
-              isOwnMessage={msg.sender === user?.username}
-            />
-          ))
+          messages.map((msg, i) => {
+            const prev = messages[i - 1];
+            const first =
+              !prev ||
+              prev.sender !== msg.sender ||
+              new Date(msg.timestamp).getTime() - new Date(prev.timestamp).getTime() > GROUP_GAP_MS;
+            return (
+              <ChatMessageItem
+                key={`${msg.timestamp}-${i}`}
+                message={msg}
+                isOwnMessage={msg.sender === user?.username}
+                isFirstInGroup={first}
+              />
+            );
+          })
         )}
-        <div ref={messagesEndRef} />
       </div>
 
-      {/* Typing indicator — fixed-height row above the input so the chat
-          doesn't reflow when it appears/disappears. visibility:hidden when
-          idle preserves the slot. Three dots stagger via CSS keyframes. */}
-      <div
-        aria-live="polite"
-        style={{
-          paddingLeft: 30,
-          paddingRight: 14,
-          height: 22,
-          fontFamily: 'var(--font-hand)',
-          fontSize: 15,
-          color: 'rgba(26,20,23,0.6)',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          visibility: isPeerTyping ? 'visible' : 'hidden',
-          flexShrink: 0,
-        }}
-      >
-        <span>{peerTypingName ?? peerName ?? 'peer'} is typing</span>
-        <span aria-hidden="true" className="typing-dots">
-          <span />
-          <span />
-          <span />
-        </span>
+      {/* Fixed-height row so the log does not reflow when it appears. */}
+      <div className="chat__typing" aria-live="polite">
+        <AnimatePresence>
+          {isPeerTyping && (
+            <m.span
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+            >
+              <span>{typingName} is typing</span>
+              <span aria-hidden="true" className="typing-dots">
+                <span />
+                <span />
+                <span />
+              </span>
+            </m.span>
+          )}
+        </AnimatePresence>
       </div>
 
-      {/* Input */}
-      <form
-        onSubmit={handleSubmit}
-        style={{
-          borderTop: '2px dashed var(--ink)',
-          padding: '12px 10px 12px 30px',
-          display: 'flex',
-          gap: 8,
-          alignItems: 'center',
-          background: 'rgba(255,79,163,0.04)',
-          flexShrink: 0,
-        }}
-      >
+      <form onSubmit={handleSubmit} className="chat__compose">
         <input
           type="text"
+          className="chat__input"
           value={input}
           onChange={(e) => {
             setInput(e.target.value);
             // Parent decides whether to actually invoke notifyTyping (it
-            // throttles via a ref-based timestamp). Empty/whitespace-only
-            // input still counts — the user is composing.
+            // throttles via a ref-based timestamp). Whitespace still counts —
+            // the user is composing.
             if (e.target.value.length > 0) onTyping?.();
           }}
-          placeholder="thoughts…"
-          style={{
-            flex: 1,
-            minWidth: 0,
-            background: 'var(--cream)',
-            border: '3px solid var(--ink)',
-            borderRadius: '20px 20px 6px 20px',
-            padding: '10px 14px',
-            fontFamily: 'var(--font-body)',
-            fontWeight: 600,
-            fontSize: 14,
-            outline: 'none',
-            color: 'var(--ink)',
-          }}
+          placeholder={peerName ? `Message ${peerName}` : 'Write a message'}
+          aria-label="Message"
+          maxLength={5000}
+          enterKeyHint="send"
         />
-        <button
-          type="submit"
-          disabled={!input.trim()}
-          title="send"
-          style={{
-            background: input.trim() ? 'var(--pink)' : 'rgba(255,79,163,0.4)',
-            border: '3px solid var(--ink)',
-            borderRadius: 12,
-            width: 40,
-            height: 40,
-            cursor: input.trim() ? 'pointer' : 'not-allowed',
-            display: 'grid',
-            placeItems: 'center',
-            boxShadow: '0 3px 0 var(--ink)',
-            transform: 'rotate(-6deg)',
-            padding: 0,
-            flexShrink: 0,
-            transition: 'transform .15s, background .15s',
-          }}
-          onMouseEnter={(e) => {
-            if (input.trim()) {
-              e.currentTarget.style.transform = 'rotate(0) translateY(-2px) scale(1.08)';
-            }
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.transform = 'rotate(-6deg)';
-          }}
-        >
-          <Doodle kind="airplane" size={22} color="var(--ink)" />
-        </button>
+        <IconButton label="Send" type="submit" tone={input.trim() ? 'amber' : undefined} disabled={!input.trim()} tip={false}>
+          <SendIcon size={19} />
+        </IconButton>
       </form>
-    </div>
+    </section>
   );
 }

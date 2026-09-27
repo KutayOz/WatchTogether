@@ -1,6 +1,10 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { api } from '../../services/api';
-import { BackButton, SectionTitle, StickerButton, TagSticker } from '../manga';
+import { Button } from '../ui/Button';
+import { AlertIcon, ChevronDownIcon, ShieldIcon } from '../ui/icons';
+import { ease, spring } from '../ui/motion';
+import { useScene } from '../ui/useScene';
 
 interface TermsModalProps {
   isOpen: boolean;
@@ -13,19 +17,27 @@ interface TermsModalProps {
   onDecline?: () => void;
 }
 
+/**
+ * The House Rules, as the whole screen.
+ *
+ * A reading-progress line runs along the top of the document so the reader
+ * can see how much is left, and the accept button unlatches only once they
+ * have reached the end — see checkAtBottom for the two ways that can happen.
+ */
 export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
+  useScene('theater');
   const [terms, setTerms] = useState<{ version: string; content: string } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isAccepting, setIsAccepting] = useState(false);
   const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
+  const progressRef = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
     if (isOpen) {
       loadTerms();
     }
-
   }, [isOpen]);
 
   const loadTerms = async () => {
@@ -33,7 +45,7 @@ export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
       const data = await api.getTerms();
       setTerms(data);
     } catch {
-      setError('Failed to load terms');
+      setError('The house rules did not load. Check your connection and reload the page.');
     } finally {
       setIsLoading(false);
     }
@@ -45,10 +57,16 @@ export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
    * room to spare, and a box that cannot scroll never fires a scroll event.
    * Gating purely on onScroll left the accept button permanently disabled for
    * anyone whose viewport was taller than ~960px.
+   *
+   * The same pass drives the reading-progress line, written straight to its
+   * style so scrolling does not re-render the document.
    */
   const checkAtBottom = useCallback(() => {
     const el = bodyRef.current;
     if (!el) return;
+    const scrollable = el.scrollHeight - el.clientHeight;
+    const progress = scrollable <= 0 ? 1 : Math.min(1, el.scrollTop / scrollable);
+    progressRef.current?.style.setProperty('transform', `scaleX(${progress})`);
     if (el.scrollHeight - el.scrollTop <= el.clientHeight + 50) {
       setHasScrolledToBottom(true);
     }
@@ -80,7 +98,7 @@ export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
       await api.acceptTerms();
       onAccept();
     } catch {
-      setError('Failed to accept terms. Please try again.');
+      setError('Accepting didn’t go through. Try again.');
     } finally {
       setIsAccepting(false);
     }
@@ -89,173 +107,98 @@ export function TermsModal({ isOpen, onAccept, onDecline }: TermsModalProps) {
   if (!isOpen) return null;
 
   return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(26,20,23,0.5)',
-        zIndex: 7000,
-        display: 'grid',
-        placeItems: 'center',
-        animation: 'fadeIn 0.25s ease-out forwards',
-        padding: 16,
-      }}
-    >
-      <div
-        style={{
-          width: '100%',
-          maxWidth: 640,
-          maxHeight: '90vh',
-          display: 'flex',
-          flexDirection: 'column',
-          background: 'var(--cream)',
-          border: '4.5px solid var(--ink)',
-          boxShadow: '12px 12px 0 var(--ink)',
-          animation: 'postcardIn 0.55s cubic-bezier(.34,1.56,.64,1)',
-          transform: 'rotate(-1.2deg)',
-        }}
+    <div className="rules">
+      <m.section
+        className="sheet rules__sheet"
+        aria-labelledby="rules-title"
+        initial={{ opacity: 0, y: 28, filter: 'blur(8px)' }}
+        animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+        transition={{ duration: 0.7, ease: ease.out }}
       >
-        {/* Header */}
-        <div
-          style={{
-            padding: '20px 28px 14px',
-            borderBottom: '3px dashed var(--ink)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 14,
-            flexWrap: 'wrap',
-          }}
-        >
-          <SectionTitle size={32} underline="pink">
-            HOUSE RULES
-          </SectionTitle>
-          {terms && (
-            <TagSticker color="cream" rot={4}>
-              v{terms.version}
-            </TagSticker>
-          )}
+        <header className="rules__head">
+          <span className="rules__badge" aria-hidden="true">
+            <ShieldIcon size={22} />
+          </span>
+          <div>
+            <h1 id="rules-title" className="rules__title">
+              House rules
+            </h1>
+            <p className="rules__sub">
+              {terms ? `Version ${terms.version}. ` : ''}Read them through once, then you’re in.
+            </p>
+          </div>
+        </header>
+
+        <div className="rules__progress" aria-hidden="true">
+          <span ref={progressRef} />
         </div>
 
-        {/* Body */}
-        <div
-          ref={bodyRef}
-          className="scroll-y"
-          onScroll={checkAtBottom}
-          style={{
-            flex: 1,
-            padding: '20px 28px',
-            backgroundImage:
-              'repeating-linear-gradient(0deg, transparent 0 27px, rgba(123,63,228,0.18) 27px 28px)',
-          }}
-        >
+        <div ref={bodyRef} className="rules__doc" onScroll={checkAtBottom} tabIndex={0} aria-label="House rules text">
           {isLoading ? (
-            <div className="hand" style={{ fontSize: 24, color: 'var(--purple)', textAlign: 'center', padding: 32 }}>
-              loading the fine print…
-            </div>
+            <p className="muted" style={{ padding: '24px 0', textAlign: 'center' }}>
+              Loading the house rules…
+            </p>
           ) : terms ? (
-            <div style={{ fontFamily: 'var(--font-body)', color: 'var(--ink)', lineHeight: 1.6, fontSize: 14, fontWeight: 600 }}>
+            <div className="rules__text">
               {terms.content.split('\n').map((line, i) => {
-                if (line.startsWith('# ')) {
-                  return (
-                    <h3
-                      key={i}
-                      style={{
-                        fontFamily: 'var(--font-sfx)',
-                        fontSize: 24,
-                        letterSpacing: 1,
-                        margin: '14px 0 8px',
-                        color: 'var(--ink)',
-                      }}
-                    >
-                      {line.slice(2)}
-                    </h3>
-                  );
-                }
-                if (line.startsWith('## ')) {
-                  return (
-                    <h4
-                      key={i}
-                      style={{
-                        fontFamily: 'var(--font-sfx)',
-                        fontSize: 18,
-                        letterSpacing: 1,
-                        margin: '12px 0 6px',
-                        color: 'var(--purple)',
-                      }}
-                    >
-                      {line.slice(3)}
-                    </h4>
-                  );
-                }
+                if (line.startsWith('# ')) return <h2 key={i}>{line.slice(2)}</h2>;
+                if (line.startsWith('## ')) return <h3 key={i}>{line.slice(3)}</h3>;
                 if (line.startsWith('- ')) {
                   return (
-                    <div key={i} style={{ paddingLeft: 16, marginBottom: 4 }}>
-                      · {line.slice(2)}
-                    </div>
-                  );
-                }
-                if (line.trim()) {
-                  return (
-                    <p key={i} style={{ margin: '0 0 8px' }}>
-                      {line}
+                    <p key={i} className="rules__li">
+                      {line.slice(2)}
                     </p>
                   );
                 }
+                if (line.trim()) return <p key={i}>{line}</p>;
                 return null;
               })}
             </div>
           ) : (
-            <div className="hand" style={{ color: 'var(--orange-deep)', textAlign: 'center', fontSize: 22 }}>
-              failed to load
-            </div>
+            <p style={{ color: 'var(--exit)', padding: '24px 0', textAlign: 'center' }}>Failed to load.</p>
           )}
         </div>
 
-        {/* Footer */}
-        <div
-          style={{
-            padding: '16px 28px 22px',
-            borderTop: '3px dashed var(--ink)',
-            background: 'rgba(255,79,163,0.06)',
-          }}
-        >
-          {!hasScrolledToBottom && (
-            <p
-              className="hand"
-              style={{ fontSize: 18, color: 'rgba(26,20,23,0.55)', textAlign: 'center', marginTop: 0, marginBottom: 12 }}
-            >
-              ↓ scroll to the bottom to accept ↓
-            </p>
-          )}
+        <footer className="rules__foot">
+          <AnimatePresence initial={false}>
+            {!hasScrolledToBottom && (
+              <m.p
+                className="rules__hint"
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={spring.soft}
+              >
+                <ChevronDownIcon size={16} className="rules__hint-arrow" />
+                Scroll to the bottom to accept
+              </m.p>
+            )}
+          </AnimatePresence>
           {error && (
-            <p className="hand" style={{ color: 'var(--orange-deep)', fontSize: 18, textAlign: 'center', margin: '0 0 12px' }}>
-              {error}
-            </p>
+            <div className="notice notice--error" role="alert">
+              <AlertIcon size={18} />
+              <span>{error}</span>
+            </div>
           )}
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'center',
-              alignItems: 'center',
-              gap: 18,
-              flexWrap: 'wrap',
-            }}
-          >
-            <StickerButton
-              color="pink"
-              size="md"
-              sfx="STAMP!"
+          <div className="rules__actions">
+            {onDecline && (
+              <Button variant="ghost" onClick={onDecline}>
+                No thanks, sign me out
+              </Button>
+            )}
+            <Button
+              variant="primary"
+              size="lg"
+              magnetic
               onClick={handleAccept}
+              loading={isAccepting}
               disabled={!hasScrolledToBottom || isAccepting || isLoading}
             >
-              {isAccepting ? 'STAMPING…' : 'I ACCEPT'}
-            </StickerButton>
-            {onDecline && (
-              <BackButton onClick={onDecline}>no thanks — sign out</BackButton>
-            )}
+              {isAccepting ? 'Accepting…' : 'I accept'}
+            </Button>
           </div>
-        </div>
-      </div>
+        </footer>
+      </m.section>
     </div>
   );
 }

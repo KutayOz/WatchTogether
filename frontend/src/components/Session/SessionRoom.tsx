@@ -57,17 +57,22 @@ import { useResizableSidebar } from '../../hooks/useResizableSidebar';
 import { useInviteLink } from '../../hooks/useInviteLink';
 import { useWatchTogether } from '../../hooks/useWatchTogether';
 import { usePeerPresence } from '../../hooks/usePeerPresence';
-import { MediaControls } from '../Controls/MediaControls';
-import { Loading } from '../common/Loading';
+import { MediaControls, type DockMenuItem } from '../Controls/MediaControls';
 import { Toast } from '../common/Toast';
-import {
-  SectionTitle,
-  TagSticker,
-  StickerButton,
-  BurstSticker,
-  BackButton,
-  Doodle,
-} from '../manga';
+import { AnimatePresence, m } from 'motion/react';
+import { Button } from '../ui/Button';
+import { TextField } from '../ui/Field';
+import { Modal } from '../ui/Modal';
+import { Lights } from '../ui/Lights';
+import { FilmLeader } from '../ui/FilmLeader';
+import { ScrambleText } from '../ui/ScrambleText';
+import { AlertIcon, BlurIcon, CheckIcon, CopyIcon, KeyboardIcon, LinkIcon, PlayIcon, RefreshIcon } from '../ui/icons';
+import { sparkle } from '../ui/interactions';
+import { ease } from '../ui/motion';
+import { useScene } from '../ui/useScene';
+import { useAmbientLight } from '../../hooks/useAmbientLight';
+import type { FloatingReaction as FloatingReactionData } from '../../hooks/usePeerPresence';
+import './session.css';
 import type {
   MediaState,
   ScreenShareQuality,
@@ -119,7 +124,11 @@ export function SessionRoom() {
    */
   const SCREEN_SHARE_REQUEST_TIMEOUT_MS = 30_000;
   const [toast, setToast] = useState<{ message: string; type: 'info' | 'error' | 'warning' } | null>(null);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  // Docked and open on a desk-sized screen; on anything narrower the panel is
+  // a drawer over the stage, so it starts closed and the picture gets the room.
+  const [isSidebarOpen, setIsSidebarOpen] = useState(
+    () => typeof window === 'undefined' || window.matchMedia('(min-width: 1024px)').matches,
+  );
 
   // Stage gate. Mount lands here; PreflightLobby renders until the user
   // grants device permission and clicks JOIN, then we flip to 'joining'
@@ -127,6 +136,14 @@ export function SessionRoom() {
   // is set. Routing back to lobby cancels and unmounts this whole component,
   // so we don't need an explicit reset path.
   const [stage, setStage] = useState<'preflight' | 'joining' | 'live'>('preflight');
+
+  // In the call the room goes dark and the grain stops: the picture is the
+  // only thing that should be moving.
+  useScene(stage === 'live' ? 'room' : 'theater');
+
+  // The stage throws the colours of whatever is playing onto the room.
+  const stageWrapRef = useRef<HTMLDivElement>(null);
+  useAmbientLight(stageWrapRef, stage === 'live');
 
   /**
    * The user's quality CEILING, not the operating point.
@@ -1696,6 +1713,19 @@ export function SessionRoom() {
   // onReady callback. hasTriedJoiningRef survives so the error-state TRY AGAIN
   // button (below) can re-arm a retry.
 
+  // On a narrow screen the panel floats over the stage, so Escape should be
+  // able to put it away like any other drawer.
+  useEffect(() => {
+    if (!isSidebarOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || window.matchMedia('(min-width: 1024px)').matches) return;
+      if (document.querySelector('[role="dialog"]')) return;
+      setIsSidebarOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isSidebarOpen]);
+
   if (!user) {
     return null;
   }
@@ -1708,53 +1738,62 @@ export function SessionRoom() {
       <PreflightLobby
         onReady={handlePreflightReady}
         onCancel={handlePreflightCancel}
-        contextHint={isCreator ? 'starting a new session' : urlSessionId ? `joining session ${urlSessionId.slice(0, 6)}…` : undefined}
+        contextHint={
+          isCreator
+            ? 'Starting a new session'
+            : urlSessionId
+              ? `Joining session ${urlSessionId.slice(0, 6)}…`
+              : undefined
+        }
       />
     );
   }
 
   if (isJoining || (!sessionId && !error)) {
     return (
-      <div className="app" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
-        <div style={{ textAlign: 'center' }}>
-          <Loading />
-          <p className="hand" style={{ fontSize: 22, marginTop: 16, color: 'var(--purple)' }}>
-            {urlSessionId ? 'joining session…' : 'creating session…'}
-          </p>
-        </div>
+      <div className="room-wait">
+        <FilmLeader label={urlSessionId ? 'Joining the session…' : 'Creating the session…'} />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="app" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
-        <div style={{ textAlign: 'center', maxWidth: 480 }}>
-          <BurstSticker bg="var(--orange)" rot={-4} w={240} h={150}>
-            OOPS!
-          </BurstSticker>
-          <p className="hand" style={{ fontSize: 22, marginTop: 18 }}>{error}</p>
-          <div className="row" style={{ justifyContent: 'center', gap: 14, marginTop: 24, flexWrap: 'wrap' }}>
+      <div className="room-wait">
+        <m.div
+          className="sheet room-wait__card"
+          role="alert"
+          initial={{ opacity: 0, y: 18, filter: 'blur(6px)' }}
+          animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+          transition={{ duration: 0.55, ease: ease.out }}
+        >
+          <span className="status-card__icon" aria-hidden="true">
+            <AlertIcon size={28} />
+          </span>
+          <h1>Couldn’t join the session</h1>
+          <p>{error}</p>
+          <div className="cluster" style={{ justifyContent: 'center' }}>
+            <Button variant="ghost" onClick={() => navigate('/')}>
+              Back to lobby
+            </Button>
             {urlSessionId && (
-              <StickerButton
-                color="pink"
-                size="md"
-                sfx="TAP!"
+              <Button
+                variant="primary"
+                icon={<RefreshIcon size={18} />}
                 onClick={() => {
-                  // Bounce back to the preflight stage. The user can re-pick
-                  // devices (USB plug changes are a real recovery path) and
-                  // commit again from there.
+                  // Back to the preflight stage. The user can re-pick devices
+                  // (USB plug changes are a real recovery path) and commit again
+                  // from there.
                   setError(null);
                   hasTriedJoiningRef.current = false;
                   setStage('preflight');
                 }}
               >
-                TRY AGAIN
-              </StickerButton>
+                Try again
+              </Button>
             )}
-            <BackButton onClick={() => navigate('/')}>lobby</BackButton>
           </div>
-        </div>
+        </m.div>
       </div>
     );
   }
@@ -1763,16 +1802,27 @@ export function SessionRoom() {
   const canRequestShare = !currentScreenSharer && !isWaitingForApproval;
   const timeRemaining = getInviteTimeRemaining();
 
-  // Human-friendly label + color for the header pill. Kept in one place so
-  // the overlay below can also key off the same uiConnState.
+  // With nobody sharing and their camera up, the stage already IS their face,
+  // so the side panel folds its copy of the faces away and gives chat the room.
+  const stageShowsPeer =
+    !watchVideoId &&
+    !webrtc.localScreenStream &&
+    !webrtc.remoteScreenStream &&
+    !currentScreenSharer &&
+    !peerHasLeft &&
+    !!peerName &&
+    !!webrtc.remoteCameraStream;
+
+  // Friendly projection of uiConnState for the top bar. Kept in one place so
+  // the overlay below keys off the same states.
   const connDisplay = (() => {
     switch (uiConnState) {
-      case 'connected':    return { label: 'connected',     color: 'var(--purple)' };
-      case 'connecting':   return { label: 'connecting…',   color: 'var(--orange)' };
-      case 'reconnecting': return { label: 'reconnecting…', color: 'var(--orange-deep)' };
-      case 'lost':         return { label: 'connection lost', color: 'var(--orange-deep)' };
+      case 'connected':    return { label: 'Connected' };
+      case 'connecting':   return { label: 'Connecting…' };
+      case 'reconnecting': return { label: 'Reconnecting…' };
+      case 'lost':         return { label: 'Connection lost' };
       case 'idle':
-      default:             return { label: 'idle',          color: 'rgba(26,20,23,0.5)' };
+      default:             return { label: peerName ? 'Setting up' : 'Ready' };
     }
   })();
 
@@ -1798,18 +1848,47 @@ export function SessionRoom() {
     onPeerVolumeChange: setPeerVolume,
   };
 
+  // What lives behind the dock's "more" button. Watch together needs a live
+  // call and a free stage (one main-panel mode at a time); blur needs a camera.
+  const menuItems: DockMenuItem[] = [
+    ...(isCallActive && !currentScreenSharer && !watchVideoId
+      ? [
+          {
+            id: 'watch',
+            label: 'Watch a video together',
+            hint: 'Paste a YouTube link, playback stays in sync',
+            icon: <PlayIcon size={18} />,
+            onSelect: () => setShowWatchPrompt(true),
+          },
+        ]
+      : []),
+    ...(cameraTrack
+      ? [
+          {
+            id: 'blur',
+            label: blur.isLoading ? 'Preparing background blur…' : 'Background blur',
+            hint: 'Blurs everything behind you',
+            icon: <BlurIcon size={18} />,
+            pressed: bgBlurEnabled,
+            disabled: blur.isLoading,
+            onSelect: () => setBgBlurEnabled((b) => !b),
+          },
+        ]
+      : []),
+    {
+      id: 'shortcuts',
+      label: 'Keyboard shortcuts',
+      icon: <KeyboardIcon size={18} />,
+      onSelect: () => setShowCheatSheet(true),
+    },
+  ];
+
   return (
     <div
-      style={{
-        height: '100vh',
-        display: 'flex',
-        flexDirection: 'column',
-        padding: 12,
-        gap: 10,
-        overflow: 'hidden',
-        position: 'relative',
-        zIndex: 1,
-      }}
+      className="room"
+      data-side={isSidebarOpen ? 'open' : 'closed'}
+      data-resizing={isResizingSidebar ? '' : undefined}
+      style={{ ['--side-w' as string]: `${sidebarWidth}px` }}
     >
       {/*
         Everything `position: fixed` at room level goes through FullscreenPortal.
@@ -1829,7 +1908,11 @@ export function SessionRoom() {
           />
         )}
 
-        {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+        <AnimatePresence>
+          {toast && (
+            <Toast key={toast.message} message={toast.message} type={toast.type} onClose={() => setToast(null)} />
+          )}
+        </AnimatePresence>
 
         <KeyboardShortcutsModal isOpen={showCheatSheet} onClose={() => setShowCheatSheet(false)} />
 
@@ -1839,271 +1922,54 @@ export function SessionRoom() {
           report={debugReport ?? ''}
         />
 
-        {/* Watch Together URL prompt */}
-        {showWatchPrompt && (
-          <WatchUrlPrompt
-            onSubmit={handleStartWatch}
-            onCancel={() => setShowWatchPrompt(false)}
-          />
-        )}
+        <WatchUrlPrompt
+          isOpen={showWatchPrompt}
+          onSubmit={handleStartWatch}
+          onCancel={() => setShowWatchPrompt(false)}
+        />
 
-        {/* Reactions: floating emojis drifting up from the bottom-centre,
-            fading out. role="status" + aria-live="polite" so screen readers
-            get a brief mention without interrupting. */}
-        <div
-          role="status"
-          aria-live="polite"
-          style={{
-            position: 'fixed',
-            left: 0,
-            right: 0,
-            bottom: 0,
-            pointerEvents: 'none',
-            zIndex: 70,
-            display: 'flex',
-            justifyContent: 'center',
-          }}
-        >
-          {reactions.map((r) => (
-            <span
-              key={r.id}
-              aria-label={`${r.from} reacted with ${r.emoji}`}
-              style={{
-                position: 'absolute',
-                bottom: 80,
-                fontSize: 44,
-                animation: 'reactionFloat 2200ms ease-out forwards',
-                // Slight horizontal jitter per reaction so they don't stack —
-                // hash the id into a deterministic offset.
-                transform: `translateX(${((r.id % 9) - 4) * 16}px)`,
-                userSelect: 'none',
-              }}
-            >
-              {r.emoji}
-            </span>
-          ))}
-        </div>
-
-        {/* Reactions palette — small floating cluster bottom-right, always
-            available when there's a peer. R keyboard shortcut also opens it
-            (via the keyboard hook below). */}
-        {isCallActive && (
-          <ReactionsPalette onPick={handleSendReaction} />
-        )}
+        <FloatingReactions reactions={reactions} myName={user.username} />
       </FullscreenPortal>
 
-      {/* Top header strip */}
-      <div
-        style={{
-          flexShrink: 0,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          padding: '8px 14px',
-          background: 'var(--cream)',
-          border: '3px solid var(--ink)',
-          borderRadius: 12,
-          boxShadow: '4px 4px 0 var(--ink)',
-          flexWrap: 'wrap',
-          transform: 'rotate(-0.3deg)',
-        }}
-      >
-        <SectionTitle size={22} underline="pink">
-          SESSION
-        </SectionTitle>
-
-        {peerName ? (
-          <span
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              fontFamily: 'var(--font-body)',
-              fontWeight: 700,
-              fontSize: 14,
-            }}
-          >
-            <Doodle kind="heart" size={18} color="var(--pink)" />
-            <span style={{ color: 'var(--ink)' }}>{peerName}</span>
-            <span
-              className="hand"
-              aria-live="polite"
-              style={{ fontSize: 16, color: connDisplay.color }}
-            >
-              · {connDisplay.label}
+      <header className="room-top">
+        <div className="room-top__who">
+          <Lights together={!!peerName && !peerHasLeft} size={40} />
+          <div className="room-top__text">
+            <span className="room-top__title" aria-live="polite">
+              {peerName ? (
+                <>
+                  With <strong>{peerName}</strong>
+                </>
+              ) : peerHasLeft ? (
+                'They left the session'
+              ) : (
+                'Waiting for someone to join'
+              )}
             </span>
-            {/* Quality badge — only when we have an active call to measure.
-                During connecting/reconnecting/lost the connDisplay pill
-                already tells the story, so we'd be adding noise. */}
-            {isCallActive && (
-              <ConnectionQualityBadge
-                quality={qualityMonitor.quality}
-                metrics={qualityMonitor.metrics}
-              />
-            )}
-            {/* Watch Together launcher — small inline sticker. Disabled when
-                someone is already screen-sharing (only one main-panel mode
-                at a time) or when there's no peer yet. */}
-            {isCallActive && !currentScreenSharer && !watchVideoId && (
-              <button
-                type="button"
-                onClick={() => setShowWatchPrompt(true)}
-                aria-label="watch a video together"
-                title="watch a video together"
-                style={{
-                  marginLeft: 'auto',
-                  padding: '4px 12px',
-                  background: 'var(--purple)',
-                  color: 'var(--cream)',
-                  border: '2.5px solid var(--ink)',
-                  boxShadow: '3px 3px 0 var(--ink)',
-                  fontFamily: 'var(--font-sfx)',
-                  fontSize: 12,
-                  letterSpacing: 1,
-                  cursor: 'pointer',
-                  transform: 'rotate(-2deg)',
-                }}
-              >
-                ♥ WATCH TOGETHER
-              </button>
-            )}
-            {/* Background blur toggle — small sticker next to the call-quality
-                badge. Only renders when we actually have a camera (no point
-                if camera is off). aria-pressed tells SR it's a toggle. */}
-            {!!cameraTrack && (
-              <button
-                type="button"
-                onClick={() => setBgBlurEnabled((b) => !b)}
-                aria-pressed={bgBlurEnabled}
-                aria-label="background blur"
-                title={blur.isLoading ? 'preparing blur…' : bgBlurEnabled ? 'blur on — click to turn off' : 'blur off'}
-                disabled={blur.isLoading}
-                style={{
-                  marginLeft: isCallActive && !currentScreenSharer && !watchVideoId ? 0 : 'auto',
-                  padding: '4px 10px',
-                  background: bgBlurEnabled ? 'var(--purple)' : 'var(--cream)',
-                  color: bgBlurEnabled ? 'var(--cream)' : 'var(--ink)',
-                  border: '2.5px solid var(--ink)',
-                  boxShadow: '3px 3px 0 var(--ink)',
-                  fontFamily: 'var(--font-sfx)',
-                  fontSize: 11,
-                  letterSpacing: 1,
-                  cursor: blur.isLoading ? 'wait' : 'pointer',
-                  transform: 'rotate(2deg)',
-                  opacity: blur.isLoading ? 0.6 : 1,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 4,
-                }}
-              >
-                <span aria-hidden="true">⊙</span>
-                {blur.isLoading ? 'LOADING' : bgBlurEnabled ? 'BLUR ON' : 'BLUR'}
-              </button>
-            )}
-          </span>
-        ) : (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span className="hand" style={{ fontSize: 18, color: 'rgba(26,20,23,0.6)' }}>
-              waiting for a friend…
+            <span className="room-top__meta">
+              <span className="room-top__state" data-state={uiConnState}>
+                <span className="chip__dot" data-live={uiConnState === 'connected' ? '' : undefined} aria-hidden="true" />
+                {connDisplay.label}
+              </span>
+              {/* Only with a live call to measure. While connecting or
+                  reconnecting the state above already tells the story. */}
+              {isCallActive && (
+                <ConnectionQualityBadge quality={qualityMonitor.quality} metrics={qualityMonitor.metrics} />
+              )}
             </span>
-            {inviteUrl ? (
-              <>
-                <a
-                  href={inviteUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title={inviteUrl}
-                  style={{
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                    color: 'var(--ink)',
-                    textDecoration: 'underline',
-                    maxWidth: 200,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {inviteUrl.replace(/^https?:\/\//, '').substring(0, 32)}…
-                </a>
-                <button
-                  type="button"
-                  onClick={handleCopyInvite}
-                  style={{
-                    padding: '4px 10px',
-                    background: inviteCopied ? 'var(--purple)' : 'var(--pink)',
-                    color: inviteCopied ? 'var(--cream)' : 'var(--ink)',
-                    border: '2.5px solid var(--ink)',
-                    borderRadius: 999,
-                    fontFamily: 'var(--font-sfx)',
-                    fontSize: 12,
-                    letterSpacing: 1,
-                    cursor: 'pointer',
-                    boxShadow: '2px 2px 0 var(--ink)',
-                  }}
-                >
-                  {inviteCopied ? 'COPIED!' : 'COPY'}
-                </button>
-                {timeRemaining && (
-                  <span className="hand" style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)' }}>
-                    {timeRemaining}
-                  </span>
-                )}
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={handleGenerateInvite}
-                disabled={isGeneratingInvite}
-                style={{
-                  padding: '4px 12px',
-                  background: 'var(--purple)',
-                  color: 'var(--cream)',
-                  border: '2.5px solid var(--ink)',
-                  borderRadius: 999,
-                  fontFamily: 'var(--font-sfx)',
-                  fontSize: 12,
-                  letterSpacing: 1,
-                  cursor: isGeneratingInvite ? 'not-allowed' : 'pointer',
-                  boxShadow: '2px 2px 0 var(--ink)',
-                  opacity: isGeneratingInvite ? 0.5 : 1,
-                }}
-              >
-                {isGeneratingInvite ? 'GENERATING…' : 'GENERATE INVITE'}
-              </button>
-            )}
+          </div>
+        </div>
+        <div className="room-top__right">
+          <span className="chip room-top__me" title="Signed in as">
+            {user.tag}
           </span>
-        )}
+        </div>
+      </header>
 
-        <span style={{ flex: 1 }} />
-
-        <TagSticker color="cream" rot={2}>
-          {user.tag}
-        </TagSticker>
-      </div>
-
-      {/* Main content */}
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          gap: 10,
-          minHeight: 0,
-          overflow: 'hidden',
-        }}
-      >
-        {/* Screen share + controls */}
-        <div
-          style={{
-            flex: 1,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 10,
-            minWidth: 0,
-            minHeight: 0,
-          }}
-        >
-          <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+      <div className="room-body">
+        <main className="room-main">
+          <div className="stage-wrap" ref={stageWrapRef}>
+            <div className="stage-glow" aria-hidden="true" />
             {/*
               A sibling of ScreenShareView, not a child, so in fullscreen it was
               painted underneath the share: an ICE drop looked like a picture
@@ -2141,44 +2007,54 @@ export function SessionRoom() {
                 onClose={handleCloseWatch}
               />
             ) : (
-            <ScreenShareView
-              screenStream={isLocalSharing ? webrtc.localScreenStream : webrtc.remoteScreenStream}
-              isLocalSharing={isLocalSharing}
-              sharerName={currentScreenSharer}
-              onRequestShare={handleRequestScreenShare}
-              canRequestShare={canRequestShare}
-              isWaitingForApproval={isWaitingForApproval}
-              onCancelRequest={handleCancelScreenShareRequest}
-              isMuted={isMuted}
-              isCameraOn={isCameraOn}
-              isScreenSharing={webrtc.isScreenSharing}
-              onToggleMute={() => toggleMute(webrtc.toggleAudio)}
-              onToggleCamera={() => toggleCamera(webrtc.toggleVideo)}
-              onToggleScreenShare={
-                webrtc.isScreenSharing ? handleStopScreenShare : handleRequestScreenShare
-              }
-              onLeave={handleLeave}
-              canShare={canRequestShare || webrtc.isScreenSharing}
-              remoteCameraStream={webrtc.remoteCameraStream}
-              localStream={webrtc.localStream}
-              peerDisplayName={peerName}
-              peerHasLeft={peerHasLeft}
-              peerIsMuted={!!peerMediaState?.isMuted}
-              peerIsCameraOff={peerMediaState ? !peerMediaState.isCameraOn : false}
-              qualityLevel={qualityMonitor.quality}
-              peerQualityLevel={peerQualityFeedback?.level}
-              onHasScreenAudioChange={setHasScreenAudio}
-              externalScreenAudioVolume={screenAudioVolume}
-              peerCursor={peerCursor}
-              onLocalCursor={handleLocalCursor}
-              onViewportChange={handleViewportChange}
-              onDebugReport={() => void openDebugReport()}
-              {...qualityControls}
-            />
+              <ScreenShareView
+                screenStream={isLocalSharing ? webrtc.localScreenStream : webrtc.remoteScreenStream}
+                isLocalSharing={isLocalSharing}
+                sharerName={currentScreenSharer}
+                onRequestShare={handleRequestScreenShare}
+                canRequestShare={canRequestShare}
+                isWaitingForApproval={isWaitingForApproval}
+                onCancelRequest={handleCancelScreenShareRequest}
+                isMuted={isMuted}
+                isCameraOn={isCameraOn}
+                isScreenSharing={webrtc.isScreenSharing}
+                onToggleMute={() => toggleMute(webrtc.toggleAudio)}
+                onToggleCamera={() => toggleCamera(webrtc.toggleVideo)}
+                onToggleScreenShare={
+                  webrtc.isScreenSharing ? handleStopScreenShare : handleRequestScreenShare
+                }
+                onLeave={handleLeave}
+                canShare={canRequestShare || webrtc.isScreenSharing}
+                remoteCameraStream={webrtc.remoteCameraStream}
+                localStream={webrtc.localStream}
+                peerDisplayName={peerName}
+                peerHasLeft={peerHasLeft}
+                peerIsMuted={!!peerMediaState?.isMuted}
+                peerIsCameraOff={peerMediaState ? !peerMediaState.isCameraOn : false}
+                qualityLevel={qualityMonitor.quality}
+                peerQualityLevel={peerQualityFeedback?.level}
+                onHasScreenAudioChange={setHasScreenAudio}
+                externalScreenAudioVolume={screenAudioVolume}
+                peerCursor={peerCursor}
+                onLocalCursor={handleLocalCursor}
+                onViewportChange={handleViewportChange}
+                onDebugReport={() => void openDebugReport()}
+                waitingSlot={
+                  <InviteCard
+                    inviteUrl={inviteUrl}
+                    isGenerating={isGeneratingInvite}
+                    copied={inviteCopied}
+                    timeRemaining={timeRemaining}
+                    onGenerate={handleGenerateInvite}
+                    onCopy={handleCopyInvite}
+                  />
+                }
+                {...qualityControls}
+              />
             )}
           </div>
 
-          <div style={{ flexShrink: 0 }}>
+          <div className="room-dock-wrap">
             <MediaControls
               isMuted={isMuted}
               isCameraOn={isCameraOn}
@@ -2198,22 +2074,26 @@ export function SessionRoom() {
               hasScreenAudio={hasScreenAudio && !isLocalSharing}
               screenAudioVolume={screenAudioVolume}
               onScreenAudioVolumeChange={setScreenAudioVolume}
+              menuItems={menuItems}
+              onReact={isCallActive ? handleSendReaction : undefined}
+              chat={{
+                open: isSidebarOpen,
+                unread: unreadMessages,
+                onToggle: () => setIsSidebarOpen((open) => !open),
+              }}
             />
           </div>
-        </div>
+        </main>
 
-        {/* Sidebar (cameras + chat) — collapsible on mobile, resizable on desktop.
-            display: none used to wink the sidebar out instantly (no animation
-            possible on `display`). Switching to width + opacity + transform
-            lets the transition actually play. aria-hidden tracks the collapsed
-            state so screen readers skip the hidden subtree.
-
-            Resize handle sits on the LEFT edge — pulling left grows the
-            sidebar (and shrinks the screen-share panel), pulling right does
-            the inverse. Width persists in localStorage. While the user is
-            actively dragging we suppress the open/close transition so
-            tracking feels 1:1. */}
-        <div style={{ position: 'relative', display: 'flex' }}>
+        {/* People and chat — docked and resizable on a desk, a drawer on a
+            tablet, a sheet on a phone. `inert` while closed, so a hidden
+            panel cannot hold focus or be tabbed into. Nothing is unmounted:
+            the peer's audio plays from inside it. */}
+        <aside className="room-side" aria-label="People and chat" inert={!isSidebarOpen}>
+          {/* Resize handle on the LEFT edge — pulling left grows the panel
+              (and shrinks the stage), pulling right does the inverse. Width
+              persists in localStorage. While dragging, the open/close
+              transition is suppressed so tracking feels 1:1. */}
           <div
             role="separator"
             aria-orientation="vertical"
@@ -2222,282 +2102,242 @@ export function SessionRoom() {
             aria-valuemax={SIDEBAR_MAX}
             aria-valuenow={sidebarWidth}
             onMouseDown={handleSidebarResizeStart}
-            className="sidebar-resize-handle"
-            style={{
-              width: 6,
-              flexShrink: 0,
-              cursor: 'col-resize',
-              alignSelf: 'stretch',
-              // Hover-only visual; we paint a faint ink line via CSS so
-              // it doesn't compete with the content when idle.
-              background: isResizingSidebar ? 'var(--purple)' : 'transparent',
-              transition: 'background 120ms ease',
-              display: isSidebarOpen ? 'block' : 'none',
-            }}
+            className="room-side__handle"
           />
-        <div
-          aria-hidden={!isSidebarOpen}
-          style={{
-            width: isSidebarOpen ? sidebarWidth : 0,
-            flexShrink: 0,
-            minHeight: 0,
-            overflow: 'hidden',
-            transition: isResizingSidebar
-              ? 'none'
-              : 'width 280ms cubic-bezier(.34,1.5,.64,1), transform 280ms ease, opacity 220ms ease',
-            transform: isSidebarOpen ? 'translateX(0)' : 'translateX(40px)',
-            opacity: isSidebarOpen ? 1 : 0,
-            pointerEvents: isSidebarOpen ? 'auto' : 'none',
-          }}
-        >
-          <Sidebar
-            localStream={webrtc.localStream}
-            remoteStream={webrtc.remoteCameraStream}
-            remoteDisplayName={peerName}
-            peerHasLeft={peerHasLeft}
-            onSendMessage={handleSendMessage}
-            peerVolume={peerVolume}
-            peerIsMuted={!!peerMediaState?.isMuted}
-            peerIsCameraOff={peerMediaState ? !peerMediaState.isCameraOn : false}
-            localIsMuted={isMuted}
-            localIsCameraOff={!isCameraOn}
-            isPeerTyping={isPeerTyping}
-            peerTypingName={peerTypingName}
-            onLocalTyping={handleLocalTyping}
-          />
-        </div>
-        </div>
+          <div className="room-side__inner">
+            <Sidebar
+              localStream={webrtc.localStream}
+              remoteStream={webrtc.remoteCameraStream}
+              remoteDisplayName={peerName}
+              localDisplayName={user.username}
+              peerHasLeft={peerHasLeft}
+              onSendMessage={handleSendMessage}
+              peerVolume={peerVolume}
+              peerIsMuted={!!peerMediaState?.isMuted}
+              peerIsCameraOff={peerMediaState ? !peerMediaState.isCameraOn : false}
+              localIsMuted={isMuted}
+              localIsCameraOff={!isCameraOn}
+              isPeerTyping={isPeerTyping}
+              peerTypingName={peerTypingName}
+              onLocalTyping={handleLocalTyping}
+              foldTiles={stageShowsPeer}
+              onClose={() => setIsSidebarOpen(false)}
+            />
+          </div>
+        </aside>
+        <div className="room-scrim" aria-hidden="true" onClick={() => setIsSidebarOpen(false)} />
       </div>
-
-      {/* Mobile sidebar toggle (visible only on narrow viewports via media query) */}
-      <button
-        type="button"
-        onClick={() => setIsSidebarOpen((open) => !open)}
-        className="mobile-sidebar-toggle"
-        title={isSidebarOpen ? 'hide sidebar' : 'show sidebar'}
-        style={{
-          position: 'fixed',
-          bottom: 24,
-          right: 16,
-          zIndex: 60,
-          width: 50,
-          height: 50,
-          borderRadius: '50%',
-          background: 'var(--pink)',
-          border: '3px solid var(--ink)',
-          boxShadow: '4px 4px 0 var(--ink)',
-          cursor: 'pointer',
-          display: 'none',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 0,
-        }}
-      >
-        <span style={{ fontFamily: 'var(--font-sfx)', fontSize: 18, color: 'var(--ink)' }}>
-          {isSidebarOpen ? '×' : '☰'}
-        </span>
-        {/* Unread chat counter — only rendered when collapsed AND there are
-            actually unread messages. Capped at "9+" so the dot doesn't grow
-            wide enough to throw off the FAB silhouette. */}
-        {!isSidebarOpen && unreadMessages > 0 && (
-          <span
-            aria-label={`${unreadMessages} unread message${unreadMessages === 1 ? '' : 's'}`}
-            style={{
-              position: 'absolute',
-              top: -4,
-              right: -4,
-              minWidth: 22,
-              height: 22,
-              padding: '0 5px',
-              borderRadius: 999,
-              background: 'var(--orange-deep, var(--orange))',
-              color: 'var(--cream)',
-              border: '2.5px solid var(--ink)',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 11,
-              letterSpacing: 0.5,
-              display: 'grid',
-              placeItems: 'center',
-              transform: 'rotate(8deg)',
-            }}
-          >
-            {unreadMessages > 9 ? '9+' : unreadMessages}
-          </span>
-        )}
-      </button>
     </div>
   );
 }
 
 /* ────────────────────────────────────────────────────────────── */
-/* ConnectionOverlay — semi-opaque manga-panel that floats over the */
-/* screen-share area when ICE has hiccuped (reconnecting) or given   */
-/* up (lost). Keeps the user oriented while the auto-recovery does   */
-/* its thing. For 'lost' we also expose a manual "try again" button  */
-/* so they don't have to leave & rejoin if the auto-ICE-restart      */
-/* didn't take.                                                       */
+/* InviteCard — what the stage shows while you wait for someone.   */
+/* One link, one person: make it, copy it, watch it count down.    */
 /* ────────────────────────────────────────────────────────────── */
 
+function InviteCard({
+  inviteUrl,
+  isGenerating,
+  copied,
+  timeRemaining,
+  onGenerate,
+  onCopy,
+}: {
+  inviteUrl: string | null;
+  isGenerating: boolean;
+  copied: boolean;
+  timeRemaining: string | null;
+  onGenerate: () => void;
+  onCopy: () => void;
+}) {
+  const copyRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (copied) sparkle(copyRef.current);
+  }, [copied]);
+
+  return (
+    <>
+      <Lights together={false} size={88} />
+      <h2>Waiting for someone</h2>
+      <p>Send a link to the one person you want in here. It works once and lasts 15 minutes.</p>
+      {inviteUrl ? (
+        <m.div
+          className="invite-card"
+          initial={{ opacity: 0, y: 14, scale: 0.97 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          transition={{ type: 'spring', stiffness: 320, damping: 24 }}
+        >
+          <div className="invite-ticket">
+            <div className="invite-ticket__label">Session link</div>
+            <ScrambleText text={inviteUrl} className="invite-ticket__url" />
+            {timeRemaining && (
+              <div className="invite-ticket__meta">
+                {timeRemaining === 'Expired' ? 'Expired.' : <>Expires in <span className="tabular">{timeRemaining}</span>.</>}{' '}
+                Works once.
+              </div>
+            )}
+          </div>
+          <div className="invite-card__row">
+            <Button
+              ref={copyRef}
+              variant="primary"
+              icon={copied ? <CheckIcon size={18} /> : <CopyIcon size={18} />}
+              onClick={onCopy}
+            >
+              {copied ? 'Copied' : 'Copy link'}
+            </Button>
+          </div>
+        </m.div>
+      ) : (
+        <Button
+          variant="primary"
+          size="lg"
+          magnetic
+          icon={<LinkIcon size={19} />}
+          onClick={onGenerate}
+          loading={isGenerating}
+          disabled={isGenerating}
+        >
+          {isGenerating ? 'Making a link…' : 'Invite someone'}
+        </Button>
+      )}
+    </>
+  );
+}
+
 /* ────────────────────────────────────────────────────────────── */
-/* WatchUrlPrompt — modal that asks "what should we watch?" and    */
-/* hands the raw input back. Parses YouTube URLs / IDs upstream so */
-/* this stays a dumb UI.                                            */
+/* WatchUrlPrompt — "what should we watch?" Parses YouTube URLs /  */
+/* IDs upstream; this only collects the text and flags what        */
+/* clearly is not a YouTube link before anything is sent.          */
 /* ────────────────────────────────────────────────────────────── */
 
 function WatchUrlPrompt({
+  isOpen,
   onSubmit,
   onCancel,
 }: {
+  isOpen: boolean;
   onSubmit: (rawUrl: string) => void;
   onCancel: () => void;
 }) {
   const [value, setValue] = useState('');
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCancel();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onCancel]);
+  const trimmed = value.trim();
+  const looksWrong = trimmed.length > 0 && !extractYouTubeVideoId(trimmed);
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      onClick={onCancel}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(26, 20, 23, 0.6)',
-        backdropFilter: 'blur(2px)',
-        display: 'grid',
-        placeItems: 'center',
-        zIndex: 9000,
-        padding: 24,
-      }}
+    <Modal
+      isOpen={isOpen}
+      onClose={onCancel}
+      title="Watch a video together"
+      description="Paste a YouTube link or video ID. Play, pause and seeking stay in sync for both of you."
+      width={500}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button variant="primary" type="submit" form="watch-form" icon={<PlayIcon size={18} />} disabled={!trimmed}>
+            Start watching
+          </Button>
+        </>
+      }
     >
       <form
-        onClick={(e) => e.stopPropagation()}
+        id="watch-form"
         onSubmit={(e) => {
           e.preventDefault();
-          if (value.trim()) onSubmit(value.trim());
-        }}
-        style={{
-          background: 'var(--cream)',
-          border: '4px solid var(--ink)',
-          boxShadow: '8px 8px 0 var(--ink)',
-          padding: '24px 28px',
-          maxWidth: 480,
-          width: '100%',
-          transform: 'rotate(-0.5deg)',
+          if (!trimmed) return;
+          onSubmit(trimmed);
+          setValue('');
         }}
       >
-        <div style={{ fontFamily: 'var(--font-sfx)', fontSize: 24, letterSpacing: 1, color: 'var(--purple)' }}>
-          WATCH TOGETHER
-        </div>
-        <p className="hand" style={{ fontSize: 18, marginTop: 8, color: 'rgba(26,20,23,0.7)' }}>
-          paste a youtube link (or just the video id) — peer joins in sync.
-        </p>
-        <input
-          autoFocus
-          type="text"
+        <TextField
+          label="YouTube link"
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onValueChange={setValue}
           placeholder="https://www.youtube.com/watch?v=…"
-          style={{
-            width: '100%',
-            marginTop: 16,
-            padding: '10px 14px',
-            border: '3px solid var(--ink)',
-            background: 'var(--cream-deep)',
-            fontFamily: 'var(--font-body)',
-            fontSize: 14,
-            color: 'var(--ink)',
-            outline: 'none',
-          }}
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          data-autofocus=""
+          problem={looksWrong ? 'That doesn’t look like a YouTube link.' : null}
         />
-        <div className="row" style={{ marginTop: 18, gap: 12, justifyContent: 'flex-end' }}>
-          <BackButton onClick={onCancel}>nevermind</BackButton>
-          <button
-            type="submit"
-            disabled={!value.trim()}
-            style={{
-              padding: '8px 18px',
-              background: value.trim() ? 'var(--pink)' : 'rgba(255,79,163,0.4)',
-              border: '3px solid var(--ink)',
-              boxShadow: '4px 4px 0 var(--ink)',
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 16,
-              letterSpacing: 1,
-              cursor: value.trim() ? 'pointer' : 'not-allowed',
-              transform: 'rotate(-1deg)',
-            }}
-          >
-            START!
-          </button>
-        </div>
       </form>
-    </div>
+    </Modal>
   );
 }
 
 /* ────────────────────────────────────────────────────────────── */
-/* ReactionsPalette — small floating cluster of 6 emoji that fly   */
-/* up when clicked. Bottom-right corner of the screen, so it       */
-/* doesn't crowd the centre content. Always reachable.             */
+/* FloatingReactions — emoji that rise from the bottom of the room */
+/* and fade. Yours float up on the right in amber light, theirs on  */
+/* the left in teal. Each flight path is generated from its id, so  */
+/* two at once never trace the same line.                           */
 /* ────────────────────────────────────────────────────────────── */
 
-const REACTION_EMOJI = ['🩷', '😂', '🔥', '👏', '👍', '🤯'];
-
-function ReactionsPalette({ onPick }: { onPick: (emoji: string) => void }) {
+function FloatingReactions({ reactions, myName }: { reactions: FloatingReactionData[]; myName: string }) {
   return (
-    <div
-      style={{
-        position: 'fixed',
-        bottom: 90,
-        right: 16,
-        zIndex: 65,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 6,
-        background: 'var(--cream)',
-        border: '3px solid var(--ink)',
-        boxShadow: '4px 4px 0 var(--ink)',
-        padding: 6,
-        transform: 'rotate(-2deg)',
-      }}
-    >
-      {REACTION_EMOJI.map((emoji) => (
-        <button
-          key={emoji}
-          type="button"
-          onClick={() => onPick(emoji)}
-          aria-label={`react with ${emoji}`}
-          style={{
-            background: 'transparent',
-            border: 'none',
-            fontSize: 22,
-            cursor: 'pointer',
-            padding: '2px 6px',
-            transition: 'transform 120ms ease',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.transform = 'scale(1.4) rotate(-6deg)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.transform = 'scale(1)';
-          }}
-        >
-          {emoji}
-        </button>
+    <div className="reactions" role="status" aria-live="polite">
+      {reactions.map((r) => (
+        <FloatingReaction key={r.id} reaction={r} own={r.from === myName} />
       ))}
     </div>
   );
 }
+
+function FloatingReaction({ reaction, own }: { reaction: FloatingReactionData; own: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // Deterministic per reaction: a tiny hash of the id picks the path.
+    const rand = (salt: number) => {
+      const x = Math.sin(reaction.id * 12.9898 + salt * 78.233) * 43758.5453;
+      return x - Math.floor(x);
+    };
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      el.animate([{ opacity: 0 }, { opacity: 1, offset: 0.15 }, { opacity: 1, offset: 0.7 }, { opacity: 0 }], {
+        duration: 2200,
+        fill: 'forwards',
+      });
+      return;
+    }
+    const drift = (rand(1) - 0.5) * 160;
+    const rise = 280 + rand(2) * 160;
+    const spin = (rand(3) - 0.5) * 50;
+    el.animate(
+      [
+        { transform: 'translate(0, 24px) scale(0.3) rotate(0deg)', opacity: 0 },
+        { transform: `translate(${drift * 0.15}px, -26px) scale(1.3) rotate(${spin * 0.3}deg)`, opacity: 1, offset: 0.14 },
+        { transform: `translate(${drift * 0.55}px, -${rise * 0.5}px) scale(1) rotate(${spin * 0.6}deg)`, opacity: 1, offset: 0.6 },
+        { transform: `translate(${drift}px, -${rise}px) scale(0.85) rotate(${spin}deg)`, opacity: 0 },
+      ],
+      { duration: 2200, easing: 'cubic-bezier(0.2, 0.7, 0.3, 1)', fill: 'forwards' },
+    );
+  }, [reaction.id]);
+
+  const jitter = ((reaction.id % 9) - 4) * 10;
+  return (
+    <span
+      ref={ref}
+      className="reaction"
+      data-own={own ? '' : undefined}
+      style={{ left: `calc(${own ? 62 : 38}% + ${jitter}px)`, opacity: 0 }}
+      aria-label={`${reaction.from} reacted with ${reaction.emoji}`}
+    >
+      {reaction.emoji}
+    </span>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────── */
+/* ConnectionOverlay — covers the stage when ICE has hiccuped      */
+/* (reconnecting) or given up (lost). Keeps the user oriented while */
+/* the auto-recovery does its thing; for 'lost' there is also a     */
+/* manual nudge so they don't have to leave and rejoin.             */
+/* ────────────────────────────────────────────────────────────── */
 
 function ConnectionOverlay({
   state,
@@ -2508,72 +2348,39 @@ function ConnectionOverlay({
 }) {
   const isLost = state === 'lost';
   return (
-    <div
+    <m.div
+      className="conn-overlay"
       role="status"
       aria-live="assertive"
-      style={{
-        position: 'absolute',
-        inset: 0,
-        zIndex: 5,
-        display: 'grid',
-        placeItems: 'center',
-        background: 'rgba(26, 20, 23, 0.55)',
-        backdropFilter: 'blur(2px)',
-        pointerEvents: isLost ? 'auto' : 'none',
-      }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      style={{ pointerEvents: isLost ? 'auto' : 'none' }}
     >
-      <div
-        style={{
-          background: 'var(--cream)',
-          border: '4px solid var(--ink)',
-          boxShadow: '6px 6px 0 var(--ink)',
-          padding: '20px 28px',
-          textAlign: 'center',
-          maxWidth: 420,
-          transform: 'rotate(-1deg)',
-          pointerEvents: 'auto',
-        }}
+      <m.div
+        className="sheet conn-overlay__card"
+        initial={{ scale: 0.94, y: 10 }}
+        animate={{ scale: 1, y: 0 }}
+        style={{ pointerEvents: 'auto' }}
       >
-        <div
-          style={{
-            fontFamily: 'var(--font-sfx)',
-            fontSize: 32,
-            letterSpacing: 2,
-            color: isLost ? 'var(--orange-deep)' : 'var(--orange)',
-          }}
-        >
-          {isLost ? 'CONNECTION LOST' : 'RECONNECTING…'}
-        </div>
-        <div
-          className="hand"
-          style={{ fontSize: 18, marginTop: 10, color: 'rgba(26,20,23,0.75)' }}
-        >
-          {isLost
-            ? 'something interrupted the call. trying to recover — or you can give it a nudge.'
-            : 'hang tight — finding a new path to your friend.'}
-        </div>
-        {isLost && onIceRestart && (
-          <button
-            type="button"
-            onClick={onIceRestart}
-            style={{
-              marginTop: 16,
-              fontFamily: 'var(--font-sfx)',
-              fontSize: 18,
-              letterSpacing: 1,
-              padding: '8px 18px',
-              background: 'var(--pink)',
-              color: 'var(--ink)',
-              border: '3px solid var(--ink)',
-              boxShadow: '4px 4px 0 var(--ink)',
-              cursor: 'pointer',
-              transform: 'rotate(-1deg)',
-            }}
-          >
-            TRY AGAIN
-          </button>
+        {isLost ? (
+          <span className="status-card__icon" aria-hidden="true">
+            <AlertIcon size={26} />
+          </span>
+        ) : (
+          <span className="btn__spinner" aria-hidden="true" style={{ width: 34, height: 34, color: 'var(--amber)' }} />
         )}
-      </div>
-    </div>
+        <h2>{isLost ? 'Connection lost' : 'Reconnecting…'}</h2>
+        <p>
+          {isLost
+            ? 'Something interrupted the call. It’s still trying to recover, or you can give it a nudge.'
+            : 'Hang on, finding a new path to them.'}
+        </p>
+        {isLost && onIceRestart && (
+          <Button variant="primary" icon={<RefreshIcon size={18} />} onClick={onIceRestart}>
+            Try again
+          </Button>
+        )}
+      </m.div>
+    </m.div>
   );
 }

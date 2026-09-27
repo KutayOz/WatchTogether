@@ -130,7 +130,7 @@ async function openTermsGate(page: Page, content: string) {
 
   await page.goto('/invite/test-invite-token');
   await page.getByRole('textbox').first().fill('bea');
-  await page.getByRole('button', { name: /create my passkey/i }).click();
+  await page.getByRole('button', { name: /create account with a passkey/i }).click();
 
   await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
 }
@@ -177,7 +177,7 @@ test.describe('House Rules gate', () => {
  * screens rather than a property of being signed in.
  */
 test.describe('House Rules gate is reachable from every entry point', () => {
-  const lobbyGreeting = (page: Page) => page.getByText(/ready to hang/i);
+  const lobbyGreeting = (page: Page) => page.getByRole('button', { name: /start a session/i });
 
   test.beforeEach(async ({ page }) => {
     await disableAnimations(page);
@@ -253,7 +253,7 @@ test.describe('House Rules gate is reachable from every entry point', () => {
     // Deep-linking past it does not work either.
     await page.goto('/settings');
     await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /create a session/i })).toBeHidden();
+    await expect(page.getByRole('button', { name: /start a session/i })).toBeHidden();
 
     await page.route('**/api/terms/accept', async (route) => {
       await route.fulfill({
@@ -287,7 +287,7 @@ test.describe('House Rules gate is reachable from every entry point', () => {
     await page.goto('/');
     await expect(page.getByRole('heading', { name: /house rules/i })).toBeVisible();
 
-    await page.getByRole('button', { name: /no thanks — sign out/i }).click();
+    await page.getByRole('button', { name: /no thanks, sign me out/i }).click();
 
     await expect(page).toHaveURL(/\/login$/);
     await expect(page.getByRole('heading', { name: /house rules/i })).toBeHidden();

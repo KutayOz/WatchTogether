@@ -1,16 +1,16 @@
-import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { AnimatePresence, m } from 'motion/react';
 import { api } from '../../services/api';
+import { useAuthContext } from '../../context/AuthContext';
 import type { PasskeyListItem } from '../../types';
-import {
-  Sketchbook,
-  SectionTitle,
-  StickerButton,
-  BackButton,
-  BurstSticker,
-  TagSticker,
-  Doodle,
-} from '../manga';
+import { AppShell } from '../ui/AppShell';
+import { Button, IconButton } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { TextField } from '../ui/Field';
+import { AlertIcon, CheckIcon, PasskeyIcon, PlusIcon, TrashIcon } from '../ui/icons';
+import { shake } from '../ui/interactions';
+import { cascade, rise, spring } from '../ui/motion';
+import './settings.css';
 
 /**
  * Settings — for now just the passkey manager. A user can add new passkeys
@@ -19,10 +19,8 @@ import {
  * Registration flow:
  *   1. Click "Add a passkey" → server returns CredentialCreateOptions
  *   2. Browser invokes WebAuthn create() → user verifies via biometric
- *   3. We POST the attestation back → server stores public key
- *
- * The "Add" button is the only interactive entry into adding credentials;
- * everything else is observation + remove.
+ *   3. We ask for a name (a dialog, not window.prompt), then POST the
+ *      attestation back → server stores public key
  *
  * Passwords are deliberately absent from this screen. They can be set at signup
  * and replaced through a root-issued reset link, but there is no
@@ -33,10 +31,18 @@ import {
  * returns its own message when it refuses.
  */
 export function Settings() {
+  const { user } = useAuthContext();
   const [items, setItems] = useState<PasskeyListItem[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  // The name dialog stands in for window.prompt: registration awaits it.
+  const [naming, setNaming] = useState<{ value: string; fallback: string; resolve: (label: string) => void } | null>(
+    null,
+  );
+  const [removing, setRemoving] = useState<PasskeyListItem | null>(null);
 
   const load = async () => {
     try {
@@ -50,6 +56,20 @@ export function Settings() {
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    if (error) shake(errorRef.current);
+  }, [error]);
+
+  const askForLabel = (fallback: string) =>
+    new Promise<string>((resolve) => setNaming({ value: fallback, fallback, resolve }));
+
+  const finishNaming = (label: string | null) => {
+    if (!naming) return;
+    const chosen = label?.trim() || naming.fallback;
+    naming.resolve(chosen);
+    setNaming(null);
+  };
 
   const handleAdd = async () => {
     setBusy(true);
@@ -66,19 +86,16 @@ export function Settings() {
 
       // Default label uses the rough device kind from the user-agent hint.
       // Server will fall back to "Passkey added on YYYY-MM-DD" if empty.
-      const defaultLabel = guessDeviceLabel();
-      const label = window.prompt('Label this passkey:', defaultLabel) ?? defaultLabel;
+      const label = await askForLabel(guessDeviceLabel());
 
       await api.passkeyFinishRegistration(attestation, label);
-      setSuccess(`Added "${label}"`);
+      setSuccess(`Added “${label}”.`);
       await load();
     } catch (err) {
       // SimpleWebAuthn throws a friendly DOMException on user cancel —
       // swallow that one quietly, surface anything else.
       const name = (err as { name?: string })?.name;
-      if (name === 'NotAllowedError') {
-        // user cancelled, no message
-      } else {
+      if (name !== 'NotAllowedError') {
         setError(err instanceof Error ? err.message : 'Passkey registration failed');
       }
     } finally {
@@ -86,16 +103,16 @@ export function Settings() {
     }
   };
 
-  const handleRemove = async (item: PasskeyListItem) => {
-    if (!window.confirm(`Remove "${item.label}"? You won't be able to sign in with this passkey any more.`)) {
-      return;
-    }
+  const confirmRemove = async () => {
+    const item = removing;
+    if (!item) return;
+    setRemoving(null);
     setBusy(true);
     setError(null);
     setSuccess(null);
     try {
       await api.passkeyRemove(item.credentialId);
-      setSuccess(`Removed "${item.label}"`);
+      setSuccess(`Removed “${item.label}”.`);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove passkey');
@@ -105,150 +122,161 @@ export function Settings() {
   };
 
   return (
-    <div className="app">
-      <div className="screen" style={{ display: 'grid', placeItems: 'center', padding: '20px 0', minHeight: '100vh' }}>
-        <Sketchbook style={{ width: '100%', maxWidth: 720 }}>
-          <div style={{ marginBottom: 18, position: 'relative' }}>
-            <SectionTitle size={42} underline="pink">
-              SETTINGS
-            </SectionTitle>
-            <div style={{ position: 'absolute', right: 0, top: -4 }}>
-              <TagSticker color="purple" rot={6}>
-                MY STUFF
-              </TagSticker>
-            </div>
-          </div>
-
-          <section style={{ marginTop: 18 }}>
-            <SectionTitle size={28} underline="purple">
-              passkeys
-            </SectionTitle>
-            <p className="hand" style={{ fontSize: 18, marginTop: 8, color: 'rgba(26,20,23,0.7)' }}>
-              sign in with Touch ID, Windows Hello, or a security key — nothing to remember.
+    <AppShell>
+      <div className="settings">
+        <header className="page-head">
+          <div>
+            <h1>Settings</h1>
+            <p className="page-head__sub">
+              Signed in as <strong style={{ color: 'var(--amber-hi)' }}>{user?.tag}</strong>.
             </p>
-
-            {success && (
-              <div className="hand" style={{ marginTop: 12, color: 'var(--purple)', fontSize: 18 }} role="status">
-                ✓ {success}
-              </div>
-            )}
-            {error && (
-              <div className="shake" style={{ marginTop: 12 }} role="alert">
-                <BurstSticker bg="var(--orange)" rot={-3} w={160} h={100}>OOPS!</BurstSticker>
-                <div className="hand" style={{ fontSize: 16, marginTop: 4, color: 'var(--ink)' }}>{error}</div>
-              </div>
-            )}
-
-            <div style={{ marginTop: 16 }}>
-              <StickerButton
-                color="pink"
-                size="md"
-                sfx="TAP!"
-                onClick={handleAdd}
-                disabled={busy}
-              >
-                {busy ? 'WAITING…' : '+ ADD A PASSKEY'}
-              </StickerButton>
-            </div>
-
-            <div style={{ marginTop: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {items === null ? (
-                <div className="hand" style={{ fontSize: 16, color: 'rgba(26,20,23,0.5)' }}>loading…</div>
-              ) : items.length === 0 ? (
-                <div
-                  className="hand"
-                  style={{
-                    fontSize: 18,
-                    color: 'rgba(26,20,23,0.55)',
-                    padding: 18,
-                    border: '2.5px dashed rgba(26,20,23,0.3)',
-                    background: 'rgba(123, 63, 228, 0.04)',
-                    textAlign: 'center',
-                  }}
-                >
-                  no passkeys on file — add one so you can sign in from another device ↑
-                </div>
-              ) : (
-                items.map((item) => <PasskeyRow key={item.credentialId} item={item} onRemove={() => handleRemove(item)} disabled={busy} />)
-              )}
-            </div>
-          </section>
-
-          <div style={{ marginTop: 32 }}>
-            <Link to="/" style={{ textDecoration: 'none' }}>
-              <BackButton>back to lobby</BackButton>
-            </Link>
           </div>
+        </header>
 
-          <div className="margin-doodles" style={{ position: 'absolute', right: 32, bottom: 40 }}>
-            <span className="bob" style={{ display: 'inline-block' }}>
-              <Doodle kind="sparkle" size={36} color="var(--purple)" />
+        <m.section className="card settings__card" aria-labelledby="passkeys-title" variants={rise} initial="hidden" animate="shown">
+          <div className="settings__card-head">
+            <span className="settings__icon" aria-hidden="true">
+              <PasskeyIcon size={20} />
             </span>
+            <div className="settings__card-title">
+              <h2 id="passkeys-title" className="section-title">
+                Passkeys
+              </h2>
+              <p className="section-sub">Sign in with Touch ID, Windows Hello, your phone or a security key.</p>
+            </div>
+            <Button variant="primary" icon={<PlusIcon size={18} />} onClick={handleAdd} loading={busy} disabled={busy}>
+              {busy ? 'Waiting…' : 'Add a passkey'}
+            </Button>
           </div>
-        </Sketchbook>
-      </div>
-    </div>
-  );
-}
 
-function PasskeyRow({
-  item,
-  onRemove,
-  disabled,
-}: {
-  item: PasskeyListItem;
-  onRemove: () => void;
-  disabled: boolean;
-}) {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '12px 14px',
-        border: '3px solid var(--ink)',
-        background: 'var(--cream)',
-        boxShadow: '3px 3px 0 var(--ink)',
-        transform: 'rotate(-0.2deg)',
-      }}
-    >
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontFamily: 'var(--font-body)', fontWeight: 700, fontSize: 16, color: 'var(--ink)' }}>
-          {item.label}
-        </div>
-        <div className="hand" style={{ fontSize: 14, color: 'rgba(26,20,23,0.55)' }}>
-          added {new Date(item.registeredAt).toLocaleDateString()}
-          {item.lastUsedAt && <> · last used {new Date(item.lastUsedAt).toLocaleDateString()}</>}
-        </div>
+          <AnimatePresence>
+            {success && (
+              <m.div
+                key={success}
+                className="notice notice--ok"
+                role="status"
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={spring.soft}
+              >
+                <CheckIcon size={18} />
+                <span>{success}</span>
+              </m.div>
+            )}
+          </AnimatePresence>
+          {error && (
+            <div ref={errorRef} className="notice notice--error" role="alert">
+              <AlertIcon size={18} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {items === null ? (
+            <p className="muted">Loading your passkeys…</p>
+          ) : items.length === 0 ? (
+            <div className="empty settings__empty">
+              <PasskeyIcon size={30} />
+              <p className="empty__title">No passkeys yet</p>
+              <p className="empty__text">Add one so you can sign in on this device without a password.</p>
+            </div>
+          ) : (
+            <m.ul className="passkeys" variants={cascade(0.06)} initial="hidden" animate="shown">
+              <AnimatePresence initial={false}>
+                {items.map((item) => (
+                  <m.li
+                    key={item.credentialId}
+                    layout
+                    variants={rise}
+                    exit={{ opacity: 0, x: -24, transition: { duration: 0.2 } }}
+                    className="passkey-row"
+                  >
+                    <span className="passkey-row__icon" aria-hidden="true">
+                      <PasskeyIcon size={18} />
+                    </span>
+                    <div className="passkey-row__text">
+                      <span className="passkey-row__label">{item.label}</span>
+                      <span className="passkey-row__meta">
+                        Added {new Date(item.registeredAt).toLocaleDateString()}
+                        {item.lastUsedAt && <>, last used {new Date(item.lastUsedAt).toLocaleDateString()}</>}
+                      </span>
+                    </div>
+                    {item.backedUp && <span className="chip chip--teal">Synced</span>}
+                    <IconButton
+                      label={`Remove passkey ${item.label}`}
+                      size="sm"
+                      bare
+                      disabled={busy}
+                      onClick={() => setRemoving(item)}
+                    >
+                      <TrashIcon size={17} />
+                    </IconButton>
+                  </m.li>
+                ))}
+              </AnimatePresence>
+            </m.ul>
+          )}
+        </m.section>
       </div>
-      <button
-        type="button"
-        onClick={onRemove}
-        disabled={disabled}
-        aria-label={`Remove passkey ${item.label}`}
-        style={{
-          background: 'transparent',
-          border: '2.5px solid var(--ink)',
-          padding: '4px 10px',
-          fontFamily: 'var(--font-sfx)',
-          fontSize: 14,
-          letterSpacing: 1,
-          color: 'var(--orange-deep, var(--orange))',
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          transform: 'rotate(2deg)',
-          opacity: disabled ? 0.4 : 1,
-        }}
+
+      <Modal
+        isOpen={naming !== null}
+        onClose={() => finishNaming(null)}
+        title="Name this passkey"
+        description="So you can tell your devices apart later."
+        width={440}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => finishNaming(null)}>
+              Use “{naming?.fallback}”
+            </Button>
+            <Button variant="primary" type="submit" form="passkey-name-form">
+              Save
+            </Button>
+          </>
+        }
       >
-        REMOVE
-      </button>
-    </div>
+        <form
+          id="passkey-name-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            finishNaming(naming?.value ?? null);
+          }}
+        >
+          <TextField
+            label="Name"
+            value={naming?.value ?? ''}
+            onValueChange={(v) => setNaming((n) => (n ? { ...n, value: v } : n))}
+            maxLength={64}
+            data-autofocus=""
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        isOpen={removing !== null}
+        onClose={() => setRemoving(null)}
+        title="Remove this passkey?"
+        description={removing ? `You won’t be able to sign in with “${removing.label}” any more.` : undefined}
+        width={440}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRemoving(null)}>
+              Keep it
+            </Button>
+            <Button variant="danger" icon={<TrashIcon size={17} />} onClick={confirmRemove} data-autofocus="">
+              Remove
+            </Button>
+          </>
+        }
+      />
+    </AppShell>
   );
 }
 
 /**
  * Best-effort device label from the user-agent. Pretty rough — we're just
- * giving the user a starting point they can override in the prompt. The
+ * giving the user a starting point they can override in the dialog. The
  * real source of truth is the server's AaGuid mapping which we don't
  * use here yet.
  */
