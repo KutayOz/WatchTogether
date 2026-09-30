@@ -1,3 +1,59 @@
+# Streaming incident — 1 October 2026
+
+Production was restored to Cloudflare version `decea5ff-bbed-4f0a-aa7b-ab712c32d889`
+(the pre-streaming-update `e6f8d24` release). The user and viewer refreshed and
+confirmed that the choppy playback stopped. The viewer uses Chrome on Windows.
+The API health endpoint returned healthy and the served HTML again referenced
+`index-CRdGC-Kw.js`. This rollback is the active production mitigation.
+
+The diagnostic history from the newer release showed repeated bitrate cuts
+followed by immediate jumps back to a high ceiling. Only one quality selection
+was manual. The final low-frame-rate period was an intentional source pause,
+not evidence of an encoder or network failure. No raw session/track identifiers
+are included here.
+
+The follow-up branch is based on `9d698055dab0c78eba47ff52e24ca16dbe039234` and
+preserves that branch's UI. It addresses reproducible controller defects:
+
+- Consume each receiver complaint once, and require sustained healthy feedback
+  before a bounded, reversible recovery probe. A high capacity estimate must
+  not immediately undo a decrease.
+- Keep native capture dimensions stable on automatic resolution decreases;
+  apply the requested reduction at the sender rather than rescaling capture
+  and encoding consecutively.
+- Retain CPU/idle observations across bitrate-only changes. Explicit source
+  inactivity holds the budget immediately, before a sustained health verdict;
+  one mixed resume interval also consumes pause-era receiver feedback.
+- Remember source pauses between receiver polls and exclude their mixed frame
+  window from frame-rate/freeze penalties. Packet-loss/jitter/RTT checks remain.
+- Publish explicit source inactivity when the browser omits encoded FPS,
+  preventing the viewer from falling back to the requested 24/30 FPS while paused.
+
+The first remote run passed 121 browser tests and exposed one additional
+pause/resume regression: a stable 7.45 Mbps cap fell below 5 Mbps while the
+source was intentionally paused. The immediate idle/one-interval resume guard
+addresses that failure; the strict test threshold is unchanged. UI and media
+projects now run in parallel with the same combined required-check name, and
+CI retains their measurements/traces for seven days.
+
+Local validation: all 488 frontend unit/hook tests, the production build, and
+ESLint on changed streaming modules/tests passed. New controller tests fail on
+the unchanged release for the repeated-cap and pause/resume cases; capture
+regressions also fail against that release. Native media regressions cover a
+12-second source pause and intermittent receiver warnings over a real
+DataChannel, with deterministic high-capacity input for the latter scenario.
+
+This candidate has not been deployed. Native media regressions run on remote CI
+so testing does not compete with the user's resumed live movie for local CPU.
+Local-ICE synthetic tests cannot prove real-movie performance on the Windows
+viewer; the old release remains live during candidate validation.
+
+Cloudflare rollback does not change GitHub `main`. A new main-branch deployment
+would replace this mitigation; keep the rollback in place until a replacement
+has been validated. This patch changes no backend code, schema, or migrations.
+
+---
+
 # Independent streaming-quality package
 
 This branch contains the streaming engine fixes independently of the pending UI redesign.

@@ -112,6 +112,34 @@ describe('receiver quality sampling', () => {
     expect(state.quality).toBe('excellent');
   });
 
+  it('does not report a partial pause/resume window as network starvation', async () => {
+    await render({ expectedFps: 0 });
+    await render({ expectedFps: 24 });
+    await tick(report(video({ timestamp: 3000, bytesReceived: 1_000_000,
+      packetsReceived: 1000, framesDecoded: 24, totalFreezesDuration: 2 })));
+    expect(state.quality).toBe('excellent');
+    // Grace ends with the mixed interval; a genuine subsequent stall still
+    // reports critical when packet loss and RTT are both clean.
+    await tick(report(video({ timestamp: 6000, bytesReceived: 1_000_000,
+      packetsReceived: 1000, framesDecoded: 24, totalFreezesDuration: 5 })));
+    expect(state.quality).toBe('critical');
+  });
+
+  it('remembers a pause and resume occurring between receiver polls', async () => {
+    await render();
+    await tick(report(video({ timestamp: 3000, bytesReceived: 2_000_000,
+      packetsReceived: 2000, framesDecoded: 72 })));
+    await render({ expectedFps: 0 });
+    await render({ expectedFps: 24 });
+    await tick(report(video({ timestamp: 6000, bytesReceived: 3_000_000,
+      packetsReceived: 3000, framesDecoded: 96, totalFreezesDuration: 2 })));
+    expect(state.quality).toBe('excellent');
+    expect(state.metrics?.fps).toBe(8);
+    await tick(report(video({ timestamp: 9000, bytesReceived: 5_000_000,
+      packetsReceived: 5000, framesDecoded: 168, totalFreezesDuration: 2 })));
+    expect(state.quality).toBe('excellent');
+  });
+
   it('does not punish occasional still-frame updates that straddle polling windows', async () => {
     await render({ expectedFps: 1 });
     await tick(report(video({ timestamp: 3000, framesPerSecond: 0, totalFreezesDuration: 3 })));

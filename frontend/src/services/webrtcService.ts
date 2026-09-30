@@ -105,25 +105,6 @@ const CAPTURE_RECONFIG_MIN_MS = 30_000;
 const MAX_CAPTURE_REPAIR_ATTEMPTS = 2;
 
 /**
- * How much smaller the ask must get before the capturer follows it down.
- *
- * About two rungs. One rung is 0.44 to 0.56 of the pixels depending where on
- * the ladder you are (1080p to 720p is 0.444; 720p to 540p is 0.5625), so a
- * threshold at 0.35 sits below every single step and above every double one.
- * A single step stays with the encoder's own scaler, which is the point of
- * leaving `scaleResolutionDownBy` unpinned and costs the viewer nothing.
- *
- * Following at all is new, and a captured session says why. A budget collapse
- * had walked the ask down to 640x360 while the capturer sat where it had grown
- * to, 1280x678, and the two stayed a rung and a half apart for twenty seconds:
- * `asked 640x360@30 / sending 1280x678@1`. The encoder was under no pressure to
- * scale down — with one frame a second arriving there was nothing to scale — so
- * it held the big picture, and when motion resumed the first thing it had to do
- * was encode four times the pixels the budget had been sized for.
- */
-const CAPTURE_SHRINK_RATIO = 0.35;
-
-/**
  * Capture constraints for an operating point.
  *
  * Shared by the initial getDisplayMedia and every later re-apply so the two can
@@ -309,6 +290,8 @@ class WebRTCService {
 
   /** Last successfully requested capture geometry; actual pixels come from getSettings(). */
   private capturedPoint: OperatingPoint | null = null;
+  /** Stable scale reference; transient browser adaptation must not change our next bitrate update. */
+  private captureScaleReference: { width: number; height: number } | null = null;
 
   /** When the capturer was last reconfigured. Drives the hysteresis below. */
   private lastCaptureReconfigAt = 0;
@@ -671,9 +654,10 @@ class WebRTCService {
             typeof value === 'object' && value !== null && value.max === expected &&
             (value.ideal === undefined || value.ideal === expected) &&
             (value.exact === undefined || value.exact === expected);
-          matchingConstraints = matches(constraints?.width, current.width) &&
-            matches(constraints?.height, current.height) &&
-            matches(constraints?.frameRate, current.fps);
+          const capture = this.capturedPoint ?? current;
+          matchingConstraints = matches(constraints?.width, capture.width) &&
+            matches(constraints?.height, capture.height) &&
+            matches(constraints?.frameRate, capture.fps);
         } catch { /* Unsupported inspection falls back to surface reapplication. */ }
         if (!matchingConstraints) {
           this.capturedPoint = null;
@@ -684,6 +668,7 @@ class WebRTCService {
         // Keep retry history for this track: an event may also arrive after
         // our own constraints resolve. A bitrate change or such an event must
         // not replenish the bounded repair allowance.
+        this.refreshCaptureScaleReference(track, this.capturedPoint ?? current);
         if ('contentHint' in track) track.contentHint = 'motion';
         void this.updateScreenShareQuality(current).catch((err) => {
           logger.debug('[WebRTC] Surface change update failed:', err);
@@ -864,6 +849,16 @@ class WebRTCService {
     }
   }
 
+  private refreshCaptureScaleReference(track: MediaStreamTrack | undefined, fallback: OperatingPoint): void {
+    const settings = track?.getSettings?.();
+    const valid = (value: number | undefined): value is number =>
+      typeof value === 'number' && Number.isFinite(value) && value > 0;
+    this.captureScaleReference = {
+      width: valid(settings?.width) ? settings.width : fallback.width,
+      height: valid(settings?.height) ? settings.height : fallback.height,
+    };
+  }
+
   /**
    * Motion-optimized video encoding parameters for a quality preset.
    * Mutates `params` in place. Shared by addScreenShareTracks (initial add)
@@ -893,12 +888,11 @@ class WebRTCService {
     // AUTO_MAX_BITRATE instead, so there is nothing left to special-case here.
     enc.maxBitrate = point.videoBps;
     enc.maxFramerate = point.fps;
-    // Apply the controller's geometry even before the capturer can resize.
-    // An omitted scale defaults to 1; it does not implement our chosen size.
-    // Native CPU/bandwidth adaptation can still reduce resolution further.
-    const settings = this.screenStream?.getVideoTracks()[0]?.getSettings?.();
-    const width = settings?.width ?? this.capturedPoint?.width ?? point.width;
-    const height = settings?.height ?? this.capturedPoint?.height ?? point.height;
+    // Scale against a stable capture reference. Reading getSettings on every
+    // bitrate update feeds native adaptation back into our own scale factor.
+    // A source event or deliberate capture change refreshes this reference.
+    const width = this.captureScaleReference?.width ?? this.capturedPoint?.width ?? point.width;
+    const height = this.captureScaleReference?.height ?? this.capturedPoint?.height ?? point.height;
     enc.scaleResolutionDownBy = Math.max(1, width / point.width, height / point.height);
     // Unconditional: the old `'networkPriority' in enc` guard meant this only
     // applied on browsers that happened to echo the key back from
@@ -958,6 +952,7 @@ class WebRTCService {
   async addScreenShareTracks(stream: MediaStream, point: OperatingPoint): Promise<void> {
     this.clearCaptureRecovery();
     this.screenStream = stream;
+    this.refreshCaptureScaleReference(stream.getVideoTracks()[0], point);
     this.screenStreamId = stream.id;
     this.currentPoint = point;
     this.appliedScreenPoint = null;
@@ -1057,6 +1052,13 @@ class WebRTCService {
     return result;
   }
 
+  private captureRequestPoint(point: OperatingPoint): OperatingPoint {
+    const captured = this.capturedPoint;
+    return captured
+      ? { ...point, width: Math.max(captured.width, point.width), height: Math.max(captured.height, point.height) }
+      : point;
+  }
+
   private captureGeometryKey(track: MediaStreamTrack, point: OperatingPoint): string {
     return `${track.id}:${point.width}x${point.height}@${point.fps}`;
   }
@@ -1075,7 +1077,7 @@ class WebRTCService {
    * or a demonstrably stale capture constraint warrants a bounded retry.
    */
   private captureNeedsRepair(track: MediaStreamTrack, point: OperatingPoint): boolean {
-    const key = this.captureGeometryKey(track, point);
+    const key = this.captureGeometryKey(track, this.captureRequestPoint(point));
     const failed = this.failedCaptureGeometry === key;
     // A rejected frame-rate change or small resize is also known pending work.
     // The retry allowance, rather than a size-deficit heuristic, bounds it.
@@ -1122,7 +1124,7 @@ class WebRTCService {
         if (stream !== this.screenStream || !point || !track || track.readyState === 'ended') return false;
         // A known geometry update already has its own deadline. Do not race it.
         if (this.captureReconfigTimer || Date.now() - this.lastCaptureReconfigAt < CAPTURE_RECONFIG_MIN_MS) return false;
-        const key = this.captureGeometryKey(track, point);
+        const key = this.captureGeometryKey(track, this.captureRequestPoint(point));
         const attempts = this.captureRepairAttempts.get(key) ?? 0;
         if (attempts >= MAX_CAPTURE_REPAIR_ATTEMPTS || !this.captureNeedsRepair(track, point)) return false;
         this.captureRepairAttempts.set(key, attempts + 1);
@@ -1184,8 +1186,9 @@ class WebRTCService {
     // Growing always counts: the capturer is the only thing that can deliver a
     // bigger picture, so nothing else can satisfy the ask.
     //
-    // Small downward moves use the explicit sender scale; only large sustained
-    // changes resize the capture too. Keep capture restarts out of bitrate probes.
+    // Keep the capture envelope during all automatic downshifts. Resizing it
+    // after setting a downscale factor briefly scales twice, and repeated
+    // capture restarts interrupt an otherwise continuous encode.
     //
     // A frame-rate change counts either way. It comes from the content mode,
     // which is a deliberate human action rather than the controller breathing.
@@ -1195,9 +1198,9 @@ class WebRTCService {
       point.width > captured.width ||
       point.height > captured.height ||
       point.fps !== captured.fps;
-    const mustShrink =
-      !!captured &&
-      point.width * point.height < captured.width * captured.height * CAPTURE_SHRINK_RATIO;
+    // A manual frame-rate change should not also shrink the native source.
+    // Retaining this envelope lets later recovery use a single encoder update.
+    const capturePoint = this.captureRequestPoint(point);
 
     // Hysteresis, longer than one probe/revert cycle (PROBE_INTERVAL_MS plus
     // PROBE_VERDICT_WINDOW_MS), so a probe that overshoots and reverts cannot
@@ -1207,9 +1210,10 @@ class WebRTCService {
     const settled = this.lastCaptureReconfigAt === 0 || sinceReconfig >= CAPTURE_RECONFIG_MIN_MS;
 
     const videoTrack = stream.getVideoTracks()[0];
+    const geometryKey = videoTrack ? this.captureGeometryKey(videoTrack, capturePoint) : null;
     if (this.captureReconfigTimer) clearTimeout(this.captureReconfigTimer);
     this.captureReconfigTimer = null;
-    if (videoTrack && (mustGrow || mustShrink) && !settled) {
+    if (videoTrack && mustGrow && !settled && this.failedCaptureGeometry !== geometryKey) {
       const stream = this.screenStream;
       this.captureReconfigTimer = setTimeout(() => {
         this.captureReconfigTimer = null;
@@ -1220,15 +1224,15 @@ class WebRTCService {
         }
       }, Math.max(1, CAPTURE_RECONFIG_MIN_MS - sinceReconfig));
     }
-    const geometryKey = videoTrack ? this.captureGeometryKey(videoTrack, point) : null;
-    if (videoTrack && (mustGrow || mustShrink) && settled &&
+    if (videoTrack && mustGrow && settled &&
         (repairCapture || this.failedCaptureGeometry !== geometryKey)) {
       this.lastCaptureReconfigAt = Date.now();
       this.applyingCaptureConstraints = true;
       try {
-        await videoTrack.applyConstraints(displayConstraintsFor(point));
+        await videoTrack.applyConstraints(displayConstraintsFor(capturePoint));
         if (!isCurrent()) return false;
-        this.capturedPoint = point;
+        this.capturedPoint = capturePoint;
+        this.refreshCaptureScaleReference(videoTrack, capturePoint);
         this.failedCaptureGeometry = null;
         // Capture geometry changed, so recompute the sender's relative scale.
         const resizedParams = videoSender.getParameters();
@@ -1270,6 +1274,7 @@ class WebRTCService {
     this.captureReconfigTimer = null;
     this.currentPoint = null;
     this.appliedScreenPoint = null;
+    this.captureScaleReference = null;
     try {
       if (this.screenStream) {
         const screenTracks = this.screenStream.getTracks();
@@ -1872,6 +1877,7 @@ class WebRTCService {
     this.captureReconfigTimer = null;
     this.currentPoint = null;
     this.appliedScreenPoint = null;
+    this.captureScaleReference = null;
     if (this.disconnectTimer) {
       clearTimeout(this.disconnectTimer);
       this.disconnectTimer = null;

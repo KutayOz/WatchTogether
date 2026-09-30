@@ -431,11 +431,7 @@ describe('webrtcService capture geometry', () => {
   });
 
   it('leaves the capturer alone when the picture gets smaller', async () => {
-    // Downward moves need no capturer change at all: the encoder's own scaler
-    // handles them, which is exactly why applyVideoEncoding leaves
-    // scaleResolutionDownBy unpinned. Restarting the capture pipeline costs the
-    // viewer a keyframe and a decoder re-init for a change the encoder was
-    // going to make anyway.
+    // Downward moves use explicit sender scaling without restarting capture.
     const stream = screenStream();
     stubDisplayMedia(stream);
 
@@ -527,31 +523,125 @@ describe('webrtcService capture geometry', () => {
     expect(track.contentHint).toBe('motion');
   });
 
-  it('follows the ask down once it is two rungs away', async () => {
-    // The gap the encoder was never going to close on its own. A budget
-    // collapse had walked the ask to 640x360 while the capturer sat at the
-    // 1280x678 it had grown to, and with one frame a second arriving there was
-    // nothing to make the encoder scale down: `asked 640x360@30 / sending
-    // 1280x678@1` for twenty seconds. When motion resumed, the first thing the
-    // encoder had to do was four times the pixels the budget was sized for.
+  it('scales deep downshifts and recovery without restarting or double-scaling capture', async () => {
     const stream = screenStream();
+    const track = stream.getVideoTracks()[0];
+    let source = { width: 1920, height: 1080 };
+    Object.assign(track, { getSettings: () => source });
+    // Model the actual geometry changing as soon as constraints are applied.
+    // If a sender scale of 3 is retained across a capture shrink to 360p,
+    // this records the transient 120p output before a second sender update.
+    const outputsAtCaptureChanges: number[] = [];
+    vi.spyOn(track, 'applyConstraints').mockImplementation(async constraints => {
+      source = {
+        width: (constraints?.width as ConstrainULongRange).ideal as number,
+        height: (constraints?.height as ConstrainULongRange).ideal as number,
+      };
+      outputsAtCaptureChanges.push(source.height / senderFor(pc, 'scr-v').scaleResolutionDownBy!);
+    });
     stubDisplayMedia(stream);
-
-    const big = chooseOperatingPoint(2_300_000, 'film');
+    const big = { ...POINT, width: 1920, height: 1080 };
     const { stream: captured } = await webrtcService.captureScreen(big);
     await webrtcService.addScreenShareTracks(captured, big);
+    const sender = senderFor(pc, 'scr-v');
+    sender.applied.length = 0;
 
+    for (const height of [360, 720, 1080, 360, 1080]) {
+      await webrtcService.updateScreenShareQuality({ ...big, width: height * 16 / 9, height });
+      expect(source.height / sender.scaleResolutionDownBy!).toBe(height);
+    }
+
+    expect(track.applyConstraints).not.toHaveBeenCalled();
+    expect(outputsAtCaptureChanges).toEqual([]);
+    expect(sender.applied.map(params => params.encodings[0].scaleResolutionDownBy))
+      .toEqual([3, 1.5, 1, 3, 1]);
+  });
+
+  it('does not feed transient source measurements back into a bitrate-only scale update', async () => {
+    const stream = screenStream();
     const track = stream.getVideoTracks()[0];
-    track.constraints.length = 0;
+    let source = { width: 1920, height: 1080 };
+    Object.assign(track, { getSettings: () => source });
+    stubDisplayMedia(stream);
+    const { stream: captured } = await webrtcService.captureScreen(POINT);
+    await webrtcService.addScreenShareTracks(captured, POINT);
+    const small = { ...POINT, width: 1280, height: 720 };
+    await webrtcService.updateScreenShareQuality(small);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1.5);
 
-    const tiny = chooseOperatingPoint(320_000, 'film');
-    // Precondition: two rungs, not one. One rung stays with the encoder — the
-    // test above this one is the other half of that pair.
-    expect(tiny.width * tiny.height).toBeLessThan(big.width * big.height * 0.35);
-    await webrtcService.updateScreenShareQuality(tiny);
+    // Native adaptation can report a temporarily smaller source. A bitrate
+    // update must not alternate our scale as the browser adjusts its source.
+    source = { width: 960, height: 540 };
+    await webrtcService.updateScreenShareQuality({ ...small, videoBps: small.videoBps + 100_000 });
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1.5);
+    source = { width: 1920, height: 1080 };
+    await webrtcService.updateScreenShareQuality({ ...small, videoBps: small.videoBps + 200_000 });
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1.5);
+    expect(track.constraints).toHaveLength(0);
+  });
 
+  it('preserves native geometry when a frame-rate change accompanies a smaller encoded picture', async () => {
+    const stream = screenStream();
+    const track = stream.getVideoTracks()[0];
+    Object.assign(track, {
+      getSettings: () => ({ width: 1920, height: 1080 }),
+      getConstraints: () => track.lastConstraints,
+    });
+    stubDisplayMedia(stream);
+    const { stream: captured } = await webrtcService.captureScreen(POINT);
+    await webrtcService.addScreenShareTracks(captured, POINT);
+    const smallerFaster = { ...POINT, width: 640, height: 360, fps: 60 };
+    await webrtcService.updateScreenShareQuality(smallerFaster);
+
+    expect(track.constraints).toEqual([{
+      width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 },
+      frameRate: { ideal: 60, max: 60 },
+    }]);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(3);
+    expect(senderFor(pc, 'scr-v').maxFramerate).toBe(60);
+    // A delayed event from our own application must compare the capture
+    // envelope, not the smaller output ask, and must not trigger a shrink.
+    track.emit('configurationchange');
+    await webrtcService.updateScreenShareQuality(smallerFaster);
     expect(track.constraints).toHaveLength(1);
-    expect(track.lastConstraints).toMatchObject({ width: { max: tiny.width } });
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(3);
+  });
+
+  it('refreshes sender scaling for a changed source while retaining the capture envelope', async () => {
+    const stream = screenStream();
+    const track = stream.getVideoTracks()[0];
+    let source = { width: 1920, height: 1080 };
+    Object.assign(track, {
+      getSettings: () => source,
+      getConstraints: () => ({
+        width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 },
+        frameRate: { ideal: POINT.fps, max: POINT.fps },
+      }),
+    });
+    stubDisplayMedia(stream);
+    const { stream: captured } = await webrtcService.captureScreen(POINT);
+    await webrtcService.addScreenShareTracks(captured, POINT);
+    const small = { ...POINT, width: 1280, height: 720 };
+    await webrtcService.updateScreenShareQuality(small);
+    source = { width: 3840, height: 2160 };
+    track.emit('configurationchange');
+    await webrtcService.updateScreenShareQuality(small);
+
+    expect(track.constraints).toHaveLength(0);
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(3);
+    expect(source.height / senderFor(pc, 'scr-v').scaleResolutionDownBy!).toBe(720);
+  });
+
+  it('uses the initial native size for a naturally small shared window', async () => {
+    const stream = screenStream();
+    const track = stream.getVideoTracks()[0];
+    Object.assign(track, { getSettings: () => ({ width: 640, height: 360 }) });
+    stubDisplayMedia(stream);
+    const { stream: captured } = await webrtcService.captureScreen(POINT);
+    await webrtcService.addScreenShareTracks(captured, POINT);
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 1280, height: 720 });
+    expect(senderFor(pc, 'scr-v').scaleResolutionDownBy).toBe(1);
+    expect(track.constraints).toHaveLength(0);
   });
 });
 
@@ -1297,6 +1387,24 @@ describe('bounded capture-constraint recovery', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(apply).toHaveBeenCalledTimes(2);
     expect(apply).toHaveBeenLastCalledWith({ ...fullLimits, frameRate: { ideal: 60, max: 60 } });
+  });
+
+  it('shares failed capture retry bounds across output sizes inside one retained envelope', async () => {
+    const { apply } = await beginCapture({ width: 1920, height: 1080 }, fullLimits);
+    apply.mockRejectedValue(new Error('frame-rate change unavailable'));
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 1280, height: 720, fps: 60 });
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 640, height: 360, fps: 60 });
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply).toHaveBeenLastCalledWith({ ...fullLimits, frameRate: { ideal: 60, max: 60 } });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 1280, height: 720, fps: 60 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(apply).toHaveBeenCalledTimes(3);
+    await webrtcService.updateScreenShareQuality({ ...POINT, width: 640, height: 360, fps: 60 });
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(apply).toHaveBeenCalledTimes(3); // Initial application plus two repairs.
   });
 
   it('preserves retry bounds across same-track configuration events and cancels on stop', async () => {

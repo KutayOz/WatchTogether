@@ -234,6 +234,7 @@ interface StreamSample {
   framesDecoded: number | undefined;
   freezeDuration: number;
   expectedFps: number | undefined;
+  idleGeneration: number;
   at: number;
 }
 
@@ -312,9 +313,15 @@ export function useQualityMonitor(
   const [inbound, setInbound] = useState<InboundScreenStats | null>(null);
   // Telemetry/callback changes must not restart the sampling interval. Track
   // changes do: counters and in-flight promises belong to that exact stream.
-  const inputs = useRef({ expectedFps, onQualityChange });
+  const inputs = useRef({ expectedFps, onQualityChange, idleGeneration: 0 });
   useEffect(() => {
-    inputs.current = { expectedFps, onQualityChange };
+    const previous = inputs.current;
+    // A pause may begin and end between two receiver polls. Remember that
+    // transition so its partial frame window is not treated as packet loss.
+    const enteredIdle = expectedFps !== undefined && expectedFps <= 1 &&
+      (previous.expectedFps === undefined || previous.expectedFps > 1);
+    inputs.current = { expectedFps, onQualityChange,
+      idleGeneration: previous.idleGeneration + (enteredIdle ? 1 : 0) };
   }, [expectedFps, onQualityChange]);
 
   useEffect(() => {
@@ -347,7 +354,7 @@ export function useQualityMonitor(
           return;
         }
         const now = performance.now();
-        const { expectedFps: expected, onQualityChange: notify } = inputs.current;
+        const { expectedFps: expected, onQualityChange: notify, idleGeneration } = inputs.current;
         const sample: StreamSample = {
           key: streamKey(report),
           packetsLost: report.packetsLost ?? 0,
@@ -356,6 +363,7 @@ export function useQualityMonitor(
           framesDecoded: report.framesDecoded,
           freezeDuration: report.totalFreezesDuration ?? 0,
           expectedFps: expected,
+          idleGeneration,
           at: report.timestamp ?? now,
         };
         const prior = previous;
@@ -383,7 +391,8 @@ export function useQualityMonitor(
           : report.framesPerSecond;
         // A freeze duration can be published only when playback resumes. Do
         // not blame a just-ended, intentionally paused source on the network.
-        const resumedFromIdle = prior.expectedFps !== undefined && prior.expectedFps <= 1;
+        const resumedFromIdle = (prior.expectedFps !== undefined && prior.expectedFps <= 1) ||
+          prior.idleGeneration !== sample.idleGeneration;
         const newMetrics: QualityMetrics = {
           packetsLost: Math.max(0, sample.packetsLost - prior.packetsLost),
           packetsReceived: sample.packetsReceived - prior.packetsReceived,
@@ -396,7 +405,10 @@ export function useQualityMonitor(
         };
         // Missing FPS is unknown, not a zero-frame decoder. Counter-derived
         // FPS works on browsers that omit the instantaneous framesPerSecond.
-        const newScore = calculateQualityScore(newMetrics, expected);
+        // This window contains a known source pause. Its decoded FPS cannot
+        // be compared with the sender's now-resumed instantaneous FPS. Keep
+        // transport loss/jitter/RTT scoring active; only frame terms get grace.
+        const newScore = calculateQualityScore(newMetrics, resumedFromIdle ? 1 : expected);
         const newLevel = scoreToLevel(newScore);
         setMetrics(newMetrics);
         setScore(Math.round(newScore));

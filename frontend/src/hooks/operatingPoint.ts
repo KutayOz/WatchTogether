@@ -476,6 +476,13 @@ export const BACKOFF_FACTOR = 0.85;
  */
 export const MIN_DECREASE_INTERVAL_MS = 2_500;
 
+/** Match the receiver heartbeat when an older caller cannot identify reports. */
+export const MIN_VIEWER_DECREASE_INTERVAL_MS = 9_000;
+/** Recovery must be observable across multiple 3-second health samples. */
+export const RECOVERY_HEALTHY_MS = 9_000;
+/** Re-test a recently troubled path gently, preserving a proven rollback point. */
+export const RECOVERY_PROBE_FACTOR = 1.15;
+
 /**
  * Start direct paths with a useful 1080p movie budget. A relay has no inherent
  * 800 kbps speed limit; start it at 2 Mbps and let the same measured feedback
@@ -524,6 +531,14 @@ export interface BudgetState {
   probing: boolean;
   lastChangeAt: number;
   probeBackoffMs: number;
+  /** Once reduced, estimates must earn recovery through reversible probes. */
+  lastDecreaseAt: number | null;
+  /** Beginning of the current uninterrupted healthy recovery window. */
+  healthySince: number | null;
+  /** Arrival time of the receiver complaint already consumed by a decrease. */
+  lastViewerDecreaseAt: number | null;
+  /** One mixed sampling interval still needs grace after the source resumes. */
+  sourceWasIdle: boolean;
 }
 
 export interface BudgetSignals {
@@ -534,8 +549,12 @@ export interface BudgetSignals {
    */
   estimateBps: number | null;
   health: SenderHealth;
+  /** Immediate, explicit capture inactivity; missing counters must be false. */
+  sourceIdle?: boolean;
   /** The receiver says this is not working. On `auto` this is its only route in. */
   viewerUnhappy: boolean;
+  /** Local arrival timestamp of the current receiver report; null if absent. */
+  viewerReportAt?: number | null;
   /**
    * The receiver is being sent far less picture than it has room to draw, and
    * is NOT complaining about it.
@@ -581,6 +600,10 @@ export function initialBudgetState(bps: number, now: number): BudgetState {
     probing: false,
     lastChangeAt: now,
     probeBackoffMs: PROBE_INTERVAL_MS,
+    lastDecreaseAt: null,
+    healthySince: null,
+    lastViewerDecreaseAt: null,
+    sourceWasIdle: false,
   };
 }
 
@@ -633,7 +656,37 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   );
   const raise = (bps: number) => Math.min(raiseCap, Math.max(floor, bps));
 
-  const shortage = sig.health === 'under-served' || sig.viewerUnhappy;
+  const sourceIdle = sig.sourceIdle === true || sig.health === 'source-idle';
+  if (sourceIdle || state.sourceWasIdle) {
+    // Capture can stop before the three-poll health verdict or receiver's FPS
+    // yardstick catches up. Hold immediately on direct source evidence, then
+    // allow one mixed interval on resume. Discard its viewer report as well:
+    // otherwise the same pause-era complaint cuts the budget on the next tick.
+    // A subsequent fresh complaint or sustained shortage is handled normally.
+    const ignoredReportAt = sig.viewerReportAt ?? (sig.viewerUnhappy ? sig.now : null);
+    return {
+      ...state,
+      ...(state.probing ? { bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now } : {}),
+      sourceWasIdle: sourceIdle,
+      healthySince: null,
+      lastViewerDecreaseAt: ignoredReportAt === null ? state.lastViewerDecreaseAt
+        : Math.max(state.lastViewerDecreaseAt ?? -Infinity, ignoredReportAt),
+    };
+  }
+
+  const senderShortage = sig.health === 'under-served';
+  const shortage = senderShortage || sig.viewerUnhappy;
+  const freshViewerComplaint = sig.viewerUnhappy && (state.lastViewerDecreaseAt === null ||
+    (sig.viewerReportAt != null
+      ? sig.viewerReportAt > state.lastViewerDecreaseAt
+      : sig.now - state.lastViewerDecreaseAt >= MIN_VIEWER_DECREASE_INTERVAL_MS));
+  const consumedViewerAt = freshViewerComplaint
+    ? (sig.viewerReportAt ?? sig.now) : state.lastViewerDecreaseAt;
+  const healthy = sig.health === 'satisfied' || sig.health === 'self-limited' ||
+    sig.viewerHealthy === true || sig.viewerStarved;
+  // Unknown/idle/CPU observations cannot carry a healthy streak across a gap.
+  if ((!healthy || shortage || sig.health === 'cpu-bound') &&
+      state.healthySince !== null) state = { ...state, healthySince: null };
   const target = sig.estimateBps === null ? null : sig.estimateBps * sig.headroom;
 
   // CPU pressure is not a bandwidth problem. Fewer bits do not buy the encoder
@@ -644,42 +697,20 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
     return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
   }
 
-  /*
-   * A still screen is not a slow link.
-   *
-   * This branch sits above `shortage` for the same reason `cpu-bound` does, and
-   * it is the more important of the two in practice: `shortage` is an OR, and
-   * its second term is the viewer's report. A viewer receiving the one frame a
-   * second a motionless capture produces scores it 'critical' and says so every
-   * nine seconds, forever — so without this the loop had a shortage signal that
-   * could neither be satisfied nor switched off, and the budget fell 0.85× per
-   * poll for as long as nobody touched the shared window. The captured session
-   * did exactly that: 1.9 Mbps to 250 kbps in about forty seconds, on a path
-   * measuring 4.7 Mbps.
-   *
-   * Holding is the entire response. Not lowering — fewer bits will not make a
-   * still screen move. Not raising either: a screen producing no frames proves
-   * nothing about headroom, so `satisfied` must not be inferred from the calm.
-   *
-   * A probe in flight is abandoned rather than judged, and WITHOUT doubling the
-   * backoff, because it did not fail — it was never answerable. Reverting to
-   * `baseBps` exactly is the same non-ratcheting revert the probe path uses.
-   */
-  if (sig.health === 'source-idle') {
-    if (!state.probing) return state;
-    return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
-  }
-
   // A probe that made things worse. Revert to the proven value exactly, not by
   // a factor: this is the property that stops repeated failure from decaying
   // the budget, and it is the whole reason `baseBps` is carried.
   if (state.probing && shortage) {
     const reverted = clamp(state.baseBps);
     return {
+      ...state,
       bps: reverted,
       baseBps: reverted,
       probing: false,
       lastChangeAt: sig.now,
+      lastDecreaseAt: sig.now,
+      healthySince: null,
+      lastViewerDecreaseAt: consumedViewerAt,
       probeBackoffMs: Math.min(state.probeBackoffMs * 2, MAX_BUDGET_PROBE_BACKOFF_MS),
     };
   }
@@ -689,8 +720,7 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   // losing the proven base and repeatedly increasing an unproven load.
   if (state.probing) {
     if (sig.now - state.lastChangeAt < PROBE_VERDICT_WINDOW_MS) return state;
-    const confirmed = sig.health === 'satisfied' || sig.health === 'self-limited' ||
-      sig.viewerHealthy === true || sig.viewerStarved;
+    const confirmed = healthy;
     if (confirmed) {
       return { ...state, baseBps: state.bps, probing: false, probeBackoffMs: PROBE_INTERVAL_MS };
     }
@@ -711,9 +741,12 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   // being lost in flight — could complain forever with nothing moving. Lowering
   // the budget is a real answer there: it lowers the resolution too.
   if (shortage) {
+    // A receiver verdict stays in memory between heartbeats. Replaying it on
+    // each sender tick used to multiply the same complaint three times.
+    if (!senderShortage && !freshViewerComplaint) return state;
     const byEstimate = target === null ? state.bps : Math.min(state.bps, target);
     const estimateSaysNothing = byEstimate >= state.bps;
-    const multiplicative = target === null || (sig.viewerUnhappy && estimateSaysNothing);
+    const multiplicative = target === null || (freshViewerComplaint && estimateSaysNothing);
     // The compounding path, and the only one that has to care how often it is
     // called. Following an estimate down is a `min` and repeats harmlessly; a
     // second 0.85 does not. See MIN_DECREASE_INTERVAL_MS.
@@ -721,7 +754,21 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
     const lowered = multiplicative ? state.bps * BACKOFF_FACTOR : byEstimate;
     const bps = clamp(lowered);
     if (bps === state.bps) return state;
-    return { ...state, bps, baseBps: bps, lastChangeAt: sig.now };
+    return { ...state, bps, baseBps: bps, lastChangeAt: sig.now,
+      lastDecreaseAt: sig.now, healthySince: null, lastViewerDecreaseAt: consumedViewerAt };
+  }
+
+  // A high estimate is not proof that the viewer recovered. Once a reduction
+  // was necessary, all future growth is gradual, sustained, and reversible.
+  // This blocks the observed 6M -> 5.1M -> 6M sawtooth every other poll.
+  if (state.lastDecreaseAt !== null) {
+    if (!healthy) return state;
+    if (state.healthySince === null) return { ...state, healthySince: sig.now };
+    if (sig.now - state.healthySince < RECOVERY_HEALTHY_MS ||
+        sig.now - state.lastChangeAt <= state.probeBackoffMs) return state;
+    const bps = raise(state.bps * RECOVERY_PROBE_FACTOR);
+    if (bps <= state.bps) return state;
+    return { ...state, bps, baseBps: state.bps, probing: true, lastChangeAt: sig.now };
   }
 
   // New information rather than a gamble: a trusted estimate above what we are
