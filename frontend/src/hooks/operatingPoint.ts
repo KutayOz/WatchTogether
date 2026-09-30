@@ -537,6 +537,8 @@ export interface BudgetState {
   healthySince: number | null;
   /** Arrival time of the receiver complaint already consumed by a decrease. */
   lastViewerDecreaseAt: number | null;
+  /** One mixed sampling interval still needs grace after the source resumes. */
+  sourceWasIdle: boolean;
 }
 
 export interface BudgetSignals {
@@ -547,6 +549,8 @@ export interface BudgetSignals {
    */
   estimateBps: number | null;
   health: SenderHealth;
+  /** Immediate, explicit capture inactivity; missing counters must be false. */
+  sourceIdle?: boolean;
   /** The receiver says this is not working. On `auto` this is its only route in. */
   viewerUnhappy: boolean;
   /** Local arrival timestamp of the current receiver report; null if absent. */
@@ -599,6 +603,7 @@ export function initialBudgetState(bps: number, now: number): BudgetState {
     lastDecreaseAt: null,
     healthySince: null,
     lastViewerDecreaseAt: null,
+    sourceWasIdle: false,
   };
 }
 
@@ -651,6 +656,24 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   );
   const raise = (bps: number) => Math.min(raiseCap, Math.max(floor, bps));
 
+  const sourceIdle = sig.sourceIdle === true || sig.health === 'source-idle';
+  if (sourceIdle || state.sourceWasIdle) {
+    // Capture can stop before the three-poll health verdict or receiver's FPS
+    // yardstick catches up. Hold immediately on direct source evidence, then
+    // allow one mixed interval on resume. Discard its viewer report as well:
+    // otherwise the same pause-era complaint cuts the budget on the next tick.
+    // A subsequent fresh complaint or sustained shortage is handled normally.
+    const ignoredReportAt = sig.viewerReportAt ?? (sig.viewerUnhappy ? sig.now : null);
+    return {
+      ...state,
+      ...(state.probing ? { bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now } : {}),
+      sourceWasIdle: sourceIdle,
+      healthySince: null,
+      lastViewerDecreaseAt: ignoredReportAt === null ? state.lastViewerDecreaseAt
+        : Math.max(state.lastViewerDecreaseAt ?? -Infinity, ignoredReportAt),
+    };
+  }
+
   const senderShortage = sig.health === 'under-served';
   const shortage = senderShortage || sig.viewerUnhappy;
   const freshViewerComplaint = sig.viewerUnhappy && (state.lastViewerDecreaseAt === null ||
@@ -662,7 +685,7 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   const healthy = sig.health === 'satisfied' || sig.health === 'self-limited' ||
     sig.viewerHealthy === true || sig.viewerStarved;
   // Unknown/idle/CPU observations cannot carry a healthy streak across a gap.
-  if ((!healthy || shortage || sig.health === 'cpu-bound' || sig.health === 'source-idle') &&
+  if ((!healthy || shortage || sig.health === 'cpu-bound') &&
       state.healthySince !== null) state = { ...state, healthySince: null };
   const target = sig.estimateBps === null ? null : sig.estimateBps * sig.headroom;
 
@@ -670,32 +693,6 @@ export function nextBudget(state: BudgetState, sig: BudgetSignals): BudgetState 
   // any CPU — but a raise we just made is the one thing that could have caused
   // it, so abandon any probe in flight and then hold.
   if (sig.health === 'cpu-bound') {
-    if (!state.probing) return state;
-    return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
-  }
-
-  /*
-   * A still screen is not a slow link.
-   *
-   * This branch sits above `shortage` for the same reason `cpu-bound` does, and
-   * it is the more important of the two in practice: `shortage` is an OR, and
-   * its second term is the viewer's report. A viewer receiving the one frame a
-   * second a motionless capture produces scores it 'critical' and says so every
-   * nine seconds, forever — so without this the loop had a shortage signal that
-   * could neither be satisfied nor switched off, and the budget fell 0.85× per
-   * poll for as long as nobody touched the shared window. The captured session
-   * did exactly that: 1.9 Mbps to 250 kbps in about forty seconds, on a path
-   * measuring 4.7 Mbps.
-   *
-   * Holding is the entire response. Not lowering — fewer bits will not make a
-   * still screen move. Not raising either: a screen producing no frames proves
-   * nothing about headroom, so `satisfied` must not be inferred from the calm.
-   *
-   * A probe in flight is abandoned rather than judged, and WITHOUT doubling the
-   * backoff, because it did not fail — it was never answerable. Reverting to
-   * `baseBps` exactly is the same non-ratcheting revert the probe path uses.
-   */
-  if (sig.health === 'source-idle') {
     if (!state.probing) return state;
     return { ...state, bps: clamp(state.baseBps), probing: false, lastChangeAt: sig.now };
   }

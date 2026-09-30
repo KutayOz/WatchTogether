@@ -86,9 +86,13 @@ jobs:
   # email-and-password sign-in form for two phases after passkeys replaced it —
   # half the suite was red and the repository could not tell anyone. A test
   # nobody runs is not a slow test, it is a false claim.
-  e2e:
-    name: e2e
+  browser:
+    name: browser (${{ matrix.project }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, media]
     defaults:
       run:
         working-directory: frontend
@@ -103,14 +107,36 @@ jobs:
 
       - run: npm ci
 
-      # Chromium only — playwright.config.ts defines the one project, and
-      # pulling all three browsers would triple the download for nothing.
+      # Both UI and native media projects use Chromium; download it once per job.
       - run: npx playwright install --with-deps chromium
 
       # playwright.config.ts starts `npm run dev` itself and waits for the port,
       # so there is no server to launch here. /api/* is never reached: every
       # spec stubs it with page.route().
-      - run: npm run e2e
+      # Run both projects independently: native video must not queue behind
+      # every UI test, and its failures must preserve actual frame telemetry.
+      - run: npm run e2e -- --project=${{ matrix.project }} --no-deps
+
+      - name: Preserve browser measurements and failure traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-results-${{ matrix.project }}
+          path: frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Keep the existing required-check name while both projects run in parallel.
+  e2e:
+    name: e2e
+    needs: browser
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both browser projects to pass
+        env:
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: test "$BROWSER_RESULT" = success
 
   # Lint is deliberately absent for now.
   #

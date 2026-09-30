@@ -574,6 +574,49 @@ describe('nextBudget and a still screen', () => {
     };
   }
 
+  it('holds immediately on a stopped capture while sustained health is still unknown', () => {
+    let state = initialBudgetState(7_450_000, 0);
+    for (const now of [3000, 6000, 9000, 12_000]) {
+      state = nextBudget(state, sig({ now, health: 'unknown', sourceIdle: true,
+        viewerUnhappy: true, viewerReportAt: now, estimateBps: 5_800_000 }));
+      expect(state.bps).toBe(7_450_000);
+      expect(state.lastDecreaseAt).toBeNull();
+      expect(state.probing).toBe(false);
+    }
+    // The first active poll can still see a receiver window spanning the pause.
+    state = nextBudget(state, sig({ now: 15_000, sourceIdle: false,
+      viewerUnhappy: true, viewerReportAt: 14_000, estimateBps: 5_800_000 }));
+    expect(state.bps).toBe(7_450_000);
+    expect(state.sourceWasIdle).toBe(false);
+    // Retaining the same complaint must not defer its cut until this next poll.
+    state = nextBudget(state, sig({ now: 18_000, viewerUnhappy: true,
+      viewerReportAt: 14_000, estimateBps: 5_800_000 }));
+    expect(state.bps).toBe(7_450_000);
+    // A fresh failure after that bounded grace still controls the budget.
+    state = nextBudget(state, sig({ now: 21_000, viewerUnhappy: true,
+      viewerReportAt: 20_000, estimateBps: 5_800_000 }));
+    expect(state.bps).toBe(5_800_000 * 0.85);
+  });
+
+  it('does not carry paused time into a growth window or hide subsequent sender congestion', () => {
+    let state = initialBudgetState(4_000_000, 0);
+    state = nextBudget(state, sig({ now: 3000, sourceIdle: true,
+      viewerHealthy: true, estimateBps: 30_000_000 }));
+    state = nextBudget(state, sig({ now: 6000, viewerHealthy: true,
+      estimateBps: 30_000_000 }));
+    expect(state).toMatchObject({ bps: 4_000_000, probing: false, healthySince: null });
+    state = nextBudget(state, sig({ now: 9000, health: 'under-served', estimateBps: 2_000_000 }));
+    expect(state.bps).toBe(1_700_000);
+  });
+
+  it('abandons an idle probe to its proven base without charging a failed trial', () => {
+    const state = { ...initialBudgetState(4_000_000, 0), bps: 6_000_000, probing: true };
+    const held = nextBudget(state, sig({ now: 3000, sourceIdle: true,
+      viewerUnhappy: true, viewerReportAt: 2000, estimateBps: 1_000_000 }));
+    expect(held).toMatchObject({ bps: 4_000_000, probing: false,
+      lastDecreaseAt: null, probeBackoffMs: PROBE_INTERVAL_MS });
+  });
+
   it('does not answer a motionless capture by cutting the budget', () => {
     // The captured failure, reproduced. A viewer receiving the one frame a
     // second a still window produces scores it 'critical' and says so every
@@ -976,7 +1019,7 @@ describe('receiver-driven budget recovery', () => {
       state = nextBudget(state, healthy(18_000));
       expect(state.bps).toBe(base);
       expect(state.probing).toBe(false);
-      expect(state.healthySince).toBe(18_000);
+      expect(state.healthySince).toBe(health === 'source-idle' ? null : 18_000);
     }
   });
 

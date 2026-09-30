@@ -285,9 +285,24 @@ export function shouldDowngradeCodec(
   return isSoftwareEncoder(stats?.encoderImplementation ?? null);
 }
 
+/** Source counters, unlike encoded FPS, can directly prove capture inactivity. */
+function capturedSourceIsIdle(stats: OutboundScreenStats | null): boolean {
+  const fps = stats?.sourceFramesPerSecond;
+  return typeof fps === 'number' && Number.isFinite(fps) && fps >= 0 && fps <= 1;
+}
+
+/** Receiver FPS yardstick; active source FPS must never hide an encoder stall. */
+export function reportedScreenFps(stats: OutboundScreenStats | null): number | undefined {
+  if (capturedSourceIsIdle(stats)) return stats?.sourceFramesPerSecond ?? undefined;
+  const fps = stats?.framesPerSecond;
+  return typeof fps === 'number' && Number.isFinite(fps) && fps >= 0 ? fps : undefined;
+}
+
 export interface SenderHealthState {
   /** The sustained verdict — only set once SUSTAIN_POLLS agree. */
   health: SenderHealth;
+  /** Direct capture evidence (0–1 FPS), usable before a sustained verdict forms. */
+  sourceIdle: boolean;
   /** How many consecutive polls have agreed. Lets callers require a longer run. */
   streak: number;
   /**
@@ -333,6 +348,7 @@ export function useSenderHealth(
 ): SenderHealthState {
   const [state, setState] = useState<SenderHealthState>({
     health: 'unknown',
+    sourceIdle: false,
     streak: 0,
     tick: 0,
     latest: null,
@@ -372,6 +388,11 @@ export function useSenderHealth(
         run.verdict = verdict;
         setState((prev) => ({
           health: run.count >= SUSTAIN_POLLS ? verdict : 'unknown',
+          // Unlike a bitrate ratio, an explicit stopped capture is not an
+          // inference about congestion. Waiting three polls lets pause-era
+          // receiver warnings cut the cap before source-idle can protect it.
+          // Missing counters and low encoded FPS are not direct evidence.
+          sourceIdle: capturedSourceIsIdle(stats),
           streak: run.count,
           tick: prev.tick + 1,
           latest: stats,
@@ -386,7 +407,7 @@ export function useSenderHealth(
       cancelled = true;
       clearInterval(interval);
       runRef.current = { verdict: 'unknown', count: 0 };
-      setState({ health: 'unknown', streak: 0, tick: 0, latest: null });
+      setState({ health: 'unknown', sourceIdle: false, streak: 0, tick: 0, latest: null });
     };
   }, [isActive]);
 

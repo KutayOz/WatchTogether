@@ -8,7 +8,7 @@ import { useWebRTC } from '../../hooks/useWebRTC';
 import { useMediaDevices } from '../../hooks/useMediaDevices';
 import { useUplinkEstimate } from '../../hooks/useUplinkEstimate';
 import { useTransportDiagnostics } from '../../hooks/useTransportDiagnostics';
-import { shouldDowngradeCodec, useSenderHealth } from '../../hooks/useSenderHealth';
+import { reportedScreenFps, shouldDowngradeCodec, useSenderHealth } from '../../hooks/useSenderHealth';
 import {
   chooseOperatingPoint,
   coldStartBudgetBps,
@@ -1135,6 +1135,7 @@ export function SessionRoom() {
         viewport,
         estimateBps: uplink?.capacityKnown ? uplink.uplinkBps : null,
         health: senderHealth.health,
+        sourceIdle: senderHealth.sourceIdle,
         // Receiver feedback also works when the transport has no capacity estimate.
         // Expire old reports instead of pinning a past failure forever.
         viewerUnhappy: viewerIsUnhappy(currentViewerLevel(viewerReportRef.current, now)),
@@ -1157,7 +1158,7 @@ export function SessionRoom() {
     // `health` rides along for the linter's benefit and costs nothing: it is
     // set in the same update as `tick`, so the two can never change on separate
     // renders. `tick` is the one that means "a new sample exists".
-  }, [senderHealth.tick, senderHealth.health, contentMode, screenShareQuality, capacityPixelsPerSecond, webrtc.isScreenSharing]);
+  }, [senderHealth.tick, senderHealth.health, senderHealth.sourceIdle, contentMode, screenShareQuality, capacityPixelsPerSecond, webrtc.isScreenSharing]);
 
   // A new share is a new load; carrying the old budget across would judge it by
   // the previous one's behaviour. The viewer's verdict goes with it, for the
@@ -1267,19 +1268,17 @@ export function SessionRoom() {
     const sessionId = sessionIdRef.current;
     if (!transport || !sessionId) return;
 
+    const sentFps = reportedScreenFps(diagnostics.outbound);
     void transport
       .sendShareStatus(sessionId, {
         fps: operatingPoint.fps,
         width: operatingPoint.width,
         height: operatingPoint.height,
         bps: operatingPoint.videoBps,
-        // What is actually leaving, beside what was asked for. This is the
-        // receiver's yardstick — see ShareStatus.sentFps — so it is measured,
-        // never inferred: a browser that does not publish it sends nothing and
-        // the far end keeps using the ask.
-        ...(typeof diagnostics.outbound?.framesPerSecond === 'number'
-          ? { sentFps: diagnostics.outbound.framesPerSecond }
-          : {}),
+        // Browsers may omit encoded FPS while capture is idle. Send explicit
+        // source inactivity then, so the viewer does not fall back to the
+        // requested 24/30 FPS. Active-source FPS never masks a stalled encoder.
+        ...(sentFps !== undefined ? { sentFps } : {}),
         ...(diagnostics.outbound?.qualityLimitationReason
           ? { limitedBy: diagnostics.outbound.qualityLimitationReason }
           : {}),

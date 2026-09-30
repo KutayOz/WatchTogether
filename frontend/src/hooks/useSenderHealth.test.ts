@@ -5,6 +5,7 @@ import { webrtcService } from '../services/webrtcService';
 import {
   classifySenderHealth,
   isSoftwareEncoder,
+  reportedScreenFps,
   shouldDowngradeCodec,
   sourceIsIdle,
   useSenderHealth,
@@ -317,6 +318,32 @@ describe('classifySenderHealth and a still screen', () => {
 });
 
 
+describe('reportedScreenFps', () => {
+  it.each([0, 1])('reports direct idle capture FPS %s when encoded FPS is absent or stale', (fps) => {
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: fps, framesPerSecond: null }))).toBe(fps);
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: fps, framesPerSecond: 30 }))).toBe(fps);
+  });
+
+  it('keeps encoded zero and measured motion rates instead of substituting active source FPS', () => {
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: 30, framesPerSecond: 0 }))).toBe(0);
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: 30, framesPerSecond: 24 }))).toBe(24);
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: 30, framesPerSecond: null }))).toBeUndefined();
+  });
+
+  it.each([undefined, NaN, Infinity, -1])('ignores invalid source FPS %s and uses only valid encoded FPS', (fps) => {
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: fps, framesPerSecond: 24 }))).toBe(24);
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: fps, framesPerSecond: NaN }))).toBeUndefined();
+  });
+
+  it.each([null, NaN, Infinity, -1])('omits absent or invalid encoded FPS %s', (fps) => {
+    expect(reportedScreenFps(stats({ sourceFramesPerSecond: 30, framesPerSecond: fps }))).toBeUndefined();
+  });
+
+  it('omits the yardstick with no stats', () => {
+    expect(reportedScreenFps(null)).toBeUndefined();
+  });
+});
+
 describe('sender health polling lifecycle', () => {
   let root: Root;
   let state: SenderHealthState;
@@ -334,6 +361,42 @@ describe('sender health polling lifecycle', () => {
     await act(async () => root.unmount());
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it('exposes direct source inactivity on the first poll without bypassing sustained health', async () => {
+    const read = vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({
+      sourceFramesPerSecond: 0, framesPerSecond: 0,
+      qualityLimitationReason: 'bandwidth', targetBitrate: 200_000,
+    }));
+    await act(async () => root.render(createElement(Probe)));
+    expect(state).toMatchObject({ sourceIdle: true, health: 'unknown', streak: 1 });
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(state).toMatchObject({ sourceIdle: true, health: 'unknown', streak: 2 });
+    read.mockResolvedValue(stats({ sourceFramesPerSecond: 30, framesPerSecond: 0,
+      qualityLimitationReason: 'bandwidth', targetBitrate: 200_000 }));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(state).toMatchObject({ sourceIdle: false, health: 'unknown', streak: 1 });
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(state.health).toBe('under-served');
+  });
+
+  it.each([undefined, null, NaN, Infinity, -1, 2, 30])(
+    'does not immediately hold on absent, invalid or active source FPS: %s', async (sourceFps) => {
+      vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({
+        sourceFramesPerSecond: sourceFps as number | undefined, framesPerSecond: 0,
+        qualityLimitationReason: 'bandwidth', targetBitrate: 200_000,
+      }));
+      await act(async () => root.render(createElement(Probe)));
+      expect(state.sourceIdle).toBe(false);
+    },
+  );
+
+  it('recognises a directly measured 1 FPS still source and clears it when sharing ends', async () => {
+    vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({ sourceFramesPerSecond: 1 }));
+    await act(async () => root.render(createElement(Probe)));
+    expect(state.sourceIdle).toBe(true);
+    await act(async () => root.render(createElement(Probe, { active: false })));
+    expect(state.sourceIdle).toBe(false);
   });
 
   it('requires fresh sustained evidence after changing the encoder budget', async () => {

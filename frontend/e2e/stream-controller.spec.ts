@@ -9,8 +9,12 @@ type CaptureFixture = {
   frames: number;
   constraints: Array<{ at: number; value: MediaTrackConstraints }>;
 };
+type FeedbackObservation = { at: number; level: string | null; fps: number | null; score: number | null };
 declare global {
-  interface Window { controllerCapture?: CaptureFixture; }
+  interface Window {
+    controllerCapture?: CaptureFixture;
+    controllerFeedback?: FeedbackObservation[];
+  }
 }
 const SESSION = 'sess-quality-controller';
 
@@ -84,12 +88,25 @@ async function observeViewerFeedback(page: Page) {
     };
     const state = window as unknown as { controllerQualityMessages: number };
     state.controllerQualityMessages = 0;
+    window.controllerFeedback = [];
     if (!dataChannelService.control) throw new Error('The application control DataChannel was not created');
     dataChannelService.control.addEventListener('message', (event) => {
       if (typeof event.data !== 'string') return;
       try {
-        const message = JSON.parse(event.data) as { t?: string };
-        if (message.t === 'quality') state.controllerQualityMessages += 1;
+        const message = JSON.parse(event.data) as {
+          t?: string; d?: { feedback?: { level?: unknown; fps?: unknown; score?: unknown } };
+        };
+        if (message.t === 'quality') {
+          state.controllerQualityMessages += 1;
+          const feedback = message.d?.feedback;
+          window.controllerFeedback!.push({
+            at: Date.now(),
+            level: typeof feedback?.level === 'string' ? feedback.level : null,
+            fps: typeof feedback?.fps === 'number' ? feedback.fps : null,
+            score: typeof feedback?.score === 'number' ? feedback.score : null,
+          });
+          if (window.controllerFeedback!.length > 64) window.controllerFeedback!.shift();
+        }
       } catch { /* Ignore unrelated malformed frames just as the application does. */ }
     });
   });
@@ -165,13 +182,28 @@ async function measure(sender: Page, receiver: Page) {
       screenVideoSender: RTCRtpSender | null;
     };
     const parameters = internals.screenVideoSender?.getParameters();
+    const outbound = await service.getOutboundScreenStats();
+    const healthPath = '/src/hooks/useSenderHealth.ts';
+    const { classifySenderHealth } = await import(/* @vite-ignore */ healthPath) as typeof import('../src/hooks/useSenderHealth');
+    const point = internals.currentPoint;
+    const report = await service.getStats();
+    let selectedPairId: string | undefined;
+    report?.forEach((row) => {
+      if (row.type === 'transport' && row.selectedCandidatePairId) selectedPairId = row.selectedCandidatePairId;
+    });
+    const pair = selectedPairId ? report?.get(selectedPairId) : undefined;
     return {
+      observedAt: Date.now(),
+      availableOutgoingBitrate: typeof pair?.availableOutgoingBitrate === 'number' ? pair.availableOutgoingBitrate as number : null,
+      instantHealth: classifySenderHealth(outbound, point?.videoBps ?? 0,
+        point ? point.width * point.height : null, point?.fps ?? null),
+      lastFeedback: window.controllerFeedback?.at(-1) ?? null,
       asked: internals.currentPoint,
       parameters: parameters ? {
         encodings: parameters.encodings,
         degradationPreference: parameters.degradationPreference,
       } : null,
-      outbound: await service.getOutboundScreenStats(),
+      outbound,
       screenId: service.getScreenStreamId(),
       screenTrackId: service.getScreenStream()?.getVideoTracks()[0]?.id ?? null,
       capture: window.controllerCapture ?? null,
@@ -318,6 +350,7 @@ test('pausing the actual source and resuming does not collapse quality or resize
   const peers = await startControllerSession(browser);
   const { alice, bob } = peers;
   const samples: Record<string, ControllerSample[]> = {};
+  let initialCap: number | null = null;
   try {
     // Do not pause an unconfirmed trial: source-idle intentionally abandons
     // one to its proven base. Fifteen seconds with an unchanged cap exceeds
@@ -334,7 +367,7 @@ test('pausing the actual source and resuming does not collapse quality or resize
     }, { timeout: 60_000, intervals: [1_000] }).toBeGreaterThanOrEqual(15_000);
     const before = await measure(alice, bob);
     samples.beforePause = [before];
-    const initialCap = videoCap(before);
+    initialCap = videoCap(before);
     const initialConstraints = before.outgoing.capture!.constraints.length;
     expect(initialCap).toBeGreaterThanOrEqual(3_000_000);
 
@@ -362,8 +395,27 @@ test('pausing the actual source and resuming does not collapse quality or resize
     }
     expect(peers.errors).toEqual([]);
   } finally {
+    // Keep failure diagnostics in CI stdout even if artifact upload is absent.
+    // No SDP, addresses, stream/track identifiers or user content is printed.
+    const startedAt = samples.beforePause?.[0]?.outgoing.observedAt ?? 0;
+    const columns = ['ms', 'capBps', 'sourceFps', 'encodedFps', 'targetBps', 'limitedBy',
+      'instantHealth', 'receiverFps', 'decoded', 'dropped', 'feedbackLevel', 'feedbackAgeMs',
+      'feedbackFps', 'gccBps', 'captureConstraintCalls'];
+    const phases = Object.fromEntries(Object.entries(samples).map(([phase, values]) => [phase,
+      values.map(({ outgoing: out, incoming: inc }) => [
+        out.observedAt - startedAt, out.parameters?.encodings[0].maxBitrate ?? null,
+        out.outbound?.sourceFramesPerSecond ?? null, out.outbound?.framesPerSecond ?? null,
+        out.outbound?.targetBitrate ?? null, out.outbound?.qualityLimitationReason ?? null,
+        out.instantHealth, inc.fps, inc.framesDecoded, inc.framesDropped,
+        out.lastFeedback?.level ?? null,
+        out.lastFeedback ? out.observedAt - out.lastFeedback.at : null,
+        out.lastFeedback?.fps ?? null, out.availableOutgoingBitrate,
+        out.capture?.constraints.length ?? null,
+      ]),
+    ]));
+    console.log(`[pause-controller] ${JSON.stringify({ initialCap, columns, phases })}`);
     const path = info.outputPath('pause-resume-controller.json');
-    await writeFile(path, JSON.stringify({ samples, errors: peers.errors }, null, 2));
+    await writeFile(path, JSON.stringify({ initialCap, samples, errors: peers.errors }, null, 2));
     await info.attach('pause-resume-controller.json', { path, contentType: 'application/json' });
     await peers.close();
   }
