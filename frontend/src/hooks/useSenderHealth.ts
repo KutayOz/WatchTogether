@@ -343,8 +343,13 @@ export function useSenderHealth(
   useEffect(() => {
     const old = configRef.current;
     const config = { bps: configuredBps, area: asked?.area, fps: asked?.fps };
-    if (old.bps !== config.bps || old.area !== config.area || old.fps !== config.fps) {
-      // Evidence about the previous ceiling cannot immediately cut the new one.
+    const geometryChanged = old.area !== config.area || old.fps !== config.fps;
+    const intrinsic = runRef.current.verdict === 'cpu-bound' || runRef.current.verdict === 'source-idle';
+    if (geometryChanged || (old.bps !== config.bps && !intrinsic)) {
+      // Bitrate ratios must be re-learned after changing their denominator.
+      // CPU/source inactivity is independent of that denominator: resetting
+      // it on every cap adjustment can keep a paused/overloaded source unknown
+      // forever. Geometry changes invalidate both kinds of evidence.
       runRef.current = { verdict: 'unknown', count: 0 };
     }
     configRef.current = config;

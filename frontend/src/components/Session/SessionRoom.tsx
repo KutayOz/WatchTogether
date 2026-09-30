@@ -1138,6 +1138,7 @@ export function SessionRoom() {
         // Receiver feedback also works when the transport has no capacity estimate.
         // Expire old reports instead of pinning a past failure forever.
         viewerUnhappy: viewerIsUnhappy(currentViewerLevel(viewerReportRef.current, now)),
+        viewerReportAt: viewerReportRef.current?.at ?? null,
         viewerHealthy: ['good', 'excellent'].includes(currentViewerLevel(viewerReportRef.current, now) ?? ''),
         // The other direction, and until now there was no other direction: the
         // receiver could ask for less and never for more, because its score has

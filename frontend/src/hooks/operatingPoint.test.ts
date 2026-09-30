@@ -6,6 +6,9 @@ import {
   COMPANION_STREAMS_BPS,
   COLD_START_BUDGET_BPS,
   MIN_DECREASE_INTERVAL_MS,
+  MIN_VIEWER_DECREASE_INTERVAL_MS,
+  RECOVERY_HEALTHY_MS,
+  RECOVERY_PROBE_FACTOR,
   PROBE_INTERVAL_MS,
   PROBE_VERDICT_WINDOW_MS,
   RELAY_COLD_START_BUDGET_BPS,
@@ -317,6 +320,11 @@ describe('nextBudget', () => {
     for (let i = 0; i < 100; i++) {
       now += 200_000; // always past the backoff, however far it has doubled
       state = nextBudget(state, sig({ now, health: 'satisfied' }));
+      if (!state.probing) {
+        now += RECOVERY_HEALTHY_MS;
+        state = nextBudget(state, sig({ now, health: 'satisfied' }));
+      }
+      expect(state.probing).toBe(true);
       now += 3000;
       state = nextBudget(state, sig({ now, health: 'under-served' }));
     }
@@ -335,7 +343,9 @@ describe('nextBudget', () => {
     // A probe left alone past the verdict window is banked, and the doubling
     // undone — otherwise one early failure slows every later recovery forever.
     let again = nextBudget(failed, sig({ now: 250_000, health: 'satisfied' }));
-    again = nextBudget(again, sig({ now: 250_000 + PROBE_VERDICT_WINDOW_MS + 1, health: 'satisfied' }));
+    again = nextBudget(again, sig({ now: 250_000 + RECOVERY_HEALTHY_MS, health: 'satisfied' }));
+    expect(again.probing).toBe(true);
+    again = nextBudget(again, sig({ now: 250_000 + RECOVERY_HEALTHY_MS + PROBE_VERDICT_WINDOW_MS + 1, health: 'satisfied' }));
     expect(again.probeBackoffMs).toBe(PROBE_INTERVAL_MS);
     expect(again.probing).toBe(false);
     expect(again.baseBps).toBe(again.bps);
@@ -586,7 +596,7 @@ describe('nextBudget and a still screen', () => {
     // weakening of the response to a real shortage.
     let state = initialBudgetState(1_900_000, 0);
     for (let i = 1; i <= 20; i++) {
-      state = nextBudget(state, sig({ now: i * 3000, viewerUnhappy: true }));
+      state = nextBudget(state, sig({ now: i * 3000, viewerUnhappy: true, viewerReportAt: i * 3000 }));
     }
     // All the way to the floor. Stated as the floor rather than as a literal
     // below it, so counting a new cost into the budget moves the assertion
@@ -882,5 +892,108 @@ describe('chooseOperatingPoint and the rest of the call', () => {
     expect(point.videoBps).toBe(
       Math.min(QUALITY_PRESETS.medium.video.bitrate, usefulVideoBps(viewport, 24)),
     );
+  });
+});
+
+
+describe('receiver-driven budget recovery', () => {
+  const sig = (over: Partial<BudgetSignals> = {}): BudgetSignals => ({
+    now: 0, estimateBps: 9_400_000, health: 'unknown', viewerUnhappy: false,
+    viewerStarved: false, viewerHealthy: false, viewerReportAt: null, headroom: 0.85,
+    mode: 'film', ceiling: 'high', viewport: { width: 1920, height: 1080 },
+    capacityPixelsPerSecond: null, ...over,
+  });
+  const complaint = (now: number, reportAt = now) => sig({ now, viewerUnhappy: true, viewerReportAt: reportAt });
+  const healthy = (now: number) => sig({ now, viewerHealthy: true, viewerReportAt: now });
+
+  it('consumes one receiver complaint once across sender ticks and estimator updates', () => {
+    const cut = nextBudget(initialBudgetState(6_000_000, 0), complaint(3000));
+    expect(cut.bps).toBe(5_100_000);
+    let state = cut;
+    for (let now = 6000; now <= 30_000; now += 3000) {
+      state = nextBudget(state, complaint(now, 3000));
+      expect(state.bps).toBe(cut.bps);
+    }
+    const newer = nextBudget(state, complaint(33_000));
+    expect(newer.bps).toBe(cut.bps * BACKOFF_FACTOR);
+  });
+
+  it('does not let a high estimate immediately restore the failed ceiling', () => {
+    const cut = nextBudget(initialBudgetState(6_000_000, 0), complaint(3000));
+    const recovered = nextBudget(cut, healthy(6000));
+    expect(recovered.bps).toBe(cut.bps);
+    expect(recovered.probing).toBe(false);
+  });
+
+  it('never sawtooths upward during alternating poor/excellent reports on a fast path', () => {
+    let state = initialBudgetState(6_000_000, 0);
+    let previous = state.bps;
+    for (let tick = 1; tick <= 20; tick++) {
+      const now = tick * 3000;
+      state = nextBudget(state, tick % 2 ? complaint(now) : healthy(now));
+      expect(state.bps).toBeLessThanOrEqual(previous);
+      expect(state.probing).toBe(false);
+      previous = state.bps;
+    }
+  });
+
+  it('requires a sustained recovery window before a small reversible probe', () => {
+    let state = nextBudget(initialBudgetState(4_000_000, 0), complaint(3000));
+    const base = state.bps;
+    for (const now of [6000, 9000, 12_000]) {
+      state = nextBudget(state, healthy(now));
+      expect(state.bps).toBe(base);
+    }
+    state = nextBudget(state, healthy(15_000));
+    expect(state.probing).toBe(true);
+    expect(state.bps).toBeCloseTo(base * RECOVERY_PROBE_FACTOR);
+    expect(state.baseBps).toBe(base);
+    const failed = nextBudget(state, complaint(18_000));
+    expect(failed.bps).toBe(base);
+    expect(failed.probeBackoffMs).toBe(PROBE_INTERVAL_MS * 2);
+    expect(nextBudget(failed, complaint(21_000, 18_000)).bps).toBe(base);
+    expect(nextBudget(failed, healthy(21_000)).bps).toBe(base);
+  });
+
+  it('honors failed-probe backoff even with continuous healthy reports and high estimates', () => {
+    let state = nextBudget(initialBudgetState(4_000_000, 0), complaint(3000));
+    for (const now of [6000, 9000, 12_000, 15_000]) state = nextBudget(state, healthy(now));
+    state = nextBudget(state, complaint(18_000));
+    const base = state.bps;
+    for (let now = 21_000; now <= 36_000; now += 3000) {
+      state = nextBudget(state, healthy(now));
+      expect(state.bps).toBe(base);
+    }
+    expect(nextBudget(state, healthy(39_000)).probing).toBe(true);
+  });
+
+  it('does not treat unknown, paused, or CPU-limited time as healthy recovery', () => {
+    for (const health of ['unknown', 'source-idle', 'cpu-bound'] as const) {
+      let state = nextBudget(initialBudgetState(4_000_000, 0), complaint(3000));
+      const base = state.bps;
+      state = nextBudget(state, healthy(6000));
+      state = nextBudget(state, sig({ now: 15_000, health }));
+      state = nextBudget(state, healthy(18_000));
+      expect(state.bps).toBe(base);
+      expect(state.probing).toBe(false);
+      expect(state.healthySince).toBe(18_000);
+    }
+  });
+
+  it('still recovers 1080p movie bitrate after the path stays healthy', () => {
+    let state = nextBudget(initialBudgetState(4_000_000, 0), complaint(3000));
+    for (let now = 6000; now <= 120_000; now += 3000) state = nextBudget(state, healthy(now));
+    const point = chooseOperatingPoint(state.bps, 'film', 'high');
+    expect(point).toMatchObject({ width: 1920, height: 1080 });
+    expect(point.videoBps).toBeGreaterThan(5_500_000);
+  });
+
+  it('limits legacy receiver callbacks without timestamps to the heartbeat cadence', () => {
+    const first = nextBudget(initialBudgetState(4_000_000, 0), sig({ now: 3000, viewerUnhappy: true }));
+    for (const now of [6000, 9000]) {
+      expect(nextBudget(first, sig({ now, viewerUnhappy: true })).bps).toBe(first.bps);
+    }
+    expect(nextBudget(first, sig({ now: 3000 + MIN_VIEWER_DECREASE_INTERVAL_MS,
+      viewerUnhappy: true })).bps).toBe(first.bps * BACKOFF_FACTOR);
   });
 });

@@ -320,8 +320,8 @@ describe('classifySenderHealth and a still screen', () => {
 describe('sender health polling lifecycle', () => {
   let root: Root;
   let state: SenderHealthState;
-  function Probe({ bps = 2_000_000, active = true }: { bps?: number; active?: boolean }) {
-    const value = useSenderHealth(active, bps, { area: 1920 * 1080, fps: 30 });
+  function Probe({ bps = 2_000_000, active = true, fps = 30 }: { bps?: number; active?: boolean; fps?: number }) {
+    const value = useSenderHealth(active, bps, { area: 1920 * 1080, fps });
     useEffect(() => { state = value; }, [value]);
     return null;
   }
@@ -349,6 +349,38 @@ describe('sender health polling lifecycle', () => {
     expect(state.streak).toBe(1);
     await act(async () => vi.advanceTimersByTimeAsync(6000));
     expect(state.health).toBe('under-served');
+  });
+
+  it.each(['source-idle', 'cpu-bound'] as const)('preserves %s evidence through bitrate-only adjustments', async (verdict) => {
+    vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({
+      qualityLimitationReason: verdict === 'cpu-bound' ? 'cpu' : 'none',
+      sourceFramesPerSecond: verdict === 'source-idle' ? 0 : 30,
+    }));
+    await act(async () => root.render(createElement(Probe)));
+    for (const bps of [1_700_000, 2_000_000]) {
+      await act(async () => root.render(createElement(Probe, { bps })));
+      await act(async () => vi.advanceTimersByTimeAsync(3000));
+    }
+    expect(state.health).toBe(verdict);
+    expect(state.streak).toBe(3);
+    await act(async () => root.render(createElement(Probe, { bps: 1_800_000 })));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(state.health).toBe(verdict);
+    expect(state.streak).toBe(4);
+  });
+
+  it.each(['source-idle', 'cpu-bound'] as const)('relearns %s after geometry changes', async (verdict) => {
+    vi.spyOn(webrtcService, 'getOutboundScreenStats').mockResolvedValue(stats({
+      qualityLimitationReason: verdict === 'cpu-bound' ? 'cpu' : 'none',
+      sourceFramesPerSecond: verdict === 'source-idle' ? 0 : 30,
+    }));
+    await act(async () => root.render(createElement(Probe)));
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(state.health).toBe(verdict);
+    await act(async () => root.render(createElement(Probe, { fps: 24 })));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(state.health).toBe('unknown');
+    expect(state.streak).toBe(1);
   });
 
   it('never overlaps slow stats reads or publishes them after sharing ends', async () => {
