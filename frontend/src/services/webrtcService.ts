@@ -15,6 +15,7 @@ import {
   type OperatingPoint,
 } from '../hooks/operatingPoint';
 import { applyOpusOptions, SDP_WARN_LENGTH } from './opusFmtp';
+import { applyRelayMode, parseRelayMode, RELAY_SETTING_KEY } from './relayPreference';
 
 /**
  * Encoder ceilings for the camera, in bps.
@@ -340,7 +341,8 @@ class WebRTCService {
     // offered?" without a second call to the API. URLs only ever leave here.
     this.iceConfig = iceConfig;
     this.warnedAboutTcpRelay = false;
-    const config: RTCConfiguration = {
+    const relayMode = parseRelayMode(readSetting(RELAY_SETTING_KEY));
+    const config: RTCConfiguration = applyRelayMode({
       iceServers: iceConfig.iceServers.map(server => ({
         urls: server.urls,
         username: server.username,
@@ -353,7 +355,14 @@ class WebRTCService {
       // assumption true rather than merely Chrome's default.
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
-    };
+    }, relayMode);
+    if (relayMode) {
+      logger.warn(
+        config.iceTransportPolicy === 'relay'
+          ? `[WebRTC] relay=${relayMode}: media forced over TURN (${config.iceServers?.length ?? 0} URLs)`
+          : `[WebRTC] relay=${relayMode} requested but no TCP/TLS TURN URL was offered; using the normal path`,
+      );
+    }
 
     // Close whatever was here first. Rejoining — the TRY AGAIN path, a second
     // preflight — used to overwrite this reference and orphan a live
