@@ -533,9 +533,17 @@ export function ScreenShareView({
 
   return (
     <div ref={containerRef} className="stage stage--share" onMouseMove={handleMouseMove}>
+      {/*
+        No data-ambient here, deliberately. A shared film changes colour every
+        sample, so .stage-glow's 1.1 s transition on the registered --amb-*
+        properties never settles and the glow — a gradient layer larger than
+        the stage — is repainted on the main thread every frame for the whole
+        film. A viewer on a 2560x1600 laptop reported it running hot. The
+        room keeps its house light while a screen is on stage; camera calls
+        still throw theirs.
+      */}
       <video
         ref={attachVideo}
-        data-ambient=""
         autoPlay
         playsInline
         muted
