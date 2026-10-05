@@ -1,8 +1,8 @@
 /* ─────────────────────────────────────────────────────────────────────────
    The room: a call between two people.
 
-   The stage is the screen, and it lights the room with whatever is on it
-   (useAmbientLight writes --amb-l/-r/-c). Around it the room stays dark and
+   The stage is the screen, under a fixed house light. Around it the room
+   stays dark and
    quiet: a slim bar of who is here, a dock of controls, and the side panel
    with your two faces and the chat — docked on a desk, a drawer on a tablet,
    a sheet on a phone.
@@ -119,15 +119,16 @@
   inset: -12% -8% -18%;
   z-index: -1;
   pointer-events: none;
+  /*
+    Fixed colours, never sampled from the picture. Sampling a playing video
+    and transitioning these gradients kept the layer repainting every frame
+    for the length of a call; nobody sees the difference behind a film.
+  */
   background:
-    radial-gradient(42% 58% at 14% 50%, var(--amb-l), transparent 72%),
-    radial-gradient(42% 58% at 86% 50%, var(--amb-r), transparent 72%),
-    radial-gradient(55% 45% at 50% 96%, var(--amb-c), transparent 76%);
+    radial-gradient(42% 58% at 14% 50%, rgb(96 58 30), transparent 72%),
+    radial-gradient(42% 58% at 86% 50%, rgb(26 74 84), transparent 72%),
+    radial-gradient(55% 45% at 50% 96%, rgb(44 24 34), transparent 76%);
   opacity: 0.62;
-  transition:
-    --amb-l 1.1s linear,
-    --amb-r 1.1s linear,
-    --amb-c 1.1s linear;
 }
 
 .stage {

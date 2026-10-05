@@ -70,7 +70,6 @@ import { AlertIcon, BlurIcon, CheckIcon, CopyIcon, KeyboardIcon, LinkIcon, PlayI
 import { sparkle } from '../ui/interactions';
 import { ease } from '../ui/motion';
 import { useScene } from '../ui/useScene';
-import { useAmbientLight } from '../../hooks/useAmbientLight';
 import type { FloatingReaction as FloatingReactionData } from '../../hooks/usePeerPresence';
 import './session.css';
 import type {
@@ -141,9 +140,10 @@ export function SessionRoom() {
   // only thing that should be moving.
   useScene(stage === 'live' ? 'room' : 'theater');
 
-  // The stage throws the colours of whatever is playing onto the room.
-  const stageWrapRef = useRef<HTMLDivElement>(null);
-  useAmbientLight(stageWrapRef, stage === 'live');
+  // No light sampled from the picture in here: .stage-glow keeps the house
+  // light. Sampling a playing video every 280 ms kept a gradient layer larger
+  // than the stage repainting on every frame for as long as a call lasted —
+  // a viewer watching a film reported the laptop running hot.
 
   /**
    * The user's quality CEILING, not the operating point.
@@ -1968,7 +1968,7 @@ export function SessionRoom() {
 
       <div className="room-body">
         <main className="room-main">
-          <div className="stage-wrap" ref={stageWrapRef}>
+          <div className="stage-wrap">
             <div className="stage-glow" aria-hidden="true" />
             {/*
               A sibling of ScreenShareView, not a child, so in fullscreen it was

@@ -4,7 +4,6 @@ import { ChatPanel } from '../Chat/ChatPanel';
 import { IconButton } from '../ui/Button';
 import { CloseIcon, MicOffIcon, PopOutIcon } from '../ui/icons';
 import { usePictureInPicture } from '../../hooks/usePictureInPicture';
-import { useAudioLevel } from '../../hooks/useAudioLevel';
 
 interface SidebarProps {
   localStream: MediaStream | null;
@@ -65,9 +64,6 @@ export function Sidebar({
   const peerTileRef = useRef<HTMLDivElement>(null);
   const localTileRef = useRef<HTMLDivElement>(null);
 
-  // Their voice lights their tile, yours lights yours.
-  useAudioLevel(remoteStream, peerTileRef);
-  useAudioLevel(localStream, localTileRef);
 
   // Native PiP on the peer's video tile. Auto-on-hide pops the peer
   // out into a floating window the moment the user switches tabs, and

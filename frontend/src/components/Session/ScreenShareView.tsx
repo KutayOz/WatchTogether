@@ -5,7 +5,6 @@ import { MediaControls, type MediaControlsQualityProps } from '../Controls/Media
 import { QualityIndicator } from '../Quality/QualityIndicator';
 import { Button, IconButton } from '../ui/Button';
 import { AudioWaveIcon, ExpandIcon, MicOffIcon, ScreenIcon, ShrinkIcon } from '../ui/icons';
-import { useAudioLevel } from '../../hooks/useAudioLevel';
 import { canCaptureScreen } from '../../utils/capabilities';
 import type { QualityLevel, Viewport } from '../../types';
 
@@ -533,15 +532,6 @@ export function ScreenShareView({
 
   return (
     <div ref={containerRef} className="stage stage--share" onMouseMove={handleMouseMove}>
-      {/*
-        No data-ambient here, deliberately. A shared film changes colour every
-        sample, so .stage-glow's 1.1 s transition on the registered --amb-*
-        properties never settles and the glow — a gradient layer larger than
-        the stage — is repainted on the main thread every frame for the whole
-        film. A viewer on a 2560x1600 laptop reported it running hot. The
-        room keeps its house light while a screen is on stage; camera calls
-        still throw theirs.
-      */}
       <video
         ref={attachVideo}
         autoPlay
@@ -685,9 +675,6 @@ function PeerLargeView({ peerStream, peerName, peerIsMuted, peerIsCameraOff, loc
   const peerVideoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
 
-  // Their voice lights the frame.
-  useAudioLevel(peerStream, stageRef);
-
   useEffect(() => {
     if (peerVideoRef.current) peerVideoRef.current.srcObject = peerStream;
   }, [peerStream]);
@@ -696,7 +683,6 @@ function PeerLargeView({ peerStream, peerName, peerIsMuted, peerIsCameraOff, loc
     <div className="stage stage--peer" ref={stageRef}>
       <video
         ref={peerVideoRef}
-        data-ambient=""
         autoPlay
         playsInline
         muted
@@ -780,9 +766,6 @@ function SelfView({ stream, boundsRef }: { stream: MediaStream; boundsRef: React
   const drag = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   const flipFrom = useRef<DOMRect | null>(null);
   const [dragging, setDragging] = useState(false);
-
-  // Your voice lights your frame.
-  useAudioLevel(stream, elRef);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;
