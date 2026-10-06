@@ -5,7 +5,6 @@ import { MediaControls, type MediaControlsQualityProps } from '../Controls/Media
 import { QualityIndicator } from '../Quality/QualityIndicator';
 import { Button, IconButton } from '../ui/Button';
 import { AudioWaveIcon, ExpandIcon, MicOffIcon, ScreenIcon, ShrinkIcon } from '../ui/icons';
-import { useAudioLevel } from '../../hooks/useAudioLevel';
 import { canCaptureScreen } from '../../utils/capabilities';
 import type { QualityLevel, Viewport } from '../../types';
 
@@ -535,7 +534,6 @@ export function ScreenShareView({
     <div ref={containerRef} className="stage stage--share" onMouseMove={handleMouseMove}>
       <video
         ref={attachVideo}
-        data-ambient=""
         autoPlay
         playsInline
         muted
@@ -677,9 +675,6 @@ function PeerLargeView({ peerStream, peerName, peerIsMuted, peerIsCameraOff, loc
   const peerVideoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
 
-  // Their voice lights the frame.
-  useAudioLevel(peerStream, stageRef);
-
   useEffect(() => {
     if (peerVideoRef.current) peerVideoRef.current.srcObject = peerStream;
   }, [peerStream]);
@@ -688,7 +683,6 @@ function PeerLargeView({ peerStream, peerName, peerIsMuted, peerIsCameraOff, loc
     <div className="stage stage--peer" ref={stageRef}>
       <video
         ref={peerVideoRef}
-        data-ambient=""
         autoPlay
         playsInline
         muted
@@ -772,9 +766,6 @@ function SelfView({ stream, boundsRef }: { stream: MediaStream; boundsRef: React
   const drag = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   const flipFrom = useRef<DOMRect | null>(null);
   const [dragging, setDragging] = useState(false);
-
-  // Your voice lights your frame.
-  useAudioLevel(stream, elRef);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;

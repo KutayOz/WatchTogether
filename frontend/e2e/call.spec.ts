@@ -71,28 +71,18 @@ test.describe('A call between two people', () => {
     // The call is measured once it is up.
     await expect(alice.getByLabel(/connection quality|measuring connection/i)).toBeVisible();
 
-    // ── the room takes the picture's colour ────────────────────────────────
-    await expect
-      .poll(
-        () =>
-          alice.locator('.stage-wrap').evaluate((el) => {
-            const [r, g, b] = getComputedStyle(el).getPropertyValue('--amb-l').match(/\d+/g)?.map(Number) ?? [0, 0, 0];
-            return g > r && g > b; // the fake camera is green
-          }),
-        { timeout: 10_000 },
-      )
-      .toBe(true);
-
-    // ── their voice lights the frame ───────────────────────────────────────
-    await expect
-      .poll(
-        () =>
-          alice
-            .locator('.stage--peer')
-            .evaluate((el) => parseFloat(getComputedStyle(el).getPropertyValue('--level')) || 0),
-        { timeout: 10_000, intervals: [100] },
-      )
-      .toBeGreaterThan(0.05);
+    // ── the room stays still around the picture ─────────────────────────────
+    // No light sampled from the video and no voice glow: both repainted every
+    // frame for as long as a call lasted, and a viewer watching a film reported
+    // the laptop running hot. The fake mic beeps the whole time, so a level
+    // meter still attached would have moved by now.
+    await alice.waitForTimeout(1500);
+    expect(
+      await alice
+        .locator('.stage--peer')
+        .evaluate((el) => parseFloat(getComputedStyle(el).getPropertyValue('--level')) || 0),
+    ).toBe(0);
+    expect(await alice.locator('.stage-glow').evaluate((el) => el.getAnimations().length)).toBe(0);
 
     // ── chat, both ways, with a typing line in between ─────────────────────
     const aliceInput = alice.getByRole('textbox', { name: 'Message' });

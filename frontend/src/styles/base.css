@@ -71,6 +71,10 @@ html[data-scene='room'] body::before {
 html[data-scene='room'] body {
   background: var(--velvet-950);
 }
+/* Nor the live dot: an infinite box-shadow pulse repaints every frame. */
+html[data-scene='room'] .chip__dot[data-live] {
+  animation: none;
+}
 
 #root {
   position: relative;
